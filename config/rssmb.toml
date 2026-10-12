@@ -1,0 +1,63 @@
+# RSSMB configuration — deployment-ready defaults
+# ================================================
+# This file is pre-configured for the docker compose setup.
+# Edit shares and authentication as needed.
+
+listen_addr = "0.0.0.0"
+port = 445
+min_dialect = "smb21"
+max_dialect = "smb311"
+
+# Signing: disabled for guest access testing.
+# Set to "required" for production with NTLM/Kerberos auth.
+signing = "disabled"
+
+# Encryption: offered but not required for 3.0+.
+# Set to "required" to force encryption on all 3.x sessions.
+encryption = "desired"
+
+# Connection limits
+max_connections_per_ip = 100
+max_frame_size = 1048576
+max_credits = 1024
+
+# Guest access: enabled for easy testing.
+# Disable in production by setting to false.
+guest_access = true
+
+# Health & metrics endpoint (HTTP, separate from SMB port)
+health_port = 8080
+
+# ── Shares ──────────────────────────────────────────────────────────────
+
+[shares.public]
+name = "public"
+path = "/data/public"
+comment = "Public share — guest access enabled"
+read_only = false
+browseable = true
+guest_ok = true
+valid_users = []
+
+[shares.homes]
+name = "homes"
+path = "/data/homes"
+comment = "User home directories"
+read_only = false
+browseable = false
+guest_ok = false
+valid_users = []
+
+# ── Authentication ─────────────────────────────────────────────────────
+# User accounts for NTLM authentication.
+# Passwords are stored in plaintext for MVP. In production, mount an
+# external auth file as a Secret (k8s) — never commit real credentials.
+#
+# Test account so the docker compose stack is usable out of the box.
+# CHANGE OR REMOVE before exposing the server beyond your machine.
+[[users]]
+username = "alice"
+password = "TestPass123"
+disabled = false
+
+# For k8s: mount as a Secret, not a ConfigMap.

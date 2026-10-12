@@ -1,0 +1,72 @@
+# RSSMB — Docker Compose for easy deployment
+# ===========================================
+# Usage:
+#   1. Copy config/rssmb.toml.example to config/rssmb.toml and edit shares
+#   2. Create the data directory: mkdir -p data/public data/homes
+#   3. Start: docker compose -f docker/compose.yml up -d
+#   4. Connect: smbclient //localhost/public -U guest
+#
+# The server runs as UID/GID 1000 (rssmb). Ensure the data directories
+# are owned by that UID: sudo chown -R 1000:1000 data/
+
+services:
+  rssmb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: rssmb
+    # Run as the rssmb user (UID 1000, GID 1000)
+    user: "1000:1000"
+    ports:
+      - "445:445"      # SMB over TCP
+      - "8080:8080"    # Health & metrics (HTTP)
+    volumes:
+      # Config (read-only)
+      - ../config/rssmb.toml:/etc/rssmb/rssmb.toml:ro
+      # Share data — adjust paths for your environment
+      - ../data/public:/data/public
+      - ../data/homes:/data/homes
+    environment:
+      - RUST_LOG=debug
+    # Graceful shutdown: give the server 10s to drain connections
+    stop_grace_period: 10s
+    # Restart policy for container orchestration
+    restart: unless-stopped
+    # Health check via the HTTP endpoint
+    healthcheck:
+      # The runtime image has no curl; bash's /dev/tcp is enough to probe it.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # Security: read-only root filesystem, write only to /data
+    # (comment out tmpfs if your Docker version doesn't support it)
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
+    # No special capabilities needed — port 445 is mapped by Docker
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional: Samba client container for interop testing
+  # Run: docker compose -f docker/compose.yml run --rm samba-client
+  samba-client:
+    image: ubuntu:22.04
+    profiles: ["test"]
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y samba-client &&
+        echo 'Testing RSSMB connectivity...' &&
+        smbclient -L //rssmb -U guest -N &&
+        echo 'Listing shares OK'
+      "
+    depends_on:
+      rssmb:
+        condition: service_healthy
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined

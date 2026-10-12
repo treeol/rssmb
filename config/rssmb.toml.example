@@ -1,0 +1,43 @@
+# RSSMB configuration file
+# ========================
+# Copy to rssmb.toml and adjust for your environment.
+
+listen_addr = "0.0.0.0"
+port = 445
+min_dialect = "smb21"
+max_dialect = "smb311"
+signing = "required"
+encryption = "desired"
+max_connections_per_ip = 100
+max_frame_size = 1048576
+guest_access = false
+health_port = 8080
+max_credits = 1024
+
+# Share definitions
+# =================
+# Each share is defined under [shares.<name>]
+
+[shares.public]
+name = "public"
+path = "/data/public"
+comment = "Public share"
+read_only = false
+browseable = true
+guest_ok = false
+valid_users = []
+
+[shares.homes]
+name = "homes"
+path = "/data/homes"
+comment = "User home directories"
+read_only = false
+browseable = false
+guest_ok = false
+valid_users = ["admin"]
+
+# Authentication
+# =================
+# NT hashes should be loaded from a secrets file, not embedded in config.
+# For k8s: mount a Secret containing the hash file at /etc/rssmb/auth.toml
+# and reference it here (future feature — currently uses guest or config-based auth).

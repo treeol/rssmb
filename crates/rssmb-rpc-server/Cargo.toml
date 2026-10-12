@@ -1,0 +1,16 @@
+[package]
+name = "rssmb-rpc-server"
+description = "DCE/RPC server-side: SrvSvc share enumeration, IPC$ dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rssmb-proto = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

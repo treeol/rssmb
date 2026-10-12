@@ -1,0 +1,7 @@
+# Don't send build artifacts to the Docker builder
+target/
+smb-rs/.git/
+smb-rs/target/
+**/*.rs.bk
+.DS_Store
+.git

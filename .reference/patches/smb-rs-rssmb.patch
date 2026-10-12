@@ -1,0 +1,541 @@
+diff --git a/crates/smb-dtyp/src/binrw_util/file_time.rs b/crates/smb-dtyp/src/binrw_util/file_time.rs
+index 2a9469c..7109de7 100644
+--- a/crates/smb-dtyp/src/binrw_util/file_time.rs
++++ b/crates/smb-dtyp/src/binrw_util/file_time.rs
+@@ -38,6 +38,11 @@ impl FileTime {
+         self.value == 0
+     }
+ 
++    /// Returns the raw u64 value (100-nanosecond intervals since 1601-01-01).
++    pub fn as_u64(&self) -> u64 {
++        self.value
++    }
++
+     /// Returns the duration since the FILETIME epoch (January 1, 1601).
+     ///
+     /// This is useful for cases where the file time represents a duration offset.
+diff --git a/crates/smb-dtyp/src/security/ace.rs b/crates/smb-dtyp/src/security/ace.rs
+index c65835d..73af7c7 100644
+--- a/crates/smb-dtyp/src/security/ace.rs
++++ b/crates/smb-dtyp/src/security/ace.rs
+@@ -93,7 +93,7 @@ pub struct ACE {
+     #[br(temp)]
+     _ace_size: PosMarker<u16>,
+     #[br(args(ace_type))]
+-    #[br(map_stream = |s| s.take_seek(_ace_size.value as u64 - Self::HEADER_SIZE))]
++    #[br(map_stream = |s| s.take_seek((_ace_size.value as u64).saturating_sub(Self::HEADER_SIZE)))]
+     #[bw(write_with = PosMarker::write_size_plus, args(&_ace_size, Self::HEADER_SIZE))]
+     pub value: AceValue,
+ }
+diff --git a/crates/smb-msg/src/compressed.rs b/crates/smb-msg/src/compressed.rs
+index bc2f32c..f27bb1d 100644
+--- a/crates/smb-msg/src/compressed.rs
++++ b/crates/smb-msg/src/compressed.rs
+@@ -126,7 +126,7 @@ pub struct CompressedChainedItem {
+     #[bw(assert(original_size.is_none() ^ compression_algorithm.original_size_required()))]
+     pub original_size: Option<u32>,
+     /// Compressed payload data
+-    #[br(map_stream = |s| s.take_seek(length.value as u64 - (add_original_size_to_total_length(&compression_algorithm))), parse_with = binrw::helpers::until_eof)]
++    #[br(map_stream = |s| s.take_seek((length.value as u64).saturating_sub(add_original_size_to_total_length(&compression_algorithm))), parse_with = binrw::helpers::until_eof)]
+     #[bw(write_with = PosMarker::write_size_plus, args(&length, add_original_size_to_total_length(compression_algorithm)))]
+     pub payload_data: Vec<u8>,
+ }
+diff --git a/crates/smb-msg/src/create.rs b/crates/smb-msg/src/create.rs
+index c502dad..446b49e 100644
+--- a/crates/smb-msg/src/create.rs
++++ b/crates/smb-msg/src/create.rs
+@@ -110,7 +110,13 @@ pub struct CreateRequest {
+ 
+     /// The list of create contexts sent in this request.
+     /// Use the [`CreateContextRequestData`]`::first_...` function family to get the first context of a specific type.
+-    #[brw(align_before = 8)]
++    ///
++    /// rssmb patch: when CreateContextsLength is 0 the request may end right
++    /// after the name (no alignment padding), so don't align/read at all.
++    /// Otherwise seek to the header-relative CreateContextsOffset.
++    #[bw(align_before = 8)]
++    #[br(if(_create_contexts_length.value != 0))]
++    #[br(seek_before = SeekFrom::Start(_create_contexts_offset.value as u64))]
+     #[br(map_stream = |s| s.take_seek(_create_contexts_length.value.into()))]
+     #[bw(write_with = PosMarker::write_roff_size, args(&_create_contexts_offset, &_create_contexts_length))]
+     pub contexts: ChainedItemList<CreateContextRequest, 8>,
+@@ -237,6 +243,7 @@ pub struct ShareAccessFlags {
+ ///
+ /// Reference: MS-SMB2 2.2.14
+ #[smb_response(size = 89)]
++#[derive(Default)]
+ pub struct CreateResponse {
+     /// The oplock level that is granted to the client for this open
+     pub oplock_level: OplockLevel,
+@@ -306,6 +313,10 @@ pub enum CreateAction {
+     Overwritten = 0x3,
+ }
+ 
++impl Default for CreateAction {
++    fn default() -> Self { CreateAction::Superseded }
++}
++
+ macro_rules! create_context_half {
+     (
+         $struct_name:ident {
+@@ -346,7 +357,10 @@ pub struct [<CreateContext $struct_name:camel>]
+     /// The name of the create context
+     #[brw(align_before = 8)]
+     #[br(count = name_length)]
+-    #[br(seek_before = _name_offset.seek_from(_name_offset.value as u64 - CHAINED_ITEM_PREFIX_SIZE as u64))]
++    // rssmb patch: saturating — a malformed (or zero) offset must be a decode
++    // error, never an arithmetic-overflow panic.
++    #[br(assert(_name_offset.value as u64 >= CHAINED_ITEM_PREFIX_SIZE as u64))]
++    #[br(seek_before = _name_offset.seek_from((_name_offset.value as u64).saturating_sub(CHAINED_ITEM_PREFIX_SIZE as u64)))]
+     #[bw(write_with = PosMarker::write_roff_plus, args(&_name_offset, CHAINED_ITEM_PREFIX_SIZE as u64))]
+     pub name: Vec<u8>,
+ 
+@@ -354,7 +368,9 @@ pub struct [<CreateContext $struct_name:camel>]
+     #[bw(align_before = 8)]
+     #[br(assert(_data_offset.value % 8 == 0))]
+     #[bw(write_with = PosMarker::write_roff_size_b_plus, args(&_data_offset, &_data_length, &_name_offset, CHAINED_ITEM_PREFIX_SIZE as u64))]
+-    #[br(seek_before = _name_offset.seek_from_if(_data_offset.value as u64 - CHAINED_ITEM_PREFIX_SIZE as u64, _data_length.value > 0))]
++    // rssmb patch: DataOffset may legally be 0 when DataLength is 0 (cifs.ko
++    // sends QFid like that); the unchecked subtraction panicked.
++    #[br(seek_before = _name_offset.seek_from_if((_data_offset.value as u64).saturating_sub(CHAINED_ITEM_PREFIX_SIZE as u64), _data_length.value > 0))]
+     #[br(map_stream = |s| s.take_seek(_data_length.value.into()), args(&name))]
+     pub data: [<CreateContext $struct_name Data>],
+ }
+@@ -820,9 +836,9 @@ pub struct DH2QResp {
+ /// Reference: MS-SMB2 2.2.15
+ #[smb_request(size = 24)]
+ pub struct CloseRequest {
+-    #[bw(calc = CloseFlags::new().with_postquery_attrib(true))]
+-    #[br(assert(_flags == CloseFlags::new().with_postquery_attrib(true)))]
+-    _flags: CloseFlags,
++    /// Flags indicating how to process the CLOSE operation.
++    /// Clients may send 0 (no postquery) or POSTQUERY_ATTRIB.
++    pub flags: CloseFlags,
+     reserved: u32,
+     /// The identifier of the open to a file or named pipe that is being closed
+     pub file_id: FileId,
+@@ -833,6 +849,7 @@ pub struct CloseRequest {
+ ///
+ /// Reference: MS-SMB2 2.2.16
+ #[smb_response(size = 60)]
++#[derive(Default)]
+ pub struct CloseResponse {
+     pub flags: CloseFlags,
+     reserved: u32,
+diff --git a/crates/smb-msg/src/file.rs b/crates/smb-msg/src/file.rs
+index 111547d..66be3c3 100644
+--- a/crates/smb-msg/src/file.rs
++++ b/crates/smb-msg/src/file.rs
+@@ -85,6 +85,7 @@ pub struct ReadRequest {
+ ///
+ /// Reference: MS-SMB2 2.2.20
+ #[smb_response(size = 17)]
++#[derive(Default)]
+ pub struct ReadResponse {
+     #[br(assert(_data_offset.value as usize >= Header::STRUCT_SIZE + Self::STRUCT_SIZE - 1))]
+     #[bw(calc = PosMarker::default())]
+@@ -202,6 +203,7 @@ impl WriteRequest {
+ ///
+ /// Reference: MS-SMB2 2.2.22
+ #[smb_response(size = 17)]
++#[derive(Default)]
+ pub struct WriteResponse {
+     reserved: u16,
+ 
+diff --git a/crates/smb-msg/src/info/query.rs b/crates/smb-msg/src/info/query.rs
+index 5214e20..dbf479d 100644
+--- a/crates/smb-msg/src/info/query.rs
++++ b/crates/smb-msg/src/info/query.rs
+@@ -205,6 +205,7 @@ pub struct GetEaInfoList {
+ ///
+ /// MS-SMB2 2.2.38
+ #[smb_response(size = 9)]
++#[derive(Default)]
+ pub struct QueryInfoResponse {
+     #[bw(calc = PosMarker::default())]
+     #[br(temp)]
+@@ -227,6 +228,13 @@ impl QueryInfoResponse {
+     pub fn parse(&self, info_type: InfoType) -> Result<QueryInfoData, binrw::Error> {
+         self.data.parse(info_type)
+     }
++
++    /// Construct a QueryInfoResponse from raw serialized data bytes.
++    pub fn from_bytes(data: Vec<u8>) -> Self {
++        QueryInfoResponse {
++            data: data.into(),
++        }
++    }
+ }
+ 
+ /// A helper structure containing raw response data that can be parsed into specific information types.
+@@ -234,6 +242,7 @@ impl QueryInfoResponse {
+ /// Call [`QueryInfoResponseData::parse`] to convert to the appropriate data format
+ /// based on the info type from the request.
+ #[smb_response_binrw]
++#[derive(Default)]
+ pub struct QueryInfoResponseData {
+     #[br(parse_with = binrw::helpers::until_eof)]
+     data: Vec<u8>,
+diff --git a/crates/smb-msg/src/ioctl/msg.rs b/crates/smb-msg/src/ioctl/msg.rs
+index 04cf0f2..65402c2 100644
+--- a/crates/smb-msg/src/ioctl/msg.rs
++++ b/crates/smb-msg/src/ioctl/msg.rs
+@@ -40,16 +40,17 @@ pub struct IoctlRequest {
+     _input_count: PosMarker<u32>,
+     /// Maximum bytes server can return for input data in response
+     pub max_input_response: u32,
+-    /// Must be set to 0 by client
++    /// Output offset — clients are expected to set this to 0, but some
++    /// clients (smbclient SMB3 mode) send non-zero values. The server
++    /// ignores this field (MS-SMB2 2.2.31: OutputOffset/OutputCount
++    /// are ignored on the server side).
+     #[bw(calc = 0)]
+-    #[br(assert(output_offset == 0))]
+     #[br(temp)]
+-    output_offset: u32,
+-    /// Must be set to 0 by client
++    _output_offset: u32,
++    /// Output count — same as above: expected 0 by clients, ignored by server.
+     #[bw(calc = 0)]
+-    #[br(assert(output_count == 0))]
+     #[br(temp)]
+-    output_count: u32,
++    _output_count: u32,
+     /// Maximum bytes server can return for output data in response
+     pub max_output_response: u32,
+     /// Indicates whether this is an IOCTL (0x00000000) or FSCTL (0x00000001) request
+diff --git a/crates/smb-msg/src/negotiate.rs b/crates/smb-msg/src/negotiate.rs
+index 36ee104..46b9c5f 100644
+--- a/crates/smb-msg/src/negotiate.rs
++++ b/crates/smb-msg/src/negotiate.rs
+@@ -223,6 +223,9 @@ pub struct NegotiateContext {
+     /// Context-specific data.
+     #[br(args(&context_type))]
+     #[br(map_stream = |s| s.take_seek(data_length.value as u64))]
++    // Always advance to the declared end of the data, even if the value
++    // parser consumed fewer bytes, so the next context starts correctly.
++    #[br(pad_size_to = data_length.value)]
+     #[bw(write_with = PosMarker::write_size, args(&data_length))]
+     pub data: NegotiateContextValue,
+ }
+@@ -231,13 +234,32 @@ macro_rules! negotiate_context_type {
+     ($($name:ident = $id:literal,)+) => {
+ /// Negotiate context type identifiers.
+ ///
++/// Unrecognized type IDs (e.g. Samba's POSIX extensions context, 0x0100)
++/// decode as [`NegotiateContextType::Unknown`]; MS-SMB2 3.3.5.4 requires the
++/// server to ignore negotiate contexts it does not understand.
++///
+ /// Reference: MS-SMB2 2.2.3.1
+-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq)]
+-#[brw(repr(u16))]
++#[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
++#[brw(little)]
+ pub enum NegotiateContextType {
+     $(
+-        $name = $id,
++        #[brw(magic = $id)]
++        $name,
+     )+
++    /// Any context type not recognized by this crate.
++    Unknown(u16),
++}
++
++impl NegotiateContextType {
++    /// The on-wire type ID.
++    pub fn id(&self) -> u16 {
++        match self {
++            $(
++                NegotiateContextType::$name => $id,
++            )+
++            NegotiateContextType::Unknown(id) => *id,
++        }
++    }
+ }
+ 
+ /// Negotiate context values.
+@@ -250,6 +272,17 @@ pub enum NegotiateContextValue {
+         #[br(pre_assert(context_type == &NegotiateContextType::$name))]
+         $name($name),
+     )+
++    /// Raw data of an unrecognized context (consumes the whole context data).
++    #[br(pre_assert(matches!(context_type, NegotiateContextType::Unknown(_))))]
++    Unknown {
++        /// The unrecognized type ID (not written; the outer context carries it).
++        #[br(calc = context_type.id())]
++        #[bw(ignore)]
++        type_id: u16,
++        /// Opaque context data.
++        #[br(parse_with = binrw::helpers::until_eof)]
++        data: Vec<u8>,
++    },
+ }
+ 
+ impl NegotiateContextValue {
+@@ -261,6 +294,9 @@ impl NegotiateContextValue {
+                     NegotiateContextType::$name
+                 }
+             )+
++            NegotiateContextValue::Unknown { type_id, .. } => {
++                NegotiateContextType::Unknown(*type_id)
++            }
+         }
+     }
+ }
+@@ -311,22 +347,38 @@ gen_impl_for_neg_msg_type!(NegotiateResponse);
+ }
+ 
+ negotiate_context_type!(
+-    PreauthIntegrityCapabilities = 0x0001,
+-    EncryptionCapabilities = 0x0002,
+-    CompressionCapabilities = 0x0003,
+-    NetnameNegotiateContextId = 0x0005,
+-    TransportCapabilities = 0x0006,
+-    RdmaTransformCapabilities = 0x0007,
+-    SigningCapabilities = 0x0008,
++    PreauthIntegrityCapabilities = 0x0001u16,
++    EncryptionCapabilities = 0x0002u16,
++    CompressionCapabilities = 0x0003u16,
++    NetnameNegotiateContextId = 0x0005u16,
++    TransportCapabilities = 0x0006u16,
++    RdmaTransformCapabilities = 0x0007u16,
++    SigningCapabilities = 0x0008u16,
+ );
+ 
+ /// Hash algorithms for pre-authentication integrity.
+ ///
++/// Unrecognized algorithm IDs decode as [`HashAlgorithm::Unknown`]; MS-SMB2
++/// requires the server to select from offered algorithms and ignore the rest.
++///
+ /// Reference: MS-SMB2 2.2.3.1.1
+ #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
+-#[brw(repr(u16))]
++#[brw(little)]
+ pub enum HashAlgorithm {
+-    Sha512 = 0x01,
++    #[brw(magic = 0x01u16)]
++    Sha512,
++    /// Any algorithm ID not recognized by this crate.
++    Unknown(u16),
++}
++
++impl HashAlgorithm {
++    /// The on-wire algorithm ID.
++    pub fn id(&self) -> u16 {
++        match self {
++            HashAlgorithm::Sha512 => 0x01,
++            HashAlgorithm::Unknown(id) => *id,
++        }
++    }
+ }
+ 
+ /// (Context) Pre-authentication integrity capabilities.
+@@ -364,14 +416,35 @@ pub struct EncryptionCapabilities {
+ 
+ /// Encryption cipher identifiers.
+ ///
++/// Unrecognized cipher IDs decode as [`EncryptionCipher::Unknown`].
++///
+ /// Reference: MS-SMB2 2.2.3.1.2
+ #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
+-#[brw(repr(u16))]
++#[brw(little)]
+ pub enum EncryptionCipher {
+-    Aes128Ccm = 0x0001,
+-    Aes128Gcm = 0x0002,
+-    Aes256Ccm = 0x0003,
+-    Aes256Gcm = 0x0004,
++    #[brw(magic = 0x0001u16)]
++    Aes128Ccm,
++    #[brw(magic = 0x0002u16)]
++    Aes128Gcm,
++    #[brw(magic = 0x0003u16)]
++    Aes256Ccm,
++    #[brw(magic = 0x0004u16)]
++    Aes256Gcm,
++    /// Any cipher ID not recognized by this crate.
++    Unknown(u16),
++}
++
++impl EncryptionCipher {
++    /// The on-wire cipher ID.
++    pub fn id(&self) -> u16 {
++        match self {
++            EncryptionCipher::Aes128Ccm => 0x0001,
++            EncryptionCipher::Aes128Gcm => 0x0002,
++            EncryptionCipher::Aes256Ccm => 0x0003,
++            EncryptionCipher::Aes256Gcm => 0x0004,
++            EncryptionCipher::Unknown(id) => *id,
++        }
++    }
+ }
+ 
+ /// (Context) Compression capabilities.
+@@ -395,20 +468,42 @@ pub struct CompressionCapabilities {
+ 
+ /// Compression algorithm identifiers.
+ ///
++/// Unrecognized algorithm IDs decode as [`CompressionAlgorithm::Unknown`].
++///
+ /// Reference: MS-SMB2 2.2.3.1.3
+ #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
+-#[brw(repr(u16))]
+-#[repr(u16)]
++#[brw(little)]
+ pub enum CompressionAlgorithm {
+-    None = 0x0000,
+-    LZNT1 = 0x0001,
+-    LZ77 = 0x0002,
+-    LZ77Huffman = 0x0003,
+-    PatternV1 = 0x0004,
+-    LZ4 = 0x0005,
++    #[brw(magic = 0x0000u16)]
++    None,
++    #[brw(magic = 0x0001u16)]
++    LZNT1,
++    #[brw(magic = 0x0002u16)]
++    LZ77,
++    #[brw(magic = 0x0003u16)]
++    LZ77Huffman,
++    #[brw(magic = 0x0004u16)]
++    PatternV1,
++    #[brw(magic = 0x0005u16)]
++    LZ4,
++    /// Any algorithm ID not recognized by this crate.
++    Unknown(u16),
+ }
+ 
+ impl CompressionAlgorithm {
++    /// The on-wire algorithm ID.
++    pub fn id(&self) -> u16 {
++        match self {
++            CompressionAlgorithm::None => 0x0000,
++            CompressionAlgorithm::LZNT1 => 0x0001,
++            CompressionAlgorithm::LZ77 => 0x0002,
++            CompressionAlgorithm::LZ77Huffman => 0x0003,
++            CompressionAlgorithm::PatternV1 => 0x0004,
++            CompressionAlgorithm::LZ4 => 0x0005,
++            CompressionAlgorithm::Unknown(id) => *id,
++        }
++    }
++
+     /// Relevant for processing compressed messages.
+     pub fn original_size_required(&self) -> bool {
+         matches!(
+@@ -430,8 +525,11 @@ impl std::fmt::Display for CompressionAlgorithm {
+             CompressionAlgorithm::LZ77Huffman => "LZ77+Huffman",
+             CompressionAlgorithm::PatternV1 => "PatternV1",
+             CompressionAlgorithm::LZ4 => "LZ4",
++            CompressionAlgorithm::Unknown(id) => {
++                return write!(f, "Unknown ({:#06x})", id);
++            }
+         };
+-        write!(f, "{} ({:#x})", message_as_string, *self as u16)
++        write!(f, "{} ({:#06x})", message_as_string, self.id())
+     }
+ }
+ 
+@@ -518,13 +616,32 @@ pub struct SigningCapabilities {
+ 
+ /// Signing algorithm identifiers.
+ ///
++/// Unrecognized algorithm IDs decode as [`SigningAlgorithmId::Unknown`].
++///
+ /// Reference: MS-SMB2 2.2.3.1.7
+ #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
+-#[brw(repr(u16))]
++#[brw(little)]
+ pub enum SigningAlgorithmId {
+-    HmacSha256 = 0x0000,
+-    AesCmac = 0x0001,
+-    AesGmac = 0x0002,
++    #[brw(magic = 0x0000u16)]
++    HmacSha256,
++    #[brw(magic = 0x0001u16)]
++    AesCmac,
++    #[brw(magic = 0x0002u16)]
++    AesGmac,
++    /// Any algorithm ID not recognized by this crate.
++    Unknown(u16),
++}
++
++impl SigningAlgorithmId {
++    /// The on-wire algorithm ID.
++    pub fn id(&self) -> u16 {
++        match self {
++            SigningAlgorithmId::HmacSha256 => 0x0000,
++            SigningAlgorithmId::AesCmac => 0x0001,
++            SigningAlgorithmId::AesGmac => 0x0002,
++            SigningAlgorithmId::Unknown(id) => *id,
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/smb-msg/src/oplock.rs b/crates/smb-msg/src/oplock.rs
+index ca1c7da..9c05e41 100644
+--- a/crates/smb-msg/src/oplock.rs
++++ b/crates/smb-msg/src/oplock.rs
+@@ -69,6 +69,14 @@ pub enum OplockLevel {
+     II = 1,
+     /// Exclusive oplock is available.
+     Exclusive = 2,
++    /// rssmb patch: batch oplock (MS-SMB2 2.2.13 RequestedOplockLevel 0x09).
++    Batch = 0x09,
++    /// rssmb patch: lease requested via RqLs context (0xFF).
++    Lease = 0xFF,
++}
++
++impl Default for OplockLevel {
++    fn default() -> Self { OplockLevel::None }
+ }
+ 
+ /// Lease state bitfield representing different types of caching permissions.
+diff --git a/crates/smb-msg/src/query_dir.rs b/crates/smb-msg/src/query_dir.rs
+index 798f57d..fd98443 100644
+--- a/crates/smb-msg/src/query_dir.rs
++++ b/crates/smb-msg/src/query_dir.rs
+@@ -85,6 +85,7 @@ pub struct QueryDirectoryFlags {
+ ///
+ /// Reference: MS-SMB2 section 2.2.34
+ #[smb_response(size = 9)]
++#[derive(Default)]
+ pub struct QueryDirectoryResponse {
+     /// Offset in bytes from the beginning of the SMB2 header to the directory enumeration data.
+     #[bw(calc = PosMarker::default())]
+diff --git a/crates/smb-msg/src/tree_connect.rs b/crates/smb-msg/src/tree_connect.rs
+index c5ee1e2..3843174 100644
+--- a/crates/smb-msg/src/tree_connect.rs
++++ b/crates/smb-msg/src/tree_connect.rs
+@@ -268,6 +268,7 @@ impl TreeConnectRequest {
+ ///
+ /// Reference: MS-SMB2 2.2.10
+ #[smb_response(size = 16)]
++#[derive(Default)]
+ pub struct TreeConnectResponse {
+     /// Type of share being accessed
+     pub share_type: ShareType,
+@@ -379,6 +380,10 @@ pub enum ShareType {
+     Print = 0x3,
+ }
+ 
++impl Default for ShareType {
++    fn default() -> Self { ShareType::Disk }
++}
++
+ /// SMB2 TREE_DISCONNECT Request
+ ///
+ /// Sent by a client to request that the tree connect that is specified in the TreeId within
+diff --git a/crates/smb/src/resource.rs b/crates/smb/src/resource.rs
+index 7a1f36e..e168dc7 100644
+--- a/crates/smb/src/resource.rs
++++ b/crates/smb/src/resource.rs
+@@ -786,7 +786,7 @@ impl ResourceHandle {
+         handler: &HandlerReference<ResourceMessageHandle>,
+     ) -> crate::Result<()> {
+         log::trace!("Send close to file with ID: {file_id:?}");
+-        let response = handler.send_recv(CloseRequest { file_id }.into()).await?;
++        let response = handler.send_recv(CloseRequest { flags: CloseFlags::new().with_postquery_attrib(true), file_id }.into()).await?;
+         log::debug!("Close response received for file ID: {file_id:?}, {response:?}");
+         Ok(())
+     }

@@ -1,0 +1,30 @@
+[package]
+name = "rssmb-server"
+description = "Core SMB2/3 server: connection engine, session state, tree dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rssmb-wire-adapter = { workspace = true }
+rssmb-auth = { workspace = true }
+rssmb-vfs = { workspace = true }
+rssmb-rpc-server = { workspace = true }
+rssmb-proto = { workspace = true }
+binrw = "0.15"
+tokio = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+cmac = { workspace = true }
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+sspi = { workspace = true }

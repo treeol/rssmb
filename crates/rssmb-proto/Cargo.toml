@@ -1,0 +1,16 @@
+[package]
+name = "rssmb-proto"
+description = "SMB2/3 wire protocol types — server-side encode/decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+binrw = "0.15"
+modular-bitfield = "0.11"
+rand = { workspace = true }
+
+[dev-dependencies]
+binrw = "0.15"

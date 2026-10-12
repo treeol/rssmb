@@ -1,0 +1,27 @@
+# Config for the local live interop harness (tests/live/run.sh).
+# Binds to loopback on an unprivileged port. The account below is a
+# throwaway test credential — never reuse it anywhere real.
+listen_addr = "127.0.0.1"
+port = 4450
+min_dialect = "smb21"
+max_dialect = "smb311"
+signing = "desired"
+encryption = "disabled"
+guest_access = true
+health_port = 18080
+max_credits = 1024
+
+[shares.public]
+name = "public"
+path = "/tmp/rssmb-live/public"
+guest_ok = true
+
+[shares.private]
+name = "private"
+path = "/tmp/rssmb-live/private"
+guest_ok = false
+valid_users = ["alice"]
+
+[[users]]
+username = "alice"
+password = "TestPass123"

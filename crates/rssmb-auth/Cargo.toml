@@ -1,0 +1,21 @@
+[package]
+name = "rssmb-auth"
+description = "Authentication acceptor: NTLM via sspi, SPNEGO, credential store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sspi = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+md4 = "0.10"
+md-5 = "0.10"
