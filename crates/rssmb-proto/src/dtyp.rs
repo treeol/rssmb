@@ -632,6 +632,77 @@ impl std::fmt::Display for SizedWideString {
     }
 }
 
+// ── FixedWideString ──────────────────────────────────────────────
+
+/// Fixed-size wide string (N u16 code units, always N*2 bytes on wire).
+///
+/// Used for 8.3 short filenames in directory enumeration (MS-FSCC §2.4).
+/// The field is always exactly N characters; `ShortNameLength` tells
+/// how many are meaningful, but the field itself is fixed-size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedWideString<const N: usize> {
+    pub data: [u16; N],
+}
+
+impl<const N: usize> Default for FixedWideString<N> {
+    fn default() -> Self {
+        Self { data: [0u16; N] }
+    }
+}
+
+impl<const N: usize> binrw::BinRead for FixedWideString<N> {
+    type Args<'a> = ();
+    fn read_options<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<Self> {
+        let mut data = [0u16; N];
+        for item in data.iter_mut() {
+            *item = u16::read_options(reader, endian, ())?;
+        }
+        Ok(Self { data })
+    }
+}
+
+impl<const N: usize> binrw::BinWrite for FixedWideString<N> {
+    type Args<'a> = ();
+    fn write_options<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut W,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<()> {
+        for item in self.data.iter() {
+            item.write_options(writer, endian, ())?;
+        }
+        Ok(())
+    }
+}
+
+impl<const N: usize> FixedWideString<N> {
+    pub const SIZE_BYTES: usize = N * 2;
+
+    pub fn from_slice(slice: &[u16]) -> Self {
+        let mut data = [0u16; N];
+        let len = slice.len().min(N);
+        data[..len].copy_from_slice(&slice[..len]);
+        Self { data }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        let u16s: Vec<u16> = s.encode_utf16().collect();
+        Self::from_slice(&u16s)
+    }
+}
+
+impl<const N: usize> std::fmt::Display for FixedWideString<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let trimmed: Vec<u16> = self.data.iter().take_while(|&&c| c != 0).copied().collect();
+        write!(f, "{}", String::from_utf16_lossy(&trimmed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,7 +24,7 @@ pub mod notify;
 pub mod ioctl;
 pub mod plain;
 
-pub use dtyp::{Guid, FileTime, Boolean, PosMarker, SizedWideString, SizedStringSize};
+pub use dtyp::{Guid, FileTime, Boolean, PosMarker, SizedWideString, SizedStringSize, FixedWideString};
 pub use fscc::{
     FileAttributes, FileBasicInformation, FileEndOfFileInformation,
     FileDispositionInformation, FileRenameInformation,

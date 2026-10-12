@@ -7,7 +7,7 @@
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{FileTime, Boolean, SizedWideString, SizedStringSize};
+use crate::dtyp::{FileTime, Boolean, SizedWideString, SizedStringSize, FixedWideString};
 
 // ── FileAttributes (MS-FSCC §2.6) ──────────────────────────────────
 // 4-byte LE bitfield.
@@ -290,8 +290,7 @@ pub struct FileBothDirectoryInformation {
     #[bw(calc = 0)]
     #[br(temp)]
     _reserved1: u8,
-    #[br(args { size: SizedStringSize::Bytes(short_name_length as u32) })]
-    pub short_name: SizedWideString,
+    pub short_name: FixedWideString<12>,
     #[br(args { size: SizedStringSize::Bytes(_file_name_length) })]
     pub file_name: SizedWideString,
 }
@@ -317,8 +316,7 @@ pub struct FileIdBothDirectoryInformation {
     #[bw(calc = 0)]
     #[br(temp)]
     _reserved1: u8,
-    #[br(args { size: SizedStringSize::Bytes(short_name_length as u32) })]
-    pub short_name: SizedWideString,
+    pub short_name: FixedWideString<12>,
     #[bw(calc = 0)]
     #[br(temp)]
     _reserved2: u16,

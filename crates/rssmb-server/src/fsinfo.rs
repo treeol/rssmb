@@ -266,7 +266,7 @@ pub fn build_directory_buffer(
                     file_attributes: file_attributes_to_fscc(&e.attributes),
                     ea_size: 0,
                     short_name_length: (short.encode_utf16().count() * 2) as u8,
-                    short_name: short.into(),
+                    short_name: rssmb_proto::FixedWideString::from_str(short),
                     file_name: e.file_name.as_str().into(),
                 }
             }).collect();
@@ -295,7 +295,7 @@ pub fn build_directory_buffer(
                     file_attributes: file_attributes_to_fscc(&e.attributes),
                     ea_size: 0,
                     short_name_length: (short.encode_utf16().count() * 2) as u8,
-                    short_name: short.into(),
+                    short_name: rssmb_proto::FixedWideString::from_str(short),
                     file_id: e.file_id.map(|f| f.0).unwrap_or(0),
                     file_name: e.file_name.as_str().into(),
                 }
