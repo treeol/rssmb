@@ -48,6 +48,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("RSSMB server starting");
 
+    // Install a panic hook that routes panics through tracing instead of
+    // dumping the raw backtrace to stderr. Keeps the default hook in tests
+    // (cfg(test)) for debugging.
+    #[cfg(not(test))]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info.location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            if let Some(payload) = info.payload().downcast_ref::<&str>() {
+                error!(location, panic = payload, "thread panicked");
+            } else if let Some(payload) = info.payload().downcast_ref::<String>() {
+                error!(location, panic = payload.as_str(), "thread panicked");
+            } else {
+                error!(location, "thread panicked");
+            }
+            default_hook(info);
+        }));
+    }
+
     // Load config
     let config_str = std::fs::read_to_string(&args.config)
         .map_err(|e| {

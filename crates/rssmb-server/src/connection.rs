@@ -354,6 +354,10 @@ impl Connection {
                     // an error response with the correct message_id/session_id.
                     // Otherwise the client waits forever for a reply.
                     warn!(conn_id = conn_state.conn_id, error = %e, "failed to parse payload");
+                    // Hex preview at debug for diagnostics (first 128 bytes).
+                    let preview_len = payload.len().min(128);
+                    debug!(conn_id = conn_state.conn_id, hex_preview = ?&payload[..preview_len],
+                        "payload hex preview");
                     if let Some(transform_sid) = was_encrypted {
                         // Decrypted frame: the AEAD authenticated the content,
                         // but we still need to validate compound structure and

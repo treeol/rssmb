@@ -120,14 +120,14 @@ fn parse_plain_payload(data: &[u8]) -> Result<FramedMessage, WireError> {
     let first_header: rssmb_proto::header::Header = {
         let mut cursor = std::io::Cursor::new(&data[..rssmb_proto::header::Header::STRUCT_SIZE]);
         rssmb_proto::header::Header::read_le(&mut cursor)
-            .map_err(|e| WireError::DecodeError(format!("header: {e:?}")))?
+            .map_err(|e| WireError::DecodeError(format!("header: {e}")))?
     };
 
     if first_header.next_command == 0 {
         // Single message — decode from the full payload.
         let mut cursor = std::io::Cursor::new(data);
         let request = PlainRequest::read_le(&mut cursor)
-            .map_err(|e| WireError::DecodeError(format!("{e:?}")))?;
+            .map_err(|e| WireError::DecodeError(format!("{e}")))?;
         return Ok(FramedMessage::Plain(request));
     }
 
@@ -147,7 +147,7 @@ fn parse_plain_payload(data: &[u8]) -> Result<FramedMessage, WireError> {
         let header: rssmb_proto::header::Header = {
             let mut cursor = std::io::Cursor::new(header_slice);
             rssmb_proto::header::Header::read_le(&mut cursor)
-                .map_err(|e| WireError::DecodeError(format!("header at {offset}: {e:?}")))?
+                .map_err(|e| WireError::DecodeError(format!("header at {offset}: {e}")))?
         };
 
         let next = header.next_command as usize;
@@ -180,7 +180,7 @@ fn parse_plain_payload(data: &[u8]) -> Result<FramedMessage, WireError> {
         let sub_slice = &data[offset..sub_end];
         let mut cursor = std::io::Cursor::new(sub_slice);
         let request = PlainRequest::read_le(&mut cursor)
-            .map_err(|e| WireError::DecodeError(format!("body at {offset}: {e:?}")))?;
+            .map_err(|e| WireError::DecodeError(format!("body at {offset}: {e}")))?;
         requests.push(request);
 
         if next == 0 {
