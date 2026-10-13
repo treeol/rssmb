@@ -219,7 +219,6 @@ pub struct IoctlResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use binrw::io::Cursor;
 
     #[test]
     fn test_ioctl_buffer_from_vec() {

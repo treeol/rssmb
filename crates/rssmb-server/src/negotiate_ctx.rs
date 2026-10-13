@@ -322,7 +322,7 @@ mod tests {
             },
             SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesCmac] }.into(),
         ]);
-        let (neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
+        let (_neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         // Unknown context ignored, not echoed.
         assert_eq!(ctxs.len(), 1);
         assert_eq!(ctxs[0].context_type, NegotiateContextType::PreauthIntegrityCapabilities);

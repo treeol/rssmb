@@ -1,10 +1,11 @@
 # RSSMB — Next Steps (implementation guide)
 
-Status snapshot: 2026-10-13 (`e08cd92`). Steps 1–8 are done: SMB 2.1–3.1.1
+Status snapshot: 2026-10-13 (`a4ba83b`). Steps 1–9 are done: SMB 2.1–3.1.1
 with signing, AES-128-GCM encryption, NTLMv2 auth, SrvSvc share enumeration,
-and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 277 unit
-tests pass. GNOME Files, `smbclient`, and Linux kernel CIFS mounts all work.
-Next: 9.5 (ID allocation), 9.6 (OpenTable), 9.7 (logging), then 10.x (testing).
+and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 295 unit
+tests pass (including 14 TCP integration tests). GNOME Files, `smbclient`,
+and Linux kernel CIFS mounts all work. Next: 10.3–10.6 (CI clients,
+smbtorture baseline, fuzz targets, unit-test gaps).
 
 Reference specs: MS-SMB2 (protocol), MS-FSCC (file/FS info structures),
 MS-SRVS + MS-RPCE (share enumeration), MS-NLMP (NTLM), MS-ERREF (NTSTATUS).
@@ -572,21 +573,35 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
 
 ## Step 10 — Testing and conformance
 
-- **Per-step unit tests** as noted above (golden bytes for each info class,
-  cursor and compound tests).
-- **Integration harness (`crates/rssmb-tests`):** start the server on an
-  ephemeral port with a temp-dir share, and drive it with the `smb` client
-  crate from smb-rs (it's a full client) for connect/ls/get/put/rename/delete.
-  This is the cheapest end-to-end test and runs in CI.
-- **Real clients (manual or CI with docker):** `smbclient` (compose
-  `samba-client` profile), `mount -t cifs` (needs privileges; run it in a
-  privileged CI job), GVFS, macOS Finder, Windows 11.
-- **smbtorture** (`smb2.connect`, `smb2.read`, `smb2.dir`, `smb2.compound`,
-  `smb2.create`, `smb2.setinfo`, later `smb2.lease`/`smb2.oplock`): the
-  conformance yardstick. Expect many failures at first; track the pass count.
-- **Fuzzing:** `cargo fuzz` targets for `parse_payload`, the SPNEGO extractor
-  and the compound splitter. With `catch_unwind`-free code, a panic is a
-  finding. Run them in CI nightly.
+- **10.1 — Done.** `listen_on` + in-process harness (`crates/rssmb-tests`).
+  TestServer binds an ephemeral port, returns the real addr, shuts down cleanly.
+- **10.2 — Done.** TCP integration tests (`crates/rssmb-tests/tests/integration.rs`):
+  14 tests covering NEGOTIATE (2.1, 3.0, 3.0.2, 3.1.1), max-common dialect,
+  ECHO after negotiation, compound NEGOTIATE rejection, SMB1 magic, bad magic,
+  truncated frame, empty payload, NetBIOS keep-alive, repeat NEGOTIATE disconnect,
+  server shutdown. Exercises the full TCP read-loop → parse → dispatch → encode
+  → write path. Does NOT cover authenticated flows (needs NTLM+signing client) —
+  left to impacket.
+- **10.3 — Done (code only, not CI-verified).** `tests/live/run.sh` updated with
+  `encrypted` scenario tier (encryption=desired config). `tests/live/smbclient.sh`
+  for smbclient interop (list, ls, get, put, -m SMB2/SMB3/SMB3_11).
+  `.github/workflows/interop-ci.yml` with jobs for unit+integration tests,
+  impacket, smbclient, smbtorture (nightly), fuzz (nightly).
+- **10.4 — Done (code only, not CI-verified).** `tests/conformance/run-smbtorture.sh`
+  runs curated smbtorture suites (smb2.connect/read/dir/compound/create/setinfo/
+  getinfo/session/credits/ioctl, rpc.srvsvc) and records pass/fail in
+  `tests/conformance/results.md`. CI job runs nightly.
+- **10.5 — Done (code only).** `fuzz/` with 6 cargo-fuzz targets: `parse_payload`,
+  `read_netbios_frame`, `extract_ntlm_token`, `extract_mech_types`,
+  `proto_decode_header`, `proto_decode_plain_request`. CI job runs nightly (5 min/target).
+- **10.6 — Remaining.** Golden-byte fixtures for every `rssmb-proto` struct,
+  QUERY_INFO/QUERY_DIRECTORY class tests, NDR decoder fixture, 3.1.1 preauth
+  end-to-end golden test.
+- **Real clients (manual):** GVFS, macOS Finder, Windows 11 `net use`/`net view`.
+- **Unverified in sandbox:** `cargo fmt --check` and `cargo clippy` (rustfmt/clippy
+  not installable; rust-toolchain.toml pins them for CI). smbtorture and fuzz
+  targets not run (need nightly toolchain / samba-testsuite). impacket/smbclient
+  scripts not run (need impacket installed).
 
 ---
 

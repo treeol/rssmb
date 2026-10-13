@@ -1,0 +1,158 @@
+name: Interop CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Nightly at 03:00 UTC — for smbtorture baseline and full interop.
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Job 1: Unit + integration tests (always, fast).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -Dclippy::all
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test --workspace
+
+  # Job 2: impacket interop (always on push/PR, nightly too).
+  impacket:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build server
+        run: cargo build --bin rssmb
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install impacket
+        run: pip install impacket
+      - name: Run impacket interop
+        run: |
+          PY=$(which python) tests/live/run.sh
+
+  # Job 3: smbclient interop (always on push/PR, nightly too).
+  smbclient:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build server
+        run: cargo build --bin rssmb
+      - name: Install smbclient
+        run: sudo apt-get update && sudo apt-get install -y smbclient
+      - name: Start server
+        run: |
+          rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private
+          echo "hello from rssmb" > /tmp/rssmb-live/public/README.txt
+          echo "secret" > /tmp/rssmb-live/private/s.txt
+          ./target/debug/rssmb --config tests/live/rssmb-live-encrypted.toml &
+          echo $! > /tmp/rssmb.pid
+          sleep 1
+      - name: Run smbclient interop
+        run: tests/live/smbclient.sh
+      - name: Stop server
+        if: always()
+        run: kill $(cat /tmp/rssmb.pid) 2>/dev/null || true
+
+  # Job 4: smbtorture baseline (nightly only — too slow for PR gating).
+  smbtorture:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.75"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build server
+        run: cargo build --bin rssmb
+      - name: Install smbtorture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y samba-testsuite cifs-utils
+      - name: Run smbtorture baseline
+        run: tests/conformance/run-smbtorture.sh
+
+  # Job 5: Fuzz targets build check (always — catches compile regressions).
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust (nightly for cargo-fuzz)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build fuzz targets
+        run: |
+          cd fuzz
+          cargo fuzz build
+
+  # Job 6: Fuzz targets (nightly only — short runs per target).
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust (nightly for cargo-fuzz)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run fuzz targets (5 min each)
+        run: |
+          cd fuzz
+          rc=0
+          for target in parse_payload read_netbios_frame extract_ntlm_token extract_mech_types proto_decode_header proto_decode_plain_request; do
+            echo "=== Fuzzing $target (5 min) ==="
+            # libFuzzer exits 0 for clean runs, 77 for timeout (no crash).
+            # Any other exit code is a crash or build failure — fail the job.
+            timeout 300 cargo fuzz run "$target" -- -max_len=65536 -timeout=5
+            exit_code=$?
+            if [ $exit_code -ne 0 ] && [ $exit_code -ne 77 ]; then
+              echo "FAIL: $target crashed or failed to build (exit $exit_code)"
+              rc=1
+            fi
+          done
+          exit $rc

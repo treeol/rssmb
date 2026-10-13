@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_read_write_close() {
         let fs = MemoryFs::new();
-        let args = CreateArgs::open_readonly();
+        let _args = CreateArgs::open_readonly();
 
         // Create a file
         let mut create_args = CreateArgs::open_readonly();

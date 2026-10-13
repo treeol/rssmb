@@ -9,18 +9,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 PY=${PY:-/tmp/smbvenv/bin/python}
-SCEN=${*:-"guest guestpriv alice badpass signed enum_guest enum_user"}
+SCEN=${*:-"guest guestpriv alice badpass signed encrypted enum_guest enum_user"}
 LOG=/tmp/rssmb-live-server.log
 
 rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private
 echo "hello from rssmb" > /tmp/rssmb-live/public/README.txt
 echo "secret" > /tmp/rssmb-live/private/s.txt
-
-RUST_LOG=${RUST_LOG:-info,rssmb_server=debug,rssmb_auth=debug} \
-  ./target/debug/rssmb --config tests/live/rssmb-live.toml >"$LOG" 2>&1 &
-SRV=$!
-trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
-sleep 0.7
 
 run_scenarios() {
   for s in "$@"; do
@@ -32,31 +26,57 @@ run_scenarios() {
   done
 }
 
-rc=0
-plain=""; signed=""
-for s in $SCEN; do
-  case $s in signed) signed=1 ;; *) plain="$plain $s" ;; esac
-done
-# Scenarios run against the signing=required server.
-SIGNED_SCEN="signed guestsigned badpass tamper"
-[ -n "$plain" ] && run_scenarios $plain
-
-# "signed": same scenarios against a server with signing = "required".
-if [ -n "$signed" ]; then
-  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+start_server() {
+  local cfg="$1"; shift
   RUST_LOG=${RUST_LOG:-info,rssmb_server=debug,rssmb_auth=debug} \
-    ./target/debug/rssmb --config tests/live/rssmb-live-signed.toml >"$LOG.signed" 2>&1 &
+    ./target/debug/rssmb --config "$cfg" >"$1" 2>&1 &
   SRV=$!
   sleep 0.7
-  for s in $SIGNED_SCEN; do
-    if [ "$s" = tamper ]; then
-      if timeout 40 "$PY" tests/live/tamper.py >/tmp/live-tamper.log 2>&1; then
-        echo "PASS tamper (signed)"; else echo "FAIL tamper (see /tmp/live-tamper.log)"; rc=1; fi
-    else
-      if timeout 20 "$PY" tests/live/client.py "$s" >"/tmp/live-$s-req.log" 2>&1; then
-        echo "PASS $s (signed)"; else echo "FAIL $s (signed, see /tmp/live-$s-req.log)"; rc=1; fi
-    fi
-  done
+}
+
+rc=0
+
+# Partition scenarios into tiers by server config.
+plain=""; signed=""; encrypted=""
+for s in $SCEN; do
+  case $s in
+    signed)        signed=1 ;;
+    encrypted)     encrypted=1 ;;
+    *)             plain="$plain $s" ;;
+  esac
+done
+
+# Tier 1: default config (signing=desired, encryption=disabled).
+if [ -n "$plain" ]; then
+  start_server tests/live/rssmb-live.toml "$LOG"
+  run_scenarios $plain
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 fi
+
+# Tier 2: signing=required config.
+if [ -n "$signed" ]; then
+  start_server tests/live/rssmb-live-signed.toml "$LOG.signed"
+  for s in signed guestsigned badpass tamper; do
+    case "$s" in
+      tamper)
+        if timeout 40 "$PY" tests/live/tamper.py >/tmp/live-tamper.log 2>&1; then
+          echo "PASS tamper (signed)"; else echo "FAIL tamper (see /tmp/live-tamper.log)"; rc=1; fi
+        ;;
+      *)
+        if timeout 20 "$PY" tests/live/client.py "$s" >"/tmp/live-$s-req.log" 2>&1; then
+          echo "PASS $s (signed)"; else echo "FAIL $s (signed, see /tmp/live-$s-req.log)"; rc=1; fi
+        ;;
+    esac
+  done
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+fi
+
+# Tier 3: encryption=desired config (SMB 3.1.1 with GCM).
+if [ -n "$encrypted" ]; then
+  start_server tests/live/rssmb-live-encrypted.toml "$LOG.encrypted"
+  run_scenarios encrypted
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+fi
+
 echo "server log: $LOG"
 exit $rc

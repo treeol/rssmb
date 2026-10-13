@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_file_attributes_roundtrip() {
-        let mut attrs = FileAttributes::new()
+        let attrs = FileAttributes::new()
             .with_normal(true)
             .with_directory(true);
         let mut buf = Cursor::new(Vec::new());

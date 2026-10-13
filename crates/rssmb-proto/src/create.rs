@@ -439,7 +439,6 @@ pub struct LeaseFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use binrw::io::Cursor;
 
     #[test]
     fn test_file_id_display() {
