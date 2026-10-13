@@ -6,10 +6,145 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+
+use crate::ntlmv2;
+
+/// A stored identity for NTLM authentication.
+///
+/// Stores the pre-computed NT hash (MD4 of UTF-16LE password) so the
+/// plaintext password is never retained after config parsing. The NT hash
+/// is sufficient for NTLMv2 proof verification and session key computation.
+#[derive(Clone)]
+pub struct StoredIdentity {
+    pub username: String,
+    /// NT hash (MD4 of UTF-16LE password) — 16 bytes.
+    pub nt_hash: [u8; 16],
+}
+
+impl std::fmt::Debug for StoredIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredIdentity")
+            .field("username", &self.username)
+            .field("nt_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Thread-safe identity store — the set of configured NTLM users.
+///
+/// Built once at server startup from the config. Each identity's NT hash is
+/// pre-computed at construction time so plaintext passwords are never stored
+/// or rebuilt per SESSION_SETUP. Lookups are case-insensitive on username.
+#[derive(Debug, Clone)]
+pub struct IdentityStore {
+    identities: Arc<HashMap<String, StoredIdentity>>,
+}
+
+impl IdentityStore {
+    /// An empty identity store (no configured users — guest/anonymous only).
+    pub fn empty() -> Self {
+        Self {
+            identities: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Build an identity store from sspi AuthIdentity entries (legacy
+    /// constructor — computes NT hashes from plaintext passwords).
+    pub fn from_identities(identities: &[sspi::AuthIdentity]) -> Self {
+        let mut map = HashMap::new();
+        for id in identities {
+            let username = id.username.account_name().to_string();
+            let nt_hash = ntlmv2::nt_hash(id.password.as_ref());
+            map.insert(
+                username.to_lowercase(),
+                StoredIdentity { username, nt_hash },
+            );
+        }
+        Self {
+            identities: Arc::new(map),
+        }
+    }
+
+    /// Build an identity store from a list of (username, password, nt_hash_hex, disabled) tuples.
+    ///
+    /// For each non-disabled user:
+    /// - If `nt_hash` is provided (hex), parse it directly.
+    /// - Otherwise, compute `nt_hash(password)`.
+    ///
+    /// Disabled users are excluded. Invalid hex hashes log a warning and
+    /// are skipped.
+    pub fn from_users(users: impl IntoIterator<Item = (String, String, String, bool)>) -> Self {
+        let mut map = HashMap::new();
+        for (username, password, nt_hash_hex, disabled) in users {
+            if disabled {
+                continue;
+            }
+            let nt_hash = if !nt_hash_hex.is_empty() {
+                match hex::decode(&nt_hash_hex) {
+                    Ok(bytes) if bytes.len() == 16 => {
+                        let mut arr = [0u8; 16];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            username = %username,
+                            "nt_hash is not 16 bytes — skipping user"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            username = %username,
+                            error = %e,
+                            "invalid nt_hash hex — skipping user"
+                        );
+                        continue;
+                    }
+                }
+            } else if !password.is_empty() {
+                ntlmv2::nt_hash(&password)
+            } else {
+                tracing::warn!(
+                    username = %username,
+                    "no password or nt_hash — skipping user"
+                );
+                continue;
+            };
+            map.insert(
+                username.to_lowercase(),
+                StoredIdentity {
+                    username,
+                    nt_hash,
+                },
+            );
+        }
+        Self {
+            identities: Arc::new(map),
+        }
+    }
+
+    /// Look up an identity by username (case-insensitive).
+    pub fn lookup(&self, username: &str) -> Option<StoredIdentity> {
+        self.identities.get(&username.to_lowercase()).cloned()
+    }
+
+    /// Number of configured identities.
+    pub fn len(&self) -> usize {
+        self.identities.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.identities.is_empty()
+    }
+}
 
 /// A stored credential (username + NT hash).
+///
+/// Deprecated: use [`StoredIdentity`] and [`IdentityStore`] instead.
 #[derive(Debug, Clone)]
+#[deprecated(note = "Use StoredIdentity / IdentityStore instead")]
 pub struct StoredCredential {
     pub username: String,
     /// The NT hash (MD4 of UTF-16LE password) as 16 bytes.
@@ -19,15 +154,21 @@ pub struct StoredCredential {
 }
 
 /// Thread-safe credential store.
+///
+/// Deprecated: use [`IdentityStore`] instead — it pre-computes NT hashes
+/// at startup and doesn't need async locking for lookups.
 #[derive(Debug, Clone)]
+#[deprecated(note = "Use IdentityStore instead")]
+#[allow(deprecated)]
 pub struct CredentialStore {
-    credentials: Arc<RwLock<HashMap<String, StoredCredential>>>,
+    credentials: std::sync::Arc<tokio::sync::RwLock<HashMap<String, StoredCredential>>>,
 }
 
+#[allow(deprecated)]
 impl CredentialStore {
     pub fn new() -> Self {
         Self {
-            credentials: Arc::new(RwLock::new(HashMap::new())),
+            credentials: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -80,6 +221,7 @@ impl CredentialStore {
     }
 }
 
+#[allow(deprecated)]
 impl Default for CredentialStore {
     fn default() -> Self {
         Self::new()

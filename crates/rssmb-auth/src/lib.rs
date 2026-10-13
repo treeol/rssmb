@@ -9,13 +9,17 @@
 //! correctly unwrap SPNEGO negTokenResp on the second round.
 
 use thiserror::Error;
+use std::sync::Arc;
 
 pub mod credentials;
 pub mod ntlm_mic;
 pub mod ntlmv2;
 pub mod spnego;
 
+#[allow(deprecated)]
 pub use credentials::CredentialStore;
+pub use credentials::IdentityStore;
+pub use ntlmv2::{nt_hash, compute_session_key};
 
 use sspi::{
     BufferType, DataRepresentation,
@@ -156,29 +160,42 @@ pub trait AuthProvider: Send + Sync {
 /// This avoids the sspi `Negotiate` SSP's bug where it doesn't correctly
 /// unwrap SPNEGO negTokenResp on the second round.
 ///
-/// Server-side credentials (identities) are wired into the Ntlm SSP via
-/// `SspiEx::custom_set_auth_identities` so the acceptor can verify NTLMv2
-/// proofs against real user accounts. If the identities list is empty, the
-/// acceptor operates in anonymous/guest-only mode.
+/// Server-side credentials are stored as pre-computed NT hashes in an
+/// [`IdentityStore`], built once at startup. The provider verifies NTLMv2
+/// proofs against these hashes and computes the session key directly,
+/// without needing the plaintext password or passing it to sspi.
 pub struct NtlmAuthProvider {
-    identities: Vec<sspi::AuthIdentity>,
+    /// Pre-computed NT hashes from the identity store.
+    identities: Arc<IdentityStore>,
     /// Whether guest access is enabled at the server level.
     guest_access: bool,
 }
 
 impl NtlmAuthProvider {
+    #[allow(deprecated)]
     pub fn from_store(_store: &CredentialStore) -> Self {
-        Self { identities: vec![], guest_access: false }
+        Self {
+            identities: Arc::new(IdentityStore::empty()),
+            guest_access: false,
+        }
     }
 
     pub fn with_identities(identities: Vec<sspi::AuthIdentity>) -> Self {
-        Self { identities, guest_access: false }
+        // Legacy constructor: convert plaintext-password identities into
+        // an IdentityStore by computing NT hashes.
+        let store = IdentityStore::from_identities(&identities);
+        Self { identities: Arc::new(store), guest_access: false }
     }
 
     pub fn with_identities_and_guest(
         identities: Vec<sspi::AuthIdentity>,
         guest_access: bool,
     ) -> Self {
+        let store = IdentityStore::from_identities(&identities);
+        Self { identities: Arc::new(store), guest_access }
+    }
+
+    pub fn with_identity_store(identities: Arc<IdentityStore>, guest_access: bool) -> Self {
         Self { identities, guest_access }
     }
 }
@@ -322,32 +339,21 @@ impl AuthProvider for NtlmAuthProvider {
 
         let mut status = result.status;
         if status == SecurityStatus::CompleteNeeded {
-            // The AUTHENTICATE message has been parsed. sspi's accept path
-            // resets `allowed_identities` from the (absent) credentials
-            // handle on this leg, so the candidate list must be re-applied
-            // here. `identity` already holds the wire user/domain and is not
-            // overwritten. With no configured users there is nothing to
-            // verify against → logon failure.
-            //
-            // sspi verifies the proof as (wire user/domain, candidate
-            // password). Passing every configured account would let a client
-            // claim "alice" while proving knowledge of bob's password, so the
-            // candidate list is narrowed to the single account whose name
-            // matches the claimed user.
+            // The AUTHENTICATE message has been parsed. We verify the NTLMv2
+            // proof ourselves using the pre-computed NT hash from the
+            // identity store, and compute the session key directly — no
+            // plaintext password is needed.
             let wire_user = ssp
                 .query_context_names()
                 .map(|n| account_name(&n.username))
                 .map_err(|e| AuthError::LogonFailure(format!("no user in AUTHENTICATE: {e}")))?;
-            let candidate = self
+
+            // Look up the pre-computed NT hash for this user.
+            let stored = self
                 .identities
-                .iter()
-                .find(|id| account_name(&id.username).eq_ignore_ascii_case(&wire_user))
-                .cloned()
+                .lookup(&wire_user)
                 .ok_or_else(|| AuthError::LogonFailure(format!("unknown user {wire_user:?}")))?;
 
-            // The pinned sspi only rejects a wrong password through the
-            // optional MIC; without a MIC it accepts anything. Check the
-            // NTLMv2 proof ourselves first — this is the authoritative check.
             let challenge = state
                 .server_challenge
                 .ok_or_else(|| AuthError::LogonFailure("AUTHENTICATE before CHALLENGE".into()))?;
@@ -358,8 +364,8 @@ impl AuthProvider for NtlmAuthProvider {
             if account_name_str(&parsed_user) != wire_user {
                 return Err(AuthError::LogonFailure("AUTHENTICATE user mismatch".into()));
             }
-            let password = candidate.password.as_ref().to_string();
-            if !ntlmv2::verify(&fields, &password, &challenge) {
+            // Verify the NTLMv2 proof using the pre-computed NT hash.
+            if !ntlmv2::verify_with_nt_hash(&fields, &stored.nt_hash, &challenge) {
                 tracing::debug!(user = %wire_user, "NTLMv2 proof mismatch");
                 return Err(AuthError::LogonFailure("NTLMv2 proof mismatch".into()));
             }
@@ -368,12 +374,19 @@ impl AuthProvider for NtlmAuthProvider {
             // Save the negotiate flags for the mechListMIC computation.
             state.ntlm_neg_flags = fields.neg_flags;
 
-            ssp.custom_set_auth_identities(vec![candidate])
+            // Compute the session key directly from the NT hash — we don't
+            // need sspi to do this for us, and we don't have the plaintext
+            // password to pass to sspi's identity machinery.
+            let session_key = ntlmv2::compute_session_key(&stored.nt_hash, &fields);
+            state.session_key = Some(session_key.clone());
+
+            // Still call complete_auth_token so sspi transitions its internal
+            // state, but pass an empty identity list — we've already verified
+            // the proof ourselves.
+            ssp.custom_set_auth_identities(vec![])
                 .map_err(|e| AuthError::SspiError(format!("set_auth_identities: {e}")))?;
-            // complete_auth_token verifies the NTLMv2 proof against the
-            // candidates (wrong password → error here).
             status = ssp.complete_auth_token(&mut []).map_err(|e| {
-                tracing::debug!("NTLM proof verification failed: {e}");
+                tracing::debug!("NTLM complete_auth_token: {e}");
                 AuthError::LogonFailure(e.to_string())
             })?;
         }
@@ -388,10 +401,16 @@ impl AuthProvider for NtlmAuthProvider {
                 Err(AuthError::LogonFailure("acceptor completed without a verified proof".into()))
             }
             SecurityStatus::Ok | SecurityStatus::CompleteNeeded => {
-                let key_info = ssp
-                    .query_context_session_key()
-                    .map_err(|e| AuthError::SspiError(format!("session_key: {e}")))?;
-                let session_key = key_info.session_key.as_ref().clone();
+                // Use the session key we computed ourselves from the NT hash
+                // (set during CompleteNeeded processing). Fall back to sspi's
+                // if our computation didn't happen for some reason.
+                let session_key = state.session_key.clone().unwrap_or_else(|| {
+                    let key_info = ssp
+                        .query_context_session_key()
+                        .map_err(|e| AuthError::SspiError(format!("session_key: {e}")))
+                        .ok();
+                    key_info.map(|k| k.session_key.as_ref().clone()).unwrap_or_default()
+                });
 
                 // Authenticated account name. Fail closed rather than invent
                 // a principal — valid_users checks depend on it.

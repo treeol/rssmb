@@ -65,15 +65,37 @@ pub struct ServerConfig {
 
 /// User account configuration for NTLM authentication.
 ///
-/// For MVP, passwords are stored in plaintext. In production, use an external
-/// auth file mounted as a Secret (k8s) or environment variable — never commit
-/// real credentials to version control.
-#[derive(Debug, Clone, Deserialize)]
+/// Either `password` (plaintext) or `nt_hash` (hex-encoded NT hash) may be
+/// used. NT hashes are preferred for production — they are password-equivalent
+/// but never expose the plaintext. Use `rssmb hash-password <password>` to
+/// generate an `nt_hash` value.
+///
+/// Passwords and hashes are secrets. The config file's permissions should be
+/// restricted (e.g. `chmod 600`) and it should be mounted as a secret, not
+/// committed to version control.
+#[derive(Clone, Deserialize)]
 pub struct UserConfig {
     pub username: String,
+    /// Plaintext password (optional if `nt_hash` is provided).
+    #[serde(default)]
     pub password: String,
+    /// NT hash as hex (alternative to plaintext password). When set, the
+    /// plaintext `password` field is ignored and never needed.
+    #[serde(default)]
+    pub nt_hash: String,
     #[serde(default)]
     pub disabled: bool,
+}
+
+impl std::fmt::Debug for UserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("nt_hash", &self.nt_hash.as_str().is_empty().then(|| "<unset>").unwrap_or("<redacted>"))
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 fn default_listen_addr() -> String { "0.0.0.0".to_string() }
@@ -310,6 +332,49 @@ disabled = true
         assert!(!config.users[0].disabled);
         assert_eq!(config.users[1].username, "guest_user");
         assert!(config.users[1].disabled);
+    }
+
+    #[test]
+    fn test_debug_redacts_password() {
+        let user = UserConfig {
+            username: "alice".to_string(),
+            password: "secret123".to_string(),
+            nt_hash: String::new(),
+            disabled: false,
+        };
+        let debug = format!("{:?}", user);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret123"));
+    }
+
+    #[test]
+    fn test_debug_redacts_nt_hash() {
+        let user = UserConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            nt_hash: "deadbeef".to_string(),
+            disabled: false,
+        };
+        let debug = format!("{:?}", user);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("deadbeef"));
+    }
+
+    #[test]
+    fn test_nt_hash_field_parsed() {
+        let toml_str = r#"
+guest_access = true
+health_port = 8080
+max_credits = 1024
+
+[[users]]
+username = "alice"
+nt_hash = "0123abcd"
+disabled = false
+"#;
+        let config = ServerConfig::from_toml(toml_str).unwrap();
+        assert_eq!(config.users[0].nt_hash, "0123abcd");
+        assert_eq!(config.users[0].password, "");
     }
 
     #[test]

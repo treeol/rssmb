@@ -52,8 +52,10 @@ pub struct ServerState {
     pub sessions: Arc<tokio::sync::RwLock<Vec<Arc<Session>>>>,
     /// Global open table (for share-mode conflict tracking).
     pub open_table: Arc<opens::OpenTable>,
-    /// NTLM credential store for user authentication.
-    pub credentials: Arc<rssmb_auth::CredentialStore>,
+    /// NTLM identity store — built once at startup from config users.
+    /// Each user's NT hash is pre-computed so plaintext passwords are never
+    /// stored or rebuilt per session_setup.
+    pub identities: Arc<rssmb_auth::IdentityStore>,
     /// Shutdown signal.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Stable server GUID (generated once, used for all negotiate responses).
@@ -67,23 +69,23 @@ impl ServerState {
         let mut guid = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut guid);
 
-        // Build the credential store from config users.
-        let credentials = Arc::new(rssmb_auth::CredentialStore::new());
-        for user in &config.users {
-            if !user.disabled {
-                credentials.add_sync(rssmb_auth::credentials::StoredCredential {
-                    username: user.username.clone(),
-                    nt_hash: [0u8; 16], // Placeholder — sspi uses the password via AuthIdentity
-                    disabled: user.disabled,
-                });
-            }
-        }
+        // Build the identity store from config users — NT hashes are
+        // pre-computed here so the plaintext password is never retained
+        // or rebuilt per SESSION_SETUP. Disabled users are excluded.
+        let identities = Arc::new(rssmb_auth::IdentityStore::from_users(
+            config.users.iter().map(|u| (
+                u.username.clone(),
+                u.password.clone(),
+                u.nt_hash.clone(),
+                u.disabled,
+            )),
+        ));
 
         Self {
             config: Arc::new(config),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             open_table: Arc::new(opens::OpenTable::new()),
-            credentials,
+            identities,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             server_guid: guid,
         }

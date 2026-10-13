@@ -19,3 +19,4 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 md4 = "0.10"
 md-5 = "0.10"
+hex = "0.4"

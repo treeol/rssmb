@@ -1,6 +1,6 @@
 //! RSSMB server binary — config loading, CLI args, signal handling, health endpoint.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rssmb_server::{ServerConfig, ServerState};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +12,10 @@ mod health;
 #[derive(Parser, Debug)]
 #[command(name = "rssmb", version, about)]
 struct Args {
-    /// Path to config file (TOML)
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Path to config file (TOML) — used when no subcommand is given.
     #[arg(short, long, default_value = "rssmb.toml")]
     config: PathBuf,
 
@@ -29,10 +32,71 @@ struct Args {
     verbose: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Compute the NT hash (MD4 of UTF-16LE) for a password.
+    ///
+    /// The hash can be used in the config as `nt_hash = "..."` instead of
+    /// storing the plaintext password.
+    HashPassword {
+        /// The password to hash.
+        password: String,
+    },
+
+    /// Validate the config file without starting the server.
+    CheckConfig {
+        /// Path to config file (TOML).
+        #[arg(short, long, default_value = "rssmb.toml")]
+        config: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Handle subcommands first.
+    if let Some(command) = &args.command {
+        match command {
+            Command::HashPassword { password } => {
+                let hash = rssmb_auth::nt_hash(password);
+                println!("{}", hex::encode(&hash));
+                return Ok(());
+            }
+            Command::CheckConfig { config } => {
+                // Initialize logging for the check-config subcommand.
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+                    .init();
+
+                let config_str = std::fs::read_to_string(config)
+                    .map_err(|e| {
+                        error!("Failed to read config file {}: {}", config.display(), e);
+                        e
+                    })?;
+                let config = ServerConfig::from_toml(&config_str)
+                    .map_err(|e| {
+                        error!("Failed to parse config: {}", e);
+                        e
+                    })?;
+                if let Err(msg) = config.validate() {
+                    error!("Config validation error: {}", msg);
+                    return Err(msg.into());
+                }
+                info!("Config OK: {} shares, {} users", config.shares.len(), config.users.len());
+                return Ok(());
+            }
+        }
+    }
+
+    // Default: run the server.
+    run_server(args).await
+}
+
+async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging — respect RUST_LOG env var, fallback to "info"
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
@@ -75,6 +139,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Failed to read config file {}: {}", args.config.display(), e);
             e
         })?;
+
+    // Warn if the config file is too permissive (it may contain passwords or
+    // NT hashes). On Unix, 0o640 or stricter is recommended.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&args.config) {
+            let mode = meta.permissions().mode();
+            if mode & 0o007 != 0 {
+                warn!(
+                    path = %args.config.display(),
+                    mode = format!("{:o}", mode),
+                    "config file is world-readable — it may contain passwords or NT hashes. \
+                     Restrict with: chmod 640 {}",
+                    args.config.display()
+                );
+            } else if mode & 0o070 != 0 {
+                warn!(
+                    path = %args.config.display(),
+                    mode = format!("{:o}", mode),
+                    "config file is group-readable — it may contain passwords or NT hashes. \
+                     Consider restricting with: chmod 600 {}",
+                    args.config.display()
+                );
+            }
+        }
+    }
 
     let mut config = ServerConfig::from_toml(&config_str)
         .map_err(|e| {

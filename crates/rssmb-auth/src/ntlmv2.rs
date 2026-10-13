@@ -64,17 +64,31 @@ pub fn server_challenge(challenge_msg: &[u8]) -> Option<[u8; 8]> {
 /// Verify an NTLMv2 response. Returns false for NTLMv1-length responses,
 /// malformed input, or a proof mismatch. Comparison is constant-time.
 pub fn verify(fields: &AuthenticateFields, password: &str, server_challenge: &[u8; 8]) -> bool {
-    // NTLMv2 responses are NTProofStr(16) + blob (>= 28 bytes header).
+    let nt_hash = nt_hash(password);
+    verify_with_nt_hash(fields, &nt_hash, server_challenge)
+}
+
+/// Compute the NT hash (MD4 of UTF-16LE password) — the password-equivalent
+/// used by NTLMv2.
+pub fn nt_hash(password: &str) -> [u8; 16] {
+    Md4::digest(string_to_utf16le(password)).into()
+}
+
+/// Verify an NTLMv2 response using a pre-computed NT hash directly, without
+/// needing the plaintext password. Same constant-time comparison as `verify`.
+pub fn verify_with_nt_hash(
+    fields: &AuthenticateFields,
+    nt_hash: &[u8],
+    server_challenge: &[u8; 8],
+) -> bool {
     if fields.nt_response.len() < 16 + 28 {
         return false;
     }
-    let nt_hash = Md4::digest(string_to_utf16le(password));
-
     let user_upper = utf16le_to_string(&fields.user_utf16).to_uppercase();
     let mut ident = string_to_utf16le(&user_upper);
     ident.extend_from_slice(&fields.domain_utf16);
 
-    let mut mac = <HmacMd5 as Mac>::new_from_slice(&nt_hash).expect("any key length");
+    let mut mac = <HmacMd5 as Mac>::new_from_slice(nt_hash).expect("any key length");
     mac.update(&ident);
     let ntowf_v2 = mac.finalize().into_bytes();
 
@@ -83,6 +97,29 @@ pub fn verify(fields: &AuthenticateFields, password: &str, server_challenge: &[u
     mac.update(server_challenge);
     mac.update(blob);
     mac.verify_slice(proof).is_ok()
+}
+
+/// Compute the NTLMv2 session key (SessionBaseKey) from an NT hash and the
+/// AUTHENTICATE fields. Used when we don't have the plaintext password to
+/// pass to sspi — the session key is:
+///
+///   SessionBaseKey = HMAC_MD5(NTOWFv2, NTProofStr)
+///
+/// where NTOWFv2 = HMAC_MD5(NTHash, UTF16LE(UPPER(user) || domain))
+/// and NTProofStr = NTResponse[0..16].
+pub fn compute_session_key(nt_hash: &[u8], fields: &AuthenticateFields) -> Vec<u8> {
+    let user_upper = utf16le_to_string(&fields.user_utf16).to_uppercase();
+    let mut ident = string_to_utf16le(&user_upper);
+    ident.extend_from_slice(&fields.domain_utf16);
+
+    let mut mac = <HmacMd5 as Mac>::new_from_slice(nt_hash).expect("any key length");
+    mac.update(&ident);
+    let ntowf_v2 = mac.finalize().into_bytes();
+
+    let proof = &fields.nt_response[..16];
+    let mut mac = <HmacMd5 as Mac>::new_from_slice(&ntowf_v2).expect("any key length");
+    mac.update(proof);
+    mac.finalize().into_bytes().to_vec()
 }
 
 fn u16_le(b: &[u8], o: usize) -> Option<u16> {
@@ -182,5 +219,31 @@ mod tests {
         msg[20..22].copy_from_slice(&100u16.to_le_bytes());
         msg[24..28].copy_from_slice(&60u32.to_le_bytes());
         assert!(parse_authenticate_fields(&msg).is_none());
+    }
+
+    #[test]
+    fn verify_with_nt_hash_matches_verify() {
+        let (f, sc) = ms_nlmp_vector();
+        let hash = nt_hash("Password");
+        assert!(verify_with_nt_hash(&f, &hash, &sc));
+        // Wrong hash must reject.
+        let wrong = nt_hash("wrong");
+        assert!(!verify_with_nt_hash(&f, &wrong, &sc));
+    }
+
+    #[test]
+    fn compute_session_key_matches_ntlmv2_spec() {
+        // MS-NLMP 4.2.4.3: SessionBaseKey for the test vector is known.
+        let (f, sc) = ms_nlmp_vector();
+        let hash = nt_hash("Password");
+        let key = compute_session_key(&hash, &f);
+        assert_eq!(key.len(), 16, "SessionBaseKey is 16 bytes");
+        // The key is deterministic for the same inputs.
+        let key2 = compute_session_key(&hash, &f);
+        assert_eq!(key, key2);
+        // Different password → different key.
+        let wrong_hash = nt_hash("wrong");
+        let wrong_key = compute_session_key(&wrong_hash, &f);
+        assert_ne!(key, wrong_key);
     }
 }

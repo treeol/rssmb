@@ -940,35 +940,16 @@ async fn handle_session_setup(
     let auth_state = auth_guard.get_or_insert_with(|| rssmb_auth::AuthState::new());
 
     // Create the NTLM auth provider with server-side credentials from
-    // ServerState. The provider verifies NTLMv2 proofs against these
-    // identities. Guest fallback is gated on config.guest_access.
-    let identities: Vec<sspi::AuthIdentity> = state
-        .config
-        .users
-        .iter()
-        .filter(|u| !u.disabled)
-        .filter_map(|u| {
-            let username = sspi::Username::parse(&u.username)
-                .or_else(|_| sspi::Username::new(&u.username, None));
-            match username {
-                Ok(un) => Some(sspi::AuthIdentity {
-                    username: un,
-                    password: u.password.clone().into(),
-                }),
-                Err(e) => {
-                    tracing::warn!(username = %u.username, error = %e, "skipping invalid username in config");
-                    None
-                }
-            }
-        })
-        .collect();
+    // ServerState. The identity store is built once at startup with
+    // pre-computed NT hashes — no plaintext passwords are rebuilt per
+    // SESSION_SETUP. Guest fallback is gated on config.guest_access.
     // Guest/anonymous sessions have no key and can never be signed, so
     // `signing = "required"` disables them (as Windows does).
     let guest_allowed = state.config.guest_access
         && state.config.signing != crate::config::SigningPolicy::Required;
     let provider: Box<dyn rssmb_auth::AuthProvider> =
-        Box::new(rssmb_auth::NtlmAuthProvider::with_identities_and_guest(
-            identities,
+        Box::new(rssmb_auth::NtlmAuthProvider::with_identity_store(
+            state.identities.clone(),
             guest_allowed,
         ));
 

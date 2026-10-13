@@ -114,8 +114,9 @@ See `config/rssmb.example.toml` for production-safe defaults, or
 - `guest_access` — allow anonymous logons as guest (only for shares with `guest_ok`)
 - `health_port` — HTTP health/metrics endpoint (default: `8080`)
 - `[shares.<name>]` — `path`, `read_only`, `guest_ok`, `valid_users`
-- `[[users]]` — `username`, `password`, `disabled` (NTLMv2; passwords are plaintext
-  in the file — mount it as a secret)
+- `[[users]]` — `username`, `password` (plaintext) or `nt_hash` (hex NT hash,
+  preferred), `disabled`. Generate hashes with `rssmb hash-password <password>`.
+  The config file should be `chmod 600` — it contains password-equivalent secrets.
 
 ## Testing
 

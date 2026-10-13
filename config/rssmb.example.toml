@@ -42,10 +42,17 @@ valid_users = ["alice"]
 
 # ── Authentication ─────────────────────────────────────────────────────
 # User accounts for NTLM authentication.
-# Passwords are stored in plaintext in this file — for production,
-# mount it as a read-only secret and restrict its permissions.
-# Phase 1.3 will add NT-hash-only storage in a separate users file.
+# Either `password` (plaintext) or `nt_hash` (hex NT hash) may be used.
+# NT hashes are preferred — generate with: `rssmb hash-password <password>`.
+# The config file may contain passwords or hashes, so restrict its
+# permissions (chmod 600) and mount it as a secret in production.
 #
+# [[users]]
+# username = "alice"
+# nt_hash = "8846f7eaee8fb117ad06bdd830b7586c"  # hash of "password"
+# disabled = false
+#
+# Or with plaintext password (not recommended for production):
 # [[users]]
 # username = "alice"
 # password = "change-me"
