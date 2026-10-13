@@ -1,11 +1,12 @@
 # RSSMB — Next Steps (implementation guide)
 
-Status snapshot: 2026-10-13 (`a4ba83b`). Steps 1–9 are done: SMB 2.1–3.1.1
+Status snapshot: 2026-10-13 (`bd8aca8`). Steps 1–10 are done: SMB 2.1–3.1.1
 with signing, AES-128-GCM encryption, NTLMv2 auth, SrvSvc share enumeration,
-and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 295 unit
+and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 339 unit
 tests pass (including 14 TCP integration tests). GNOME Files, `smbclient`,
-and Linux kernel CIFS mounts all work. Next: 10.3–10.6 (CI clients,
-smbtorture baseline, fuzz targets, unit-test gaps).
+and Linux kernel CIFS mounts all work. Steps 9–10 (hygiene, decoupling,
+conformance, testing, fuzzing) complete. Next: Phase 5+ (oplock/lease,
+multichannel, persistent handles).
 
 Reference specs: MS-SMB2 (protocol), MS-FSCC (file/FS info structures),
 MS-SRVS + MS-RPCE (share enumeration), MS-NLMP (NTLM), MS-ERREF (NTSTATUS).
@@ -594,9 +595,21 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
 - **10.5 — Done (code only).** `fuzz/` with 6 cargo-fuzz targets: `parse_payload`,
   `read_netbios_frame`, `extract_ntlm_token`, `extract_mech_types`,
   `proto_decode_header`, `proto_decode_plain_request`. CI job runs nightly (5 min/target).
-- **10.6 — Remaining.** Golden-byte fixtures for every `rssmb-proto` struct,
-  QUERY_INFO/QUERY_DIRECTORY class tests, NDR decoder fixture, 3.1.1 preauth
-  end-to-end golden test.
+- **10.6 — Done.** Golden-byte round-trip tests for every major `rssmb-proto` struct
+  (44 new tests, 295→339): FileId, OplockBreakMsg, LeaseBreakNotify,
+  LeaseBreakAckResponse, CreateResponse, CloseRequest/Response, FileAccessMask,
+  CreateOptions, ShareAccessFlags, LeaseState, ErrorResponse, WriteRequest,
+  ReadResponse, ReadFlags, WriteFlags, FlushResponse, SessionSetupResponse,
+  SessionFlags, SessionSecurityMode, TreeDisconnect Request/Response, ShareFlags,
+  TreeCapabilities. QUERY_INFO golden-byte tests: FileBasicInfo, FileStandardInfo,
+  FileInternalInfo, FileNetworkOpenInfo, FileAllInfo, FileAttributeTagInfo.
+  QUERY_DIRECTORY golden-byte tests: classes 1, 2, 3, 12, 37, 38. Filesystem info
+  golden-byte tests: FileFsSizeInfo, FileFsDeviceInfo, FileFsFullSizeInfo. NDR
+  decoder fixtures: NetrShareEnum (single/empty/3-shares), NetrShareGetInfo
+  (found/not-found), NetrServerGetInfo (level 100). 3.1.1 preauth/KDF
+  end-to-end transcript golden test: H0→hash chain→KDF→CMAC sign→verify +
+  label isolation. Also fixed `OplockBreakMsg` StructureSize bug (12→24 per
+  MS-SMB2 2.2.23.1).
 - **Real clients (manual):** GVFS, macOS Finder, Windows 11 `net use`/`net view`.
 - **Unverified in sandbox:** `cargo fmt --check` and `cargo clippy` (rustfmt/clippy
   not installable; rust-toolchain.toml pins them for CI). smbtorture and fuzz
