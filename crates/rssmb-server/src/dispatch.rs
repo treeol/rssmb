@@ -115,6 +115,12 @@ pub struct ConnState {
     /// `Conn` → hash into preauth_conn; `Session(sid)` → hash into preauth_sessions[sid].
     /// Consumed exactly once by the connection loop after encode+sign.
     pub preauth_hash_response: std::sync::Arc<std::sync::Mutex<Option<PreauthTarget>>>,
+    /// Per-connection next TreeId counter (MS-SMB2 3.3.1.5: per-session, starts at 1).
+    pub next_tree_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Per-connection next volatile FileId counter (MS-SMB2 3.3.1.6).
+    pub next_volatile_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Per-connection random persistent FileId base (MS-SMB2 3.3.1.6).
+    pub persistent_base: u64,
 }
 
 /// Per-session SMB2 message signing state (MS-SMB2 3.3.1.8).
@@ -978,7 +984,7 @@ async fn handle_session_setup(
         // A fresh authentication: discard any stale per-connection auth state
         // and invalidate the SessionId it was bound to.
         *auth_state = rssmb_auth::AuthState::new();
-        let new_id = next_session_id();
+        let new_id = next_session_id(conn_state);
         let mut pending = conn_state.pending_sessions.write().await;
         pending.clear();
         pending.insert(new_id);
@@ -1458,22 +1464,39 @@ fn handle_echo(req_header: &Header) -> FramedResponse {
 
 // ── Phase 3: File serving handlers ─────────────────────────────────────
 
-/// A per-connection open handle table: maps SMB FileId → (tree_id, vfs OpenId).
-static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Allocate a fresh, non-zero SMB2 SessionId.
-fn next_session_id() -> u64 {
-    NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Allocate a fresh, non-zero SMB2 SessionId (random with collision check).
+fn next_session_id(conn_state: &ConnState) -> u64 {
+    use rand::Rng;
+    loop {
+        let id: u64 = rand::thread_rng().gen_range(1..u64::MAX);
+        // Check against active sessions and pending sessions.
+        let sessions = conn_state.sessions.try_read();
+        let pending = conn_state.pending_sessions.try_read();
+        let in_sessions = sessions.as_ref()
+            .map(|s| s.iter().any(|sess| sess.id == id))
+            .unwrap_or(false);
+        let in_pending = pending.as_ref()
+            .map(|p| p.contains(&id))
+            .unwrap_or(false);
+        if !in_sessions && !in_pending {
+            return id;
+        }
+    }
 }
 
-static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Allocate a per-connection TreeId (starts at 1, never 0 or 0xFFFFFFFF).
+fn next_tree_id(conn_state: &ConnState) -> u32 {
+    conn_state.next_tree_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
-fn next_file_id() -> rssmb_proto::create::FileId {
-    let volatile = NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    rssmb_proto::create::FileId {
-        persistent: volatile,
-        volatile,
-    }
+/// Allocate a per-connection FileId: volatile from a counter, persistent random.
+fn next_file_id(conn_state: &ConnState) -> rssmb_proto::create::FileId {
+    let volatile = conn_state.next_volatile_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Skip the sentinel value (0xFFFFFFFFFFFFFFFF) used by substitute_file_id.
+    let volatile = if volatile == u64::MAX { 0 } else { volatile };
+    let persistent = conn_state.persistent_base.wrapping_add(volatile);
+    rssmb_proto::create::FileId { persistent, volatile }
 }
 
 /// TREE_CONNECT — look up a share and create a tree connection.
@@ -1515,7 +1538,7 @@ async fn handle_tree_connect(
     // Accept the connect as a pipe share so clients don't abort; the RPC layer
     // behind it is still a stub.
     if share_name.eq_ignore_ascii_case("IPC$") {
-        let tree_id = NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+        let tree_id = next_tree_id(conn_state);
         conn_state.trees.write().await.insert(
             tree_id,
             TreeEntry {
@@ -1596,7 +1619,7 @@ async fn handle_tree_connect(
     };
 
     // Assign tree ID
-    let tree_id = NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+    let tree_id = next_tree_id(conn_state);
 
     // Store tree in connection tree table with owning session and policy
     let tree_encrypt_data = share_config.encrypt_data;
@@ -1735,7 +1758,7 @@ async fn handle_create(
             debug!(conn_id = conn_state.conn_id, pipe = %file_path, "create on IPC$ tree: unknown pipe");
             return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
-        let file_id = next_file_id();
+        let file_id = next_file_id(conn_state);
         conn_state.opens.write().await.insert(
             file_id.volatile,
             OpenEntry {
@@ -1825,7 +1848,7 @@ async fn handle_create(
 
     match vfs.create("", &file_path, &create_args).await {
         Ok(open_id) => {
-            let file_id = next_file_id();
+            let file_id = next_file_id(conn_state);
 
             // Store the open in the per-connection open table
             conn_state.opens.write().await.insert(
@@ -3228,6 +3251,9 @@ mod tests {
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
+            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            persistent_base: 0,
         }
     }
 
@@ -3825,6 +3851,53 @@ mod tests {
             Some(FramedResponse::Error { status, .. }) => assert_eq!(status, NtStatus::NotSupported),
             other => panic!("expected NotSupported, got {:?}", other),
         }
+    }
+
+    // --- ID allocation tests (Step 9.5) ---
+
+    #[tokio::test]
+    async fn tree_ids_are_per_connection_and_start_at_1() {
+        let conn = make_conn_state();
+        let id1 = next_tree_id(&conn);
+        let id2 = next_tree_id(&conn);
+        assert_eq!(id1, 1, "first TreeId should be 1");
+        assert_eq!(id2, 2, "second TreeId should be 2");
+
+        // A second connection gets its own counter starting at 1.
+        let conn2 = make_conn_state();
+        let id3 = next_tree_id(&conn2);
+        assert_eq!(id3, 1, "new connection TreeId should restart at 1");
+    }
+
+    #[tokio::test]
+    async fn file_ids_volatile_never_hits_sentinel() {
+        let conn = make_conn_state();
+        // Set the counter close to u64::MAX to test the skip.
+        conn.next_volatile_id.store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        let fid1 = next_file_id(&conn);
+        let fid2 = next_file_id(&conn);
+        assert_ne!(fid1.volatile, u64::MAX, "volatile must never be 0xFFFF...FFFF");
+        assert_ne!(fid2.volatile, u64::MAX, "volatile must never be 0xFFFF...FFFF");
+    }
+
+    #[tokio::test]
+    async fn file_ids_persistent_differs_from_volatile() {
+        let mut conn = make_conn_state();
+        conn.persistent_base = 0x1234_5678_9ABC_DEF0;
+        let fid = next_file_id(&conn);
+        // persistent = base + volatile; with base != 0 they should differ.
+        assert_ne!(fid.persistent, fid.volatile, "persistent should differ from volatile when base != 0");
+    }
+
+    #[tokio::test]
+    async fn session_ids_are_random_and_nonzero() {
+        let conn = make_conn_state();
+        let id1 = next_session_id(&conn);
+        let id2 = next_session_id(&conn);
+        assert_ne!(0, id1, "SessionId must be non-zero");
+        assert_ne!(0, id2, "SessionId must be non-zero");
+        // Random — extremely unlikely to collide.
+        assert_ne!(id1, id2, "SessionId should be random (collision is astronomically unlikely)");
     }
 }
 

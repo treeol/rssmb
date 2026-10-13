@@ -180,6 +180,9 @@ impl Connection {
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
+            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            persistent_base: rand::random::<u64>(),
         };
 
         // Read loop.
@@ -1156,6 +1159,9 @@ mod tests {
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
+            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            persistent_base: 0,
         };
 
         let vfs: Arc<dyn Vfs> = Arc::new(rssmb_vfs::memoryfs::MemoryFs::new());
