@@ -19,8 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/rssmb /usr/local/bin/rssmb
 
-# Default config file
-COPY config/rssmb.toml /etc/rssmb/rssmb.toml
+# Config is NOT baked in — mount it as a volume (see docker/compose.yml).
+# The server will fail fast if /etc/rssmb/rssmb.toml is missing.
 
 # Health endpoint on 8080, SMB on 445
 EXPOSE 445 8080

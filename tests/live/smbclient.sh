@@ -18,7 +18,7 @@ set -u
 cd "$(dirname "$0")/../.."
 HOST=${RSSMB_HOST:-127.0.0.1}
 PORT=${RSSMB_PORT:-4450}
-SCEN=${*:-"list_anon list_alice ls get put smb2 smb3 smb311"}
+SCEN=${*:-"list_anon list_alice ls get put rename smb2 smb3 smb311"}
 
 # Use an array so word-splitting doesn't break the --option argument.
 SMBCLIENT=(smbclient "--option=client min protocol=SMB2" "--port=$PORT")
@@ -61,6 +61,11 @@ for s in $SCEN; do
       echo "uploaded via smbclient" > /tmp/rssmb-smbclient-put.txt
       run "$s" "${SMBCLIENT[@]}" "//$HOST/public" -U 'alice%TestPass123' \
         -c 'put /tmp/rssmb-smbclient-put.txt upload.txt; del upload.txt'
+      ;;
+    rename)
+      echo "rename test" > /tmp/rssmb-smbclient-rename.txt
+      run "$s" "${SMBCLIENT[@]}" "//$HOST/public" -U 'alice%TestPass123' \
+        -c 'put /tmp/rssmb-smbclient-rename.txt before.txt; rename before.txt after.txt; del after.txt'
       ;;
     smb2)
       run "$s" "${SMBCLIENT[@]}" -m SMB2 "//$HOST/public" -U 'alice%TestPass123' -c 'ls'

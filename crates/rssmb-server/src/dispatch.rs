@@ -23,6 +23,7 @@ use rssmb_proto::plain::{PlainResponse, RequestContent, ResponseContent};
 
 use rssmb_proto::FileTime;
 use rssmb_proto::Guid;
+use rssmb_proto::info::InfoType;
 
 use crate::session::Session;
 use crate::ServerState;
@@ -2546,9 +2547,8 @@ async fn handle_set_info(
     }
 
     // Only File-type SET_INFO is supported for now.
-    // info_type is #[br(temp)] so derive it from info_class.
     // InfoType::File = 0x01 is the only supported type for SET_INFO.
-    let is_file_type = si_req.info_class.0 == 0x01;
+    let is_file_type = si_req.info_type == InfoType::File;
     if !is_file_type {
         return error_response_for(Command::SetInfo, NtStatus::NotSupported, &req.header);
     }

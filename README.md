@@ -56,8 +56,9 @@ cargo run --bin rssmb -- --config config/rssmb.toml
 ## Try it (Docker)
 
 `config/rssmb.toml` ships with two shares (`public` = guest-ok, `homes` =
-users only) and a test account `alice` / `TestPass123` — change it before
-exposing the server.
+users only) and a test account `alice` / `TestPass123` — **this is a dev
+config.** For production, copy `config/rssmb.example.toml` to `config/rssmb.toml`
+and edit it (signing required, guest disabled, real users).
 
 ```sh
 mkdir -p data/public data/homes && sudo chown -R 1000:1000 data
@@ -98,7 +99,8 @@ macOS Finder, Windows 11, and GNOME Files all connect over SMB 3.x.
 
 ## Configuration
 
-See `config/rssmb.toml` for all options. Key settings:
+See `config/rssmb.example.toml` for production-safe defaults, or
+`config/rssmb.toml` for a dev/test config. Key settings:
 
 - `listen_addr` / `port` — bind address (default: `0.0.0.0:445`)
 - `min_dialect` / `max_dialect` — SMB dialect range (default: `smb21` to `smb311`).

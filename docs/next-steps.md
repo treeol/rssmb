@@ -23,7 +23,7 @@ container and exercises ls/read/write/append/overwrite/mkdir/rename/delete.
 | Area | State |
 |---|---|
 | TCP / NetBIOS framing, per-connection task, shutdown | working |
-| NEGOTIATE | **SMB 2.1 only**; SIGNING_REQUIRED from config |
+| NEGOTIATE | **SMB 2.1–3.1.1**; dialect selection, SIGNING_REQUIRED from config, negotiate contexts |
 | SESSION_SETUP: NTLMv2 (own proof check + sspi), SPNEGO or bare NTLMSSP, anonymous→guest | working (impacket, cifs.ko) |
 | SMB 2.1 signing (HMAC-SHA256), per-message incl. compounds | working; unsigned/forged requests discarded under `required` |
 | TREE_CONNECT (policy, IPC$ pipe share, MaximalAccess) | working |
@@ -44,15 +44,17 @@ gets STATUS_INVALID_PARAMETER. Disconnects no longer stall 5 s (a leftover
 clone of the write channel kept the writer alive). Propagated
 compound errors now carry the member's effective SessionId/TreeId, so they
 get signed. An abrupt disconnect now closes every VFS handle and cancels
-async ops. Still open from that review: no MessageId window (duplicates or
-replays aren't rejected), no negotiate state machine (repeated NEGOTIATE is
-accepted), and LARGE_MTU is advertised without multi-credit validation.
+async ops. The negotiate state machine is in place: a second NEGOTIATE
+or any command before NEGOTIATE disconnects the connection, and
+VALIDATE_NEGOTIATE_INFO validates against the stored NegotiateRecord.
+Still open: no MessageId window (duplicates or replays aren't rejected),
+and LARGE_MTU is advertised without multi-credit validation.
 
 **Known gaps found by the live tests and not yet fixed:** multi-credit
 requests (>64 KiB I/O) are capped by negotiating 64 KiB; GVFS, macOS and
-Windows not retested (they prefer SMB 3.x); the smb-msg patches are still
-untracked (Step 9) — they now include several fixes for panics and decode
-failures on real client traffic (create contexts, oplock levels).
+Windows not retested (they prefer SMB 3.x). The smb-rs dependency was
+removed in Step 9 (smb-rs decoupled, rssmb-proto handles all wire
+encoding); the old smb-msg patches are no longer needed.
 
 ---
 

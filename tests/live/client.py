@@ -7,6 +7,7 @@ Usage: client.py <scenario> [<scenario> ...]
   badpass     alice with wrong password -> must fail
   guestpriv   guest -> private must be denied
   signed      alice with client-side signing required
+  rename      alice -> put/rename/get/delete (exercises SET_INFO rename)
   enum_guest  anonymous -> NetrShareEnum (level 1) via IPC$
   enum_user   alice -> NetrShareEnum + NetrShareGetInfo + NetrServerGetInfo
 """
@@ -22,8 +23,11 @@ HOST = os.environ.get("RSSMB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RSSMB_PORT", "4450"))
 
 
-def connect(dialect=smb3structs.SMB2_DIALECT_21):
-    return SMBConnection(HOST, HOST, sess_port=PORT, preferredDialect=dialect, timeout=10)
+def connect(dialect=smb3structs.SMB2_DIALECT_21, require_signing=False):
+    c = SMBConnection(HOST, HOST, sess_port=PORT, preferredDialect=dialect, timeout=10)
+    if require_signing:
+        c._SMBConnection.RequireMessageSigning = True
+    return c
 
 
 def connect_311():
@@ -94,9 +98,7 @@ def scenario(name):
         assert get(c, "public", "README.txt") == b"hello from rssmb\n"
         c.logoff()
     elif name in ("alice", "signed"):
-        c = connect()
-        if name == "signed":
-            c._SMBConnection.RequireMessageSigning = True
+        c = connect(require_signing=(name == "signed"))
         c.login("alice", "TestPass123")
         s = c._SMBConnection._Session
         print("  alice logged in; SigningRequired:", s.get("SigningRequired"),
@@ -137,6 +139,22 @@ def scenario(name):
             print("  denied as expected:", str(e)[:120])
             return
         raise AssertionError("guest reached private share")
+    elif name == "rename":
+        # Exercise SET_INFO FileRenameInformation (class 10) — the path
+        # that was broken by the InfoType decode bug.
+        c = connect()
+        c.login("alice", "TestPass123")
+        data = b"rename test\n"
+        c.putFile("public", "before.txt", io.BytesIO(data).read)
+        assert get(c, "public", "before.txt") == data
+        # Rename before.txt -> after.txt
+        c._SMBConnection.rename("before.txt", "after.txt", shareName="public")
+        assert "before.txt" not in ls(c, "public"), "old name still present after rename"
+        assert "after.txt" in ls(c, "public"), "new name missing after rename"
+        assert get(c, "public", "after.txt") == data, "content changed during rename"
+        c.deleteFile("public", "after.txt")
+        assert "after.txt" not in ls(c, "public"), "delete did not take effect"
+        c.logoff()
     elif name == "enum_guest":
         c = connect()
         c.login("", "")

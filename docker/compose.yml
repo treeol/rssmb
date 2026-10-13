@@ -21,13 +21,14 @@ services:
       - "445:445"      # SMB over TCP
       - "8080:8080"    # Health & metrics (HTTP)
     volumes:
-      # Config (read-only)
+      # Config (read-only) — mount your production config here.
+      # Use config/rssmb.example.toml as a template.
       - ../config/rssmb.toml:/etc/rssmb/rssmb.toml:ro
       # Share data — adjust paths for your environment
       - ../data/public:/data/public
       - ../data/homes:/data/homes
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG=info
     # Graceful shutdown: give the server 10s to drain connections
     stop_grace_period: 10s
     # Restart policy for container orchestration

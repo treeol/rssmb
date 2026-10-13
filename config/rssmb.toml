@@ -1,7 +1,9 @@
-# RSSMB configuration — deployment-ready defaults
+# RSSMB configuration — development/test defaults
 # ================================================
-# This file is pre-configured for the docker compose setup.
-# Edit shares and authentication as needed.
+# This file is pre-configured for the docker compose dev setup.
+# For production, copy config/rssmb.example.toml and edit it.
+# DO NOT use this config in production — it has signing disabled
+# and guest access enabled.
 
 listen_addr = "0.0.0.0"
 port = 445

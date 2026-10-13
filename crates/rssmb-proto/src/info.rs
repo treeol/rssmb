@@ -222,8 +222,6 @@ impl QueryInfoResponse {
 pub struct SetInfoRequest {
     #[bw(calc = 33)]
     structure_size: u16,
-    #[bw(calc = data.info_type())]
-    #[br(temp)]
     pub info_type: InfoType,
     pub info_class: SetInfoClass,
     #[bw(calc = PosMarker::default())]
@@ -257,10 +255,6 @@ pub struct SetInfoData {
 }
 
 impl SetInfoData {
-    pub fn info_type(&self) -> InfoType {
-        InfoType::File
-    }
-
     pub fn data(&self) -> &[u8] {
         &self.raw
     }
@@ -301,5 +295,47 @@ mod tests {
         resp.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();
         assert_eq!(bytes.len(), 2);
+    }
+
+    #[test]
+    fn test_set_info_request_roundtrip_preserves_info_type() {
+        // SET_INFO with InfoType::File, FileEndOfFileInformation (class 20).
+        // This is the class that was broken by the #[br(temp)] discarding
+        // info_type and dispatch using info_class as a proxy.
+        let req = SetInfoRequest {
+            info_type: InfoType::File,
+            info_class: SetInfoClass(20),
+            additional_information: AdditionalInfo::default(),
+            file_id: FileId::default(),
+            data: SetInfoData::from(vec![0x00; 8]),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded = SetInfoRequest::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.info_type, InfoType::File);
+        assert_eq!(decoded.info_class, SetInfoClass(20));
+    }
+
+    #[test]
+    fn test_set_info_request_non_file_info_type_preserved() {
+        // A non-File InfoType must round-trip (it should be rejected by
+        // dispatch, not silently misrouted).
+        let req = SetInfoRequest {
+            info_type: InfoType::Security,
+            info_class: SetInfoClass(0),
+            additional_information: AdditionalInfo::default(),
+            file_id: FileId::default(),
+            data: SetInfoData::from(vec![]),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded = SetInfoRequest::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.info_type, InfoType::Security);
     }
 }

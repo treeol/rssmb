@@ -1,0 +1,52 @@
+# RSSMB configuration — production-safe example
+# ================================================
+# Copy this to config/rssmb.toml and edit shares + users for your setup.
+# See config/rssmb.dev.toml for a dev/test config with guest access.
+
+listen_addr = "0.0.0.0"
+port = 445
+min_dialect = "smb21"
+max_dialect = "smb311"
+
+# Signing: required for production (Windows 11 24H2 requires it by default).
+signing = "required"
+
+# Encryption: offered but not required for 3.0+.
+# Set to "required" to force encryption on all 3.x sessions.
+encryption = "desired"
+
+# Connection limits
+max_frame_size = 1048576
+max_credits = 1024
+
+# Guest access: disabled by default.
+# Recent Windows blocks insecure guest logons, so authenticated users only.
+guest_access = false
+
+# Health & metrics endpoint (HTTP, separate from SMB port)
+# Bind to localhost for security — change if you need remote access.
+health_port = 8080
+
+# ── Shares ──────────────────────────────────────────────────────────────
+# Add your shares here. Each share needs a path, and at minimum
+# read_only and guest_ok settings.
+
+[shares.public]
+name = "public"
+path = "/data/public"
+comment = "Public share"
+read_only = false
+browseable = true
+guest_ok = false
+valid_users = ["alice"]
+
+# ── Authentication ─────────────────────────────────────────────────────
+# User accounts for NTLM authentication.
+# Passwords are stored in plaintext in this file — for production,
+# mount it as a read-only secret and restrict its permissions.
+# Phase 1.3 will add NT-hash-only storage in a separate users file.
+#
+# [[users]]
+# username = "alice"
+# password = "change-me"
+# disabled = false
