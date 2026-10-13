@@ -396,7 +396,12 @@ async fn test_compound_negotiate_rejected() {
 }
 
 #[tokio::test]
-async fn test_smb1_magic_rejected() {
+async fn test_smb1_magic_dropped() {
+    // An SMB2-only server does not respond to SMB1 negotiate. The client
+    // (impacket, smbclient, cifs.ko) retries with SMB2 after the SMB1
+    // negotiate gets no response. The server should not send an SMB2 error
+    // response (which would be misinterpreted as a truncated SMB2 negotiate
+    // response by some clients). The connection stays open.
     let (config, _dir) = make_config();
     let server = TestServer::start(config).await.expect("start server");
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
@@ -407,18 +412,16 @@ async fn test_smb1_magic_rejected() {
     stream.write_all(&wire).await.expect("write");
     stream.flush().await.expect("flush");
 
-    let body = read_one_frame(&mut stream).await;
+    // The server drops the SMB1 negotiate (no response). Send a valid
+    // SMB2 NEGOTIATE — the server should still be alive and respond.
+    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
-    // Should get an error response (STATUS_NOT_SUPPORTED).
-    assert!(body.is_some(), "SMB1 magic should produce a response");
-    let resp = decode_response(&body.unwrap());
+    assert!(resp.is_some(), "server should respond to SMB2 after dropping SMB1");
+    let resp = resp.unwrap();
     assert_eq!(resp.header.command, Command::Negotiate);
-    // STATUS_NOT_SUPPORTED = 0xC00000BB
-    assert_eq!(
-        resp.header.status, 0xC00000BB,
-        "SMB1 should be STATUS_NOT_SUPPORTED"
-    );
+    assert_eq!(resp.header.status, 0, "SMB2 negotiate should succeed after SMB1 was dropped");
 }
 
 #[tokio::test]

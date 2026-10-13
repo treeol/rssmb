@@ -36,9 +36,25 @@ impl CredentialStore {
     }
 
     /// Synchronous add for use outside async contexts (e.g. ServerState::new).
-    /// Panics if the lock is held by the current thread (shouldn't happen at startup).
+    /// Uses `try_write` with a busy loop — safe because at startup no async
+    /// task holds the lock.
     pub fn add_sync(&self, cred: StoredCredential) {
-        self.credentials.blocking_write().insert(cred.username.to_lowercase(), cred);
+        // Use blocking_write via std::thread::sleep fallback — at startup
+        // the tokio runtime hasn't started its worker threads yet, so
+        // blocking_write panics. Use a standard lock instead.
+        // The RwLock is only ever held briefly; a spin loop is safe here.
+        loop {
+            match self.credentials.try_write() {
+                Ok(mut guard) => {
+                    guard.insert(cred.username.to_lowercase(), cred);
+                    return;
+                }
+                Err(_) => {
+                    // Lock contended — yield briefly and retry.
+                    std::thread::sleep(std::time::Duration::from_micros(10));
+                }
+            }
+        }
     }
 
     pub async fn lookup(&self, username: &str) -> Option<StoredCredential> {

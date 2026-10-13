@@ -330,14 +330,13 @@ pub async fn handle_message(
             handle_compound(state, conn_state, requests, raw_frame, was_encrypted).await
         }
         FramedMessage::Smb1Negotiate(_) => {
-            debug!(conn_id = conn_state.conn_id, "SMB1 negotiate — rejecting");
-            Some(FramedResponse::Error {
-                command: Command::Negotiate,
-                status: NtStatus::NotSupported,
-                message_id: u64::MAX,
-                session_id: 0,
-                tree_id: Some(0),
-            })
+            // SMB2-only server: do not respond to SMB1 negotiate.
+            // The client (impacket, smbclient, cifs.ko) will close and retry
+            // with SMB2. Returning an SMB2 error response here would be
+            // misinterpreted by some clients as a truncated SMB2 negotiate
+            // response, causing a parse failure instead of a clean fallback.
+            debug!(conn_id = conn_state.conn_id, "SMB1 negotiate — dropping (SMB2-only server)");
+            None
         }
         FramedMessage::Encrypted(_) => {
             // Encryption is handled in the connection read loop (decrypt
@@ -3464,20 +3463,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_smb1_negotiate_rejected() {
+    async fn test_smb1_negotiate_dropped() {
+        // SMB2-only server: does not respond to SMB1 negotiate.
         let state = make_test_state();
         let conn = make_conn_state();
         let framed = FramedMessage::Smb1Negotiate(vec![0xff, 0x53, 0x4d, 0x42, 0x00]);
         let resp = handle_message(&state, &conn, framed, &[], None).await;
-
-        let resp = resp.expect("SMB1 negotiate should produce a response");
-        match resp {
-            FramedResponse::Error { command, status, .. } => {
-                assert_eq!(command, Command::Negotiate);
-                assert_eq!(status, NtStatus::NotSupported);
-            }
-            other => panic!("expected Error response, got {:?}", other),
-        }
+        assert!(resp.is_none(), "SMB1 negotiate should produce no response (SMB2-only server)");
     }
 
     #[tokio::test]
