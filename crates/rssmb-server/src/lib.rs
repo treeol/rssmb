@@ -71,7 +71,7 @@ impl ServerState {
         let credentials = Arc::new(rssmb_auth::CredentialStore::new());
         for user in &config.users {
             if !user.disabled {
-                credentials.add(rssmb_auth::credentials::StoredCredential {
+                credentials.add_sync(rssmb_auth::credentials::StoredCredential {
                     username: user.username.clone(),
                     nt_hash: [0u8; 16], // Placeholder — sspi uses the password via AuthIdentity
                     disabled: user.disabled,

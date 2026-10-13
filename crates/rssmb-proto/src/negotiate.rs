@@ -2,13 +2,13 @@
 //!
 //! MS-SMB2 2.2.3, 2.2.4, 2.2.3.1.
 
-use std::io::{SeekFrom, Cursor};
+use std::io::SeekFrom;
 
 use binrw::io::TakeSeekExt;
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString, SizedStringSize};
+use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString};
 
 // ── NegotiateRequest (MS-SMB2 2.2.3) ───────────────────────────────
 
@@ -484,7 +484,6 @@ fn parse_netname<R: binrw::io::Read + binrw::io::Seek>(
     (): (),
 ) -> binrw::BinResult<SizedWideString> {
     let mut data = Vec::new();
-    use binrw::io::Read as _;
     let mut byte = [0u8; 2];
     while match reader.read(&mut byte) {
         Ok(2) => { data.push(u16::from_le_bytes(byte)); true }
@@ -501,7 +500,6 @@ fn write_netname<W: binrw::io::Write + binrw::io::Seek>(
     _endian: binrw::Endian,
     (): (),
 ) -> binrw::BinResult<()> {
-    use binrw::io::Write as _;
     for c in &netname.data {
         writer.write_all(&c.to_le_bytes())?;
     }

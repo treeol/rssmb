@@ -6,9 +6,11 @@
 //! responses in SPNEGO negTokenResp.
 
 /// SPNEGO OID: 1.3.6.1.5.5.2
+#[allow(dead_code)]
 const SPNEGO_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
 /// NTLMSSP OID: 1.3.6.1.4.1.311.2.2.10
+#[allow(dead_code)]
 const NTLMSSP_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
 /// NTLMSSP signature: "NTLMSSP\0"
@@ -76,7 +78,7 @@ pub fn extract_mech_types(input: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     p += 1; // skip A0
-    let init_len = der_len_value(&input[p..])?;
+    let _init_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?; // skip length
     // Inside negTokenInit: expect 30 (SEQUENCE).
     if input.get(p) != Some(&0x30) {

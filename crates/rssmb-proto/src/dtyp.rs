@@ -267,7 +267,7 @@ impl binrw::meta::WriteEndian for Boolean {
 //
 // Source: smb-dtyp binrw_util/pos_marker.rs (MIT). We own this copy.
 
-use binrw::io::{Read as _, Seek as _, Write as _};
+
 
 /// Wraps a value and records the stream position where it was read.
 ///

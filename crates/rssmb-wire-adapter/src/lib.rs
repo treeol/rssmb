@@ -9,8 +9,7 @@
 //! - Error response construction.
 //! - Original byte preservation for preauth integrity.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use thiserror::Error;
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub mod framing;
 pub mod credits;

@@ -4,8 +4,6 @@
 //! BIND, BIND_ACK, BIND_NAK, REQUEST, RESPONSE, FAULT.
 //! Only NDR20 (little-endian/ASCII) is supported.
 
-use std::collections::HashMap;
-
 use rssmb_proto::Guid;
 use tracing::debug;
 

@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for RSSMB
 # Stage 1: Build
-# smb-rs dependency requires edition 2024 (Rust 1.85+); use a recent stable.
+# MSRV is 1.75 (rust-toolchain.toml); use a recent stable for the build image.
 FROM rust:1.90-bookworm AS builder
 
 WORKDIR /build

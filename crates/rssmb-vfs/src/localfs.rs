@@ -451,12 +451,12 @@ impl Vfs for LocalFs {
                 let unix_secs = secs.saturating_sub(UNIX_EPOCH_FILETIME_OFFSET);
                 Some(std::time::UNIX_EPOCH + Duration::from_secs(unix_secs))
             };
-            let times = std::fs::FileTimes::new();
+            let mut times = std::fs::FileTimes::new();
             if let Some(t) = to_systemtime(info.last_write_time) {
-                times.set_modified(t);
+                times = times.set_modified(t);
             }
             if let Some(t) = to_systemtime(info.last_access_time) {
-                times.set_accessed(t);
+                times = times.set_accessed(t);
             }
             if let Some(t) = to_systemtime(info.creation_time) {
                 // set_created is not stable in this Rust version; skip creation time

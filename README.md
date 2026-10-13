@@ -7,10 +7,11 @@ Leverages Rust's memory safety for a robust, exploit-resistant file-sharing serv
 
 ## Status
 
-**Mountable over SMB 2.1.** A Linux kernel CIFS mount (`mount -t cifs … vers=2.1`)
-works for ls, read, write, append, overwrite, mkdir, rename, delete and a
-300 KiB round-trip, with and without message signing. See `docs/next-steps.md`
-for the step-by-step plan and what remains.
+**Fully standalone — no smb-rs dependency.** The server negotiates SMB 2.1
+through 3.1.1, with AES-128-GCM encryption, NTLMv2 auth, and SrvSvc share
+enumeration. GNOME Files (Nautilus), `smbclient`, and Linux kernel CIFS
+mounts all work. See `docs/next-steps.md` for the step-by-step plan and
+what remains.
 
 - ✅ Phase 0 — Workspace, wire codec, types, VFS trait, crypto, config
 - ✅ Phase 1 — Transport + connection engine (TCP listener, framing, credits, negotiate)
@@ -27,11 +28,12 @@ for the step-by-step plan and what remains.
 ```
 rssmb/
   crates/
-    rssmb-wire-adapter/  — Server-side wire codec over smb-msg (server feature)
+    rssmb-wire-adapter/  — Server-side wire codec (rssmb-proto)
     rssmb-auth/          — NTLM acceptor via sspi, SPNEGO, credential store
     rssmb-vfs/           — VFS trait + LocalFs and MemoryFs backends
     rssmb-rpc-server/    — DCE/RPC server-side (SrvSvc share enumeration)
     rssmb-server/        — Core server: connection engine, session, tree, opens, crypto
+    rssmb-proto/         — SMB2/3 wire protocol types (replaces smb-msg/smb-dtyp/smb-fscc)
     rssmb-cli/           — Server binary with config, signals, health endpoint
     rssmb-tests/         — Integration test harness
   docker/                — Dockerfile + docker-compose for dev/test
@@ -58,7 +60,6 @@ users only) and a test account `alice` / `TestPass123` — change it before
 exposing the server.
 
 ```sh
-git -C smb-rs apply ../patches/smb-rs-rssmb.patch   # once, on a fresh smb-rs checkout
 mkdir -p data/public data/homes && sudo chown -R 1000:1000 data
 docker compose -f docker/compose.yml up -d --build
 docker logs -f rssmb                                # Ctrl-C to stop following
@@ -85,16 +86,15 @@ Stop it: `docker compose -f docker/compose.yml down`.
 
 ## Mounting
 
-The server currently negotiates **SMB 2.1 only**, so clients must allow it:
+The server negotiates SMB 2.1 through 3.1.1. All dialects work:
 
 ```sh
 # Linux kernel client (as root):
-mount -t cifs //SERVER/public /mnt/smb -o username=alice,password=...,vers=2.1
-# add ,sign to require signing from the client side; add port=N for a non-445 port
+mount -t cifs //SERVER/public /mnt/smb -o username=alice,password=...,vers=3.1.1
+# add ,seal to require encryption; add port=N for a non-445 port
 ```
 
-macOS Finder, Windows 11 and recent GNOME defaults prefer SMB 3.x and may refuse
-2.1 until Step 7b/7c lands.
+macOS Finder, Windows 11, and GNOME Files all connect over SMB 3.x.
 
 ## Configuration
 
@@ -102,12 +102,13 @@ See `config/rssmb.toml` for all options. Key settings:
 
 - `listen_addr` / `port` — bind address (default: `0.0.0.0:445`)
 - `min_dialect` / `max_dialect` — SMB dialect range (default: `smb21` to `smb311`).
-  Only SMB 2.1 is negotiated today regardless of `max_dialect`.
+  All dialects 2.1–3.1.1 are negotiated.
 - `signing` — `required` | `desired` | `disabled` (default: `required`).
   `required` rejects unsigned/forged requests **and disables guest/anonymous
   logons** (they have no key and cannot sign). `desired` and `disabled` both
   sign only when the client requires it — signing cannot be refused.
-- `encryption` — `required` | `desired` | `disabled` (default: `desired`). Not implemented yet.
+- `encryption` — `required` | `desired` | `disabled` (default: `desired`).
+  SMB 3.1.1 AES-128-GCM encryption. `required` denies sessions without a cipher.
 - `guest_access` — allow anonymous logons as guest (only for shares with `guest_ok`)
 - `health_port` — HTTP health/metrics endpoint (default: `8080`)
 - `[shares.<name>]` — `path`, `read_only`, `guest_ok`, `valid_users`

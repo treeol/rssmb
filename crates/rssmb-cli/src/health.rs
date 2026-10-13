@@ -44,7 +44,7 @@ async fn handle_health_request(
     mut stream: tokio::net::TcpStream,
     _state: Arc<ServerState>,
 ) -> Result<(), std::io::Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await?;

@@ -19,6 +19,7 @@ struct InMemoryFile {
     last_write_time: u64,
     change_time: u64,
     is_directory: bool,
+    #[allow(dead_code)]
     delete_on_close: bool,
     file_id: Option<FileId>,
 }
@@ -26,7 +27,9 @@ struct InMemoryFile {
 struct InMemoryOpen {
     file_key: String,
     file_id: FileId,
+    #[allow(dead_code)]
     share_access: ShareAccess,
+    #[allow(dead_code)]
     delete_on_close: bool,
 }
 

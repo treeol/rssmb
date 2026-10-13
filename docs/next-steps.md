@@ -1,9 +1,10 @@
 # RSSMB — Next Steps (implementation guide)
 
-Status snapshot: 2026-10-10 (`2fa6f28`). Steps 1–6 and 7a are done, plus a
-reviewed round of foundation fixes (credits, compound signing, disconnect
-teardown). The share mounts with the Linux kernel client over SMB 2.1
-(signed and unsigned). Next: 7b — see its "Start here" list.
+Status snapshot: 2026-10-13 (`e08cd92`). Steps 1–8 are done: SMB 2.1–3.1.1
+with signing, AES-128-GCM encryption, NTLMv2 auth, SrvSvc share enumeration,
+and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 277 unit
+tests pass. GNOME Files, `smbclient`, and Linux kernel CIFS mounts all work.
+Next: 9.5 (ID allocation), 9.6 (OpenTable), 9.7 (logging), then 10.x (testing).
 
 Reference specs: MS-SMB2 (protocol), MS-FSCC (file/FS info structures),
 MS-SRVS + MS-RPCE (share enumeration), MS-NLMP (NTLM), MS-ERREF (NTSTATUS).
@@ -541,23 +542,22 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
 
 ---
 
-## Step 9 — Hygiene items (do alongside)
+## Step 9 — Hygiene items
 
-- **smb-rs patches are untracked.** Our edits in `smb-rs/crates/smb-msg`
-  (Default derives, CLOSE flags fix, etc.) live only on disk. Fork smb-rs into
-  a git branch (or vendor `smb-msg`, `smb-fscc` and `smb-dtyp` into
-  `third_party/` and commit them) and pin the dependency, so Docker/CI builds
-  are reproducible. Record the base SHA `7c7d4a6`.
-- **The `rust-version` mismatch:** the workspace says 1.85, while smb-rs needs
-  1.89+ / edition 2024. Set 1.90 to match the Dockerfile.
+- **smb-rs decoupled.** All `smb_msg::`/`smb_dtyp::`/`smb_fscc::` imports
+  replaced with `rssmb_proto::` (Step 9.1c-swap). `smb-rs/` moved to
+  `.reference/smb-rs/` (gitignored, not a workspace dependency). The protocol
+  crate `rssmb-proto` handles all wire encoding/decoding. Base SHA `7c7d4a6`.
+- **`rust-version` set to 1.75** (MSRV for `std::fs::FileTimes` and
+  `std::sync::OnceLock`). `rust-toolchain.toml` pins the version with
+  rustfmt + clippy. CI uses the pinned toolchain + `Swatinem/rust-cache`.
+  All warnings fixed — `RUSTFLAGS="-D warnings"` builds clean (Step 9.4).
 - **Tree IDs** are drawn from `NEXT_FILE_ID`. Give them their own counter, and
-  make FileIds per-connection with random persistent and volatile parts.
-- **TREE_DISCONNECT / LOGOFF / connection drop** must close every open on that
-  tree/session (VFS close plus global open-table removal), or handles leak.
+  make FileIds per-connection with random persistent and volatile parts. (9.5 — pending)
+- **TREE_DISCONNECT / LOGOFF / connection drop** — already done: closes every
+  open on that tree/session (VFS close plus global open-table removal).
 - **Logging:** the binrw backtrace dumps are huge. Log a one-line summary at
-  warn and the full error at trace.
-- **Update `plan/current`** and `rssmb-plan-draft.md`: Phase 2 is only partly
-  done (no signing, no 3.x).
+  warn and the full error at trace. (9.7 — pending)
 
 ---
 

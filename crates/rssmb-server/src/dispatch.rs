@@ -5,7 +5,7 @@
 //! Phase 2: SESSION_SETUP with multi-round NTLM auth is implemented.
 //! Other commands return STATUS_NOT_SUPPORTED.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -522,7 +522,7 @@ async fn handle_compound(
     }
 
     // Apply RELATED_OPERATIONS flag only to responses for related requests.
-    let mut plain_responses: Vec<PlainResponse> = responses
+    let plain_responses: Vec<PlainResponse> = responses
         .into_iter()
         .map(|(is_related, mut resp)| {
             if is_related {
@@ -1058,8 +1058,10 @@ async fn handle_session_setup(
             drop(sessions);
 
             // Set by the new-session path if the session was admitted with
-            // encrypt_data. The SPNEGO mic-exchange path leaves it false
+            // encrypt_data. The SPNEGO mic-exchange path returns early above
             // (the session already exists; its flag was set on first setup).
+            // Initialized to false; the new-session path may overwrite it.
+            #[allow(unused_assignments)]
             let mut session_encrypt_data = false;
 
             if existing.is_some() {
@@ -1693,7 +1695,7 @@ async fn handle_tree_disconnect(
 
 /// CREATE — open or create a file.
 async fn handle_create(
-    state: &ServerState,
+    _state: &ServerState,
     conn_state: &ConnState,
     req: rssmb_proto::plain::PlainRequest,
 ) -> FramedResponse {
@@ -2007,7 +2009,7 @@ async fn handle_close(
 
 /// READ — read data from a file.
 async fn handle_read(
-    state: &ServerState,
+    _state: &ServerState,
     conn_state: &ConnState,
     req: rssmb_proto::plain::PlainRequest,
 ) -> FramedResponse {
@@ -2232,7 +2234,7 @@ async fn handle_write(
 
 /// FLUSH — flush buffered data.
 async fn handle_flush(
-    state: &ServerState,
+    _state: &ServerState,
     conn_state: &ConnState,
     req: rssmb_proto::plain::PlainRequest,
 ) -> FramedResponse {
@@ -2710,8 +2712,8 @@ async fn handle_change_notify(
     let tree_id = req.header.tree_id.unwrap_or(0);
 
     // Validate the handle belongs to this session.
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
+    match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+        Ok(_) => {},
         Err(status) => return error_response_for(Command::ChangeNotify, status, &req.header),
     };
 
@@ -3155,17 +3157,6 @@ async fn lookup_open_for_session(
         return Err(NtStatus::InvalidHandle);
     }
     Ok(entry.clone())
-}
-
-/// Build an error FramedResponse.
-fn error_response(command: Command, status: NtStatus) -> FramedResponse {
-    FramedResponse::Error {
-        command,
-        status,
-        message_id: u64::MAX,
-        session_id: 0,
-        tree_id: Some(0),
-    }
 }
 
 /// Build an error response carrying the request's header fields so the

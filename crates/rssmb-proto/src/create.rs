@@ -2,11 +2,10 @@
 //!
 //! MS-SMB2 2.2.13–2.2.16, 2.2.23–2.2.25.
 
-use binrw::io::TakeSeekExt;
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString, SizedStringSize, Boolean};
+use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString, SizedStringSize};
 use crate::fscc::FileAttributes;
 
 // ── FileId (MS-SMB2 2.2.14.1) ──────────────────────────────────────

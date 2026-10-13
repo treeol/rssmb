@@ -2,14 +2,14 @@
 //!
 //! MS-SMB2 2.2.37–2.2.40.
 
-use std::io::{Cursor, SeekFrom};
+use std::io::SeekFrom;
 
 use binrw::io::TakeSeekExt;
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
 use crate::create::FileId;
-use crate::dtyp::{PosMarker, Boolean};
+use crate::dtyp::PosMarker;
 
 // ── InfoType (MS-SMB2 2.2.37) ─────────────────────────────────────
 

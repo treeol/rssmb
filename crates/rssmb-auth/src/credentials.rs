@@ -35,6 +35,12 @@ impl CredentialStore {
         self.credentials.write().await.insert(cred.username.to_lowercase(), cred);
     }
 
+    /// Synchronous add for use outside async contexts (e.g. ServerState::new).
+    /// Panics if the lock is held by the current thread (shouldn't happen at startup).
+    pub fn add_sync(&self, cred: StoredCredential) {
+        self.credentials.blocking_write().insert(cred.username.to_lowercase(), cred);
+    }
+
     pub async fn lookup(&self, username: &str) -> Option<StoredCredential> {
         self.credentials.read().await.get(&username.to_lowercase()).cloned()
     }

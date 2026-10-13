@@ -18,7 +18,7 @@ use crate::config::DialectConfig;
 use crate::tree::Tree;
 use crate::ServerError;
 
-use rssmb_auth::{AuthError, AuthProvider, AuthState, AuthStep, Identity};
+use rssmb_auth::{AuthProvider, AuthState, AuthStep, Identity};
 
 /// One SMB2/3 session.
 ///
@@ -177,7 +177,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rssmb_auth::GuestAuthProvider;
+    use rssmb_auth::{AuthError, GuestAuthProvider};
 
     #[tokio::test]
     async fn test_session_creation() {

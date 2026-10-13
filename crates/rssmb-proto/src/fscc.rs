@@ -503,7 +503,7 @@ pub struct FileFsDeviceInformation {
 
 // ── ChainedItemList (MS-FSCC directory enumeration) ───────────────
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use binrw::Endian;
 
 /// A chained item list — variable-length entries linked by next_entry_offset.

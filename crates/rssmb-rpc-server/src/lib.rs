@@ -215,7 +215,7 @@ impl PipeState {
         };
 
         // Evaluate each context element.
-        let results: Vec<BindAckResult> = ctx_items
+        let _results: Vec<BindAckResult> = ctx_items
             .iter()
             .map(|ctx| {
                 let result = evaluate_bind_context(ctx);

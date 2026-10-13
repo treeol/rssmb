@@ -7,8 +7,8 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rssmb_proto::negotiate::{
     EncryptionCapabilities, EncryptionCipher, HashAlgorithm, NegotiateContext,
-    NegotiateContextType, NegotiateContextValue, NegotiateRequest,
-    PreauthIntegrityCapabilities, SigningAlgorithmId, SigningCapabilities,
+    NegotiateContextType, NegotiateRequest,
+    PreauthIntegrityCapabilities, SigningAlgorithmId,
 };
 use rssmb_wire_adapter::error::NtStatus;
 

@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicU64;
 
 use aes::Aes128;
 use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, Payload as AeadPayload};
+use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::Aes128Gcm;
 use cmac::Cmac;
 use hmac::{Hmac, Mac};

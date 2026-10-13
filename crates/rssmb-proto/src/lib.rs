@@ -5,6 +5,11 @@
 //!
 //! Wire layout references: MS-SMB2 (protocol), MS-FSCC (file/FS info
 //! structures), MS-DTYP (basic types).
+//
+// The `#[bitfield]` macro (modular_bitfield) generates code that triggers
+// `unused_parens` warnings. Silence them at the crate level rather than
+// fighting macro-generated code.
+#![allow(unused_parens)]
 
 pub mod dtyp;
 pub mod fscc;
