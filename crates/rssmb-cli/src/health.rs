@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use rssmb_server::ServerState;
 use tracing::{info, error};
 
-/// Serve the health endpoint on the given port.
-pub async fn serve(state: Arc<ServerState>, port: u16) -> Result<(), std::io::Error> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+/// Serve the health endpoint on the given address and port.
+pub async fn serve(state: Arc<ServerState>, bind_addr: String, port: u16) -> Result<(), std::io::Error> {
+    let addr: SocketAddr = format!("{}:{}", bind_addr, port).parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Health endpoint listening on {}", addr);
 
@@ -46,8 +46,14 @@ async fn handle_health_request(
 ) -> Result<(), std::io::Error> {
     use tokio::io::AsyncReadExt;
 
+    // 5-second read timeout — a slowloris shouldn't hold a health-check thread.
     let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read(&mut buf),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "health read timeout"))??;
 
     if n == 0 {
         return Ok(());

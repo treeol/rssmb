@@ -195,8 +195,9 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Start health endpoint
     let health_state = state.clone();
     let health_port = config.health_port;
+    let health_bind_addr = config.health_bind_addr.clone();
     tokio::spawn(async move {
-        if let Err(e) = health::serve(health_state, health_port).await {
+        if let Err(e) = health::serve(health_state, health_bind_addr, health_port).await {
             error!("Health endpoint error: {}", e);
         }
     });

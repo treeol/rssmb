@@ -56,6 +56,8 @@ pub struct ServerState {
     /// Each user's NT hash is pre-computed so plaintext passwords are never
     /// stored or rebuilt per session_setup.
     pub identities: Arc<rssmb_auth::IdentityStore>,
+    /// Connection limiter (global + per-IP).
+    pub conn_limiter: Arc<crate::connection::ConnectionLimiter>,
     /// Shutdown signal.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Stable server GUID (generated once, used for all negotiate responses).
@@ -81,11 +83,17 @@ impl ServerState {
             )),
         ));
 
+        let conn_limiter = Arc::new(crate::connection::ConnectionLimiter::new(
+            config.max_connections,
+            config.max_connections_per_ip,
+        ));
+
         Self {
             config: Arc::new(config),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             open_table: Arc::new(opens::OpenTable::new()),
             identities,
+            conn_limiter,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             server_guid: guid,
         }

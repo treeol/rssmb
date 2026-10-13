@@ -34,6 +34,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_connections_per_ip: u32,
 
+    /// Maximum simultaneous connections (0 = unlimited)
+    #[serde(default)]
+    pub max_connections: u32,
+
+    /// Idle timeout in seconds — a connection with no activity for this
+    /// long is closed. Default: 900 (15 min).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+
     /// Maximum frame size (bytes)
     #[serde(default = "default_max_frame_size")]
     pub max_frame_size: usize,
@@ -49,6 +58,12 @@ pub struct ServerConfig {
     /// Health endpoint port (separate from SMB port)
     #[serde(default = "default_health_port")]
     pub health_port: u16,
+
+    /// Health endpoint bind address (default: 127.0.0.1 for security).
+    /// Set to 0.0.0.0 to allow remote access — ensure the port is otherwise
+    /// protected (firewall, network policy) if you do.
+    #[serde(default = "default_health_bind_addr")]
+    pub health_bind_addr: String,
 
     /// Maximum credits to grant per connection
     #[serde(default = "default_max_credits")]
@@ -104,6 +119,8 @@ fn default_max_frame_size() -> usize { 1_048_576 }
 fn default_health_port() -> u16 { 8080 }
 fn default_max_credits() -> u32 { 1024 }
 fn default_max_dialect() -> DialectConfig { DialectConfig::Smb311 }
+fn default_idle_timeout() -> u64 { 900 }
+fn default_health_bind_addr() -> String { "127.0.0.1".to_string() }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -244,10 +261,13 @@ impl ServerConfig {
             signing: SigningPolicy::Required,
             encryption: EncryptionPolicy::Desired,
             max_connections_per_ip: 100,
+            max_connections: 1024,
+            idle_timeout_secs: 900,
             max_frame_size: 1_048_576,
             shares,
             guest_access: false,
             health_port: 8080,
+            health_bind_addr: "127.0.0.1".to_string(),
             max_credits: 1024,
             server_name: "rssmb".to_string(),
             users: vec![],

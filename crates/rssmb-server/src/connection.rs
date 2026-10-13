@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::RwLock as StdRwLock;
 
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
@@ -36,6 +38,72 @@ use crate::ServerState;
 
 /// Buffer capacity for the write channel (number of outbound frames).
 const WRITE_CHANNEL_CAPACITY: usize = 64;
+
+/// Connection limiter — tracks active connections globally and per IP.
+///
+/// Enforces `max_connections` and `max_connections_per_ip` from the config.
+/// A connection count of 0 means unlimited. The limiter uses a plain `RwLock`
+/// (not tokio) because the critical sections are tiny and never await.
+pub struct ConnectionLimiter {
+    max_total: u32,
+    max_per_ip: u32,
+    counts: StdRwLock<HashMap<std::net::IpAddr, u32>>,
+    total: AtomicU64,
+}
+
+impl ConnectionLimiter {
+    pub fn new(max_total: u32, max_per_ip: u32) -> Self {
+        Self {
+            max_total,
+            max_per_ip,
+            counts: StdRwLock::new(HashMap::new()),
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// Try to admit a connection from `addr`. Returns a guard that
+    /// decrements the count when dropped. Returns `None` if a limit
+    /// is exceeded.
+    pub fn try_admit(self: &Arc<Self>, addr: std::net::IpAddr) -> Option<ConnectionGuard> {
+        let mut counts = self.counts.write().unwrap();
+        let per_ip = counts.entry(addr).or_insert(0);
+        if self.max_per_ip > 0 && *per_ip >= self.max_per_ip {
+            warn!(ip = %addr, "connection rejected: per-IP limit reached");
+            return None;
+        }
+        let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.max_total > 0 && total > self.max_total as u64 {
+            self.total.fetch_sub(1, Ordering::Relaxed);
+            warn!(ip = %addr, total, "connection rejected: global limit reached");
+            return None;
+        }
+        *per_ip += 1;
+        drop(counts);
+        Some(ConnectionGuard {
+            limiter: self.clone(),
+            addr,
+        })
+    }
+}
+
+/// RAII guard that decrements the connection count when dropped.
+pub struct ConnectionGuard {
+    limiter: Arc<ConnectionLimiter>,
+    addr: std::net::IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.limiter.total.fetch_sub(1, Ordering::Relaxed);
+        let mut counts = self.limiter.counts.write().unwrap();
+        if let Some(c) = counts.get_mut(&self.addr) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                counts.remove(&self.addr);
+            }
+        }
+    }
+}
 
 /// Reads the next complete NetBIOS-framed payload from `stream`.
 ///
@@ -236,6 +304,7 @@ impl Connection {
         conn_state: &ConnState,
         max_frame_size: usize,
     ) -> std::io::Result<()> {
+        let idle_timeout = std::time::Duration::from_secs(state.config.idle_timeout_secs);
         loop {
             let payload = tokio::select! {
                 biased;
@@ -245,17 +314,24 @@ impl Connection {
                     return Ok(());
                 }
 
-                res = read_netbios_payload(read_half, max_frame_size) => {
+                res = tokio::time::timeout(idle_timeout, read_netbios_payload(read_half, max_frame_size)) => {
                     match res {
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             debug!(conn_id = conn_state.conn_id, "peer closed connection");
                             return Ok(());
                         }
-                        Ok(Some(body)) => {
-                    debug!(conn_id = conn_state.conn_id, len = body.len(), "received NetBIOS payload");
-                    body
-                }
-                        Err(e) => return Err(e),
+                        Ok(Ok(Some(body))) => {
+                            debug!(conn_id = conn_state.conn_id, len = body.len(), "received NetBIOS payload");
+                            body
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            warn!(conn_id = conn_state.conn_id, "idle timeout ({}s) — closing connection", idle_timeout.as_secs());
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "idle timeout",
+                            ));
+                        }
                     }
                 }
             };
@@ -958,11 +1034,25 @@ pub async fn listen_on(
         };
 
         let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let state = state.clone();
+
+        // Enforce connection limits (global + per-IP).
+        let ip = remote_addr.ip();
+        let guard = match state.conn_limiter.try_admit(ip) {
+            Some(g) => g,
+            None => {
+                // Limit exceeded — drop the connection without a response.
+                debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
+                // The stream is dropped here, closing the TCP connection.
+                continue;
+            }
+        };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
 
+        let state = state.clone();
         tokio::spawn(async move {
+            // The guard lives for the duration of the connection task.
+            let _guard = guard;
             Connection::handle(state, stream, conn_id).await;
         });
     }
@@ -1008,11 +1098,22 @@ where
         };
 
         let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let state = state.clone();
+
+        // Enforce connection limits (global + per-IP).
+        let ip = remote_addr.ip();
+        let guard = match state.conn_limiter.try_admit(ip) {
+            Some(g) => g,
+            None => {
+                debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
+                continue;
+            }
+        };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
 
+        let state = state.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             Connection::handle(state, stream, conn_id).await;
         });
     }
