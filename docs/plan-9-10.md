@@ -1,7 +1,9 @@
 # Plan — Step 9 (decouple from smb-rs + hygiene) and Step 10 (testing & conformance)
 
-Status: **plan only, not started.** Written 2026-10-12 against HEAD `f249ee1`.
+Status: **Steps 9–10 complete.** Written 2026-10-12 against HEAD `f249ee1`.
 Mashūra plan-reviewed (2026-10-12); findings folded in below.
+Steps 9.0–9.8 and 10.1–10.6 all implemented and committed (HEAD `bd8aca8`).
+339 tests pass, 0 build warnings, `RUSTFLAGS="-D warnings"` clean.
 
 Key review findings folded in:
 - **Migration bridge:** can't swap one module's import — `PlainRequest`/`PlainResponse`
@@ -466,14 +468,26 @@ macOS Finder, Windows 11 `net use` / `net view` / Explorer.
 5. CI: nightly job, ~5 min/target (smoke budget, not evidence of
    conformance), upload crashes as artifacts.
 
-### 10.6 Unit-test gaps to fill
+### 10.6 Unit-test gaps to fill ✅ Done (commit `bd8aca8`)
 
-- **Golden-byte fixtures** for every `rssmb-proto` struct (committed in
-  9.1b, generated from smb-msg while it's still present — not proto-vs-proto
-  roundtrips which pass with symmetric bugs).
-- Golden-byte tests per QUERY_INFO / QUERY_DIRECTORY class.
-- Independent NDR decoder fixture for SrvSvc (deferred from 8).
-- 3.1.1 preauth/KDF end-to-end transcript golden test (deferred from 7c).
+- **Golden-byte fixtures** for every `rssmb-proto` struct — 44 new round-trip
+  tests across create.rs, error.rs, file.rs, session_setup.rs, tree_connect.rs.
+  Each encodes a struct, verifies the encoded bytes (size, StructureSize, key
+  field offsets), decodes them back, and asserts all meaningful fields.
+  Also fixed `OplockBreakMsg` StructureSize bug (12→24 per MS-SMB2 2.2.23.1).
+- **Golden-byte tests per QUERY_INFO / QUERY_DIRECTORY class** — in
+  `fsinfo.rs`: FileBasicInfo (40B), FileStandardInfo (24B), FileInternalInfo
+  (8B), FileNetworkOpenInfo (56B), FileAllInfo (108B), FileAttributeTagInfo
+  (8B), directory classes 1/2/3/12/37/38, filesystem classes (Size 24B,
+  Device 8B, FullSize 32B).
+- **Independent NDR decoder fixture for SrvSvc** — in `ndr.rs`:
+  NetrShareEnum (level 1, single/empty/3-share encode→decode roundtrip),
+  NetrShareGetInfo (found/not-found golden bytes), NetrServerGetInfo (level
+  100 golden bytes).
+- **3.1.1 preauth/KDF end-to-end transcript golden test** — in `crypto.rs`:
+  H0→preauth_update chain→KDF signing key→CMAC sign→verify, tamper detection,
+  determinism, different-preauth-hash→different-key, label isolation
+  (signing/encryption/decryption keys all differ).
 
 ---
 
