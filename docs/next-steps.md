@@ -552,10 +552,17 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
   `std::sync::OnceLock`). `rust-toolchain.toml` pins the version with
   rustfmt + clippy. CI uses the pinned toolchain + `Swatinem/rust-cache`.
   All warnings fixed — `RUSTFLAGS="-D warnings"` builds clean (Step 9.4).
-- **Tree IDs** are drawn from `NEXT_FILE_ID`. Give them their own counter, and
-  make FileIds per-connection with random persistent and volatile parts. (9.5 — pending)
+- **ID allocation** (9.5 — done): SessionId is random non-zero with collision
+  check; TreeId is per-connection starting at 1; FileId volatile is
+  per-connection, persistent is random base + volatile. Global statics
+  `NEXT_SESSION_ID` and `NEXT_FILE_ID` removed.
 - **TREE_DISCONNECT / LOGOFF / connection drop** — already done: closes every
   open on that tree/session (VFS close plus global open-table removal).
+- **OpenTable** (9.6 — decided): the global `OpenTable` exists and is tested
+  (18 unit tests in `opens.rs`) but is **not wired into dispatch** — `handle_create`
+  hardcodes `ShareAccess::all()`, so cross-connection share-mode conflicts are
+  not enforced. Wire it in as part of oplock/lease work (Phase 5), where
+  share-mode tracking and `STATUS_SHARING_VIOLATION` are needed.
 - **Logging:** the binrw backtrace dumps are huge. Log a one-line summary at
   warn and the full error at trace. (9.7 — pending)
 
