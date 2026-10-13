@@ -173,6 +173,54 @@ mod tests {
     }
 
     #[test]
+    fn test_session_setup_response_roundtrip() {
+        let resp = SessionSetupResponse {
+            session_flags: SessionFlags::new().with_encrypt_data(true),
+            buffer: vec![0x42; 8],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: SessionSetupResponse = SessionSetupResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.buffer, vec![0x42; 8]);
+        assert!(decoded.session_flags.encrypt_data());
+    }
+
+    #[test]
+    fn test_session_flags_roundtrip() {
+        let flags = SessionFlags::new()
+            .with_is_guest(true)
+            .with_encrypt_data(true);
+        let mut buf = Cursor::new(Vec::new());
+        flags.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 2);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: SessionFlags = SessionFlags::read_le(&mut cursor).unwrap();
+        assert!(decoded.is_guest());
+        assert!(!decoded.is_null_session());
+        assert!(decoded.encrypt_data());
+    }
+
+    #[test]
+    fn test_session_security_mode_roundtrip() {
+        let mode = SessionSecurityMode::new()
+            .with_signing_enabled(true)
+            .with_signing_required(true);
+        let mut buf = Cursor::new(Vec::new());
+        mode.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        // SessionSecurityMode is a 1-byte bitfield (2 bits + 6 reserved).
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x03);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: SessionSecurityMode = SessionSecurityMode::read_le(&mut cursor).unwrap();
+        assert!(decoded.signing_enabled());
+        assert!(decoded.signing_required());
+    }
+
+    #[test]
     fn test_logoff_roundtrip() {
         let req = LogoffRequest::default();
         let mut buf = Cursor::new(Vec::new());

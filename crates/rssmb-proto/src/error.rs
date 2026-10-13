@@ -56,10 +56,23 @@ mod tests {
         resp.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();
         // StructureSize(2) + ErrorContextCount(1) + Reserved(1) + ByteCount(4) = 8
-        // With structure_size(u16, calc=9) now the first field, the body
-        // serializes to 2 + 1 + 1 + 4 = 8 bytes when error_data is empty.
         assert_eq!(bytes.len(), 8);
-        // The manual build_error_response in wire-adapter adds the 9-byte body:
-        // [0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        // Golden bytes: [0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        assert_eq!(&bytes, &[0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_error_response_with_data_roundtrip() {
+        let resp = ErrorResponse {
+            error_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        // ErrorContextCount=4 → 8 fixed + 4 data = 12 bytes
+        assert_eq!(bytes.len(), 12);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ErrorResponse = ErrorResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.error_data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 }

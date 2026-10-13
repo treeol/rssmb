@@ -262,4 +262,82 @@ mod tests {
         let decoded: WriteResponse = WriteResponse::read_le(&mut cursor).unwrap();
         assert_eq!(decoded.count, 42);
     }
+
+    #[test]
+    fn test_write_request_roundtrip() {
+        let req = WriteRequest {
+            length: 1024,
+            offset: 4096,
+            file_id: FileId { persistent: 0xDEAD, volatile: 0xBEEF },
+            flags: WriteFlags::new().with_write_through(true),
+            _write_offset: (),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        // WriteRequest fixed part: 2+2+4+8+16+4+2+2+4+1 = 47 bytes, but with
+        // the _write_offset: () field (0 bytes), the total is 48 bytes.
+        assert_eq!(bytes.len(), 48);
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 49);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: WriteRequest = WriteRequest::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.length, 1024);
+        assert_eq!(decoded.offset, 4096);
+        assert_eq!(decoded.file_id, FileId { persistent: 0xDEAD, volatile: 0xBEEF });
+        assert!(decoded.flags.write_through());
+    }
+
+    #[test]
+    fn test_read_response_roundtrip_with_data() {
+        let resp = ReadResponse {
+            buffer: vec![0x41; 16],
+            ..Default::default()
+        };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ReadResponse = ReadResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.buffer, vec![0x41; 16]);
+    }
+
+    #[test]
+    fn test_read_flags_roundtrip() {
+        let flags = ReadFlags::new().with_read_unbuffered(true);
+        let mut buf = Cursor::new(Vec::new());
+        flags.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0], 0x01);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ReadFlags = ReadFlags::read_le(&mut cursor).unwrap();
+        assert!(decoded.read_unbuffered());
+        assert!(!decoded.read_compressed());
+    }
+
+    #[test]
+    fn test_write_flags_roundtrip() {
+        let flags = WriteFlags::new().with_write_through(true);
+        let mut buf = Cursor::new(Vec::new());
+        flags.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: WriteFlags = WriteFlags::read_le(&mut cursor).unwrap();
+        assert!(decoded.write_through());
+        assert!(!decoded.write_unbuffered());
+    }
+
+    #[test]
+    fn test_flush_response_roundtrip() {
+        let resp = FlushResponse::default();
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4); // StructureSize=4 per MS-SMB2 2.2.18
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: FlushResponse = FlushResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded, FlushResponse::default());
+    }
 }

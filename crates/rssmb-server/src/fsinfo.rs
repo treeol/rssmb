@@ -459,4 +459,255 @@ mod tests {
         let entries = vec![];
         assert!(build_directory_buffer(&entries, 99).is_none());
     }
+
+    // --- Golden-byte tests for QUERY_INFO file classes ---
+
+    #[test]
+    fn test_file_basic_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(42),
+            attributes: rssmb_vfs::FileAttributes {
+                directory: true,
+                ..Default::default()
+            },
+            size: 0,
+            allocation_size: 0,
+            creation_time: 0x0102030405060708,
+            last_access_time: 0x090A0B0C0D0E0F10,
+            last_write_time: 0x1112131415161718,
+            change_time: 0x191A1B1C1D1E1F20,
+            file_name: "test".to_string(),
+        };
+        let buf = file_basic_info(&info);
+        // FileBasicInformation: 4×FILETIME(8) + Attributes(4) + Reserved(4) = 40 bytes
+        assert_eq!(buf.len(), 40);
+        // Verify creation_time bytes (LE)
+        assert_eq!(&buf[0..8], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(&buf[8..16], &0x090A0B0C0D0E0F10u64.to_le_bytes());
+        assert_eq!(&buf[16..24], &0x1112131415161718u64.to_le_bytes());
+        assert_eq!(&buf[24..32], &0x191A1B1C1D1E1F20u64.to_le_bytes());
+        // Attributes at offset 32 (directory bit = 0x10 in MS-FSCC)
+        let attrs = u32::from_le_bytes(buf[32..36].try_into().unwrap());
+        assert_eq!(attrs & 0x10, 0x10, "directory bit should be set");
+        // Reserved at offset 36
+        assert_eq!(&buf[36..40], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_file_standard_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(1),
+            attributes: rssmb_vfs::FileAttributes::default(),
+            size: 1024,
+            allocation_size: 4096,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            file_name: "test".to_string(),
+        };
+        let buf = file_standard_info(&info);
+        // FileStandardInformation: AllocSize(8) + EOF(8) + NumLinks(4) + DelPending(1) + Dir(1) + Reserved(2) = 24
+        assert_eq!(buf.len(), 24);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 4096);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 1024);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 1); // NumberOfLinks
+        assert_eq!(buf[20], 0); // DeletePending = false
+        assert_eq!(buf[21], 0); // Directory = false
+    }
+
+    #[test]
+    fn test_file_internal_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(0xDEADBEEF),
+            ..test_file_info()
+        };
+        let buf = file_internal_info(&info);
+        // FileInternalInformation: IndexNumber(u64) = 8 bytes
+        assert_eq!(buf.len(), 8);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_file_network_open_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(1),
+            attributes: rssmb_vfs::FileAttributes {
+                read_only: true,
+                ..Default::default()
+            },
+            size: 2048,
+            allocation_size: 4096,
+            creation_time: 100,
+            last_access_time: 200,
+            last_write_time: 300,
+            change_time: 400,
+            file_name: "test".to_string(),
+        };
+        let buf = file_network_open_info(&info);
+        // FileNetworkOpenInformation: 4×FILETIME(8) + AllocSize(8) + EOF(8) + Attrs(4) + Reserved(4) = 56
+        assert_eq!(buf.len(), 56);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
+        assert_eq!(u64::from_le_bytes(buf[32..40].try_into().unwrap()), 4096);
+        assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), 2048);
+        let attrs = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        assert_eq!(attrs & 0x01, 0x01, "readonly bit should be set");
+    }
+
+    #[test]
+    fn test_file_all_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(42),
+            attributes: rssmb_vfs::FileAttributes {
+                directory: true,
+                ..Default::default()
+            },
+            size: 100,
+            allocation_size: 512,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            file_name: "dir".to_string(),
+        };
+        let buf = file_all_info(&info, "dir", 0x001f_01ff);
+        // Fixed 96 bytes + 4 (FileNameLength) + UTF-16LE of "\dir" (8 bytes)
+        assert_eq!(buf.len(), 96 + 4 + 8);
+        // FilePositionInformation at offset 80 (u64 = 0)
+        assert_eq!(u64::from_le_bytes(buf[80..88].try_into().unwrap()), 0);
+        // FileNameLength at offset 96 (u32 = 8)
+        assert_eq!(u32::from_le_bytes(buf[96..100].try_into().unwrap()), 8);
+        // FileName starts at offset 100, should be "\dir" in UTF-16LE
+        let expected: Vec<u16> = "\\dir".encode_utf16().collect();
+        for (i, &ch) in expected.iter().enumerate() {
+            assert_eq!(
+                u16::from_le_bytes(buf[100 + i * 2..102 + i * 2].try_into().unwrap()),
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_attribute_tag_info_golden_bytes() {
+        let info = FileInfo {
+            file_id: VfsFileId(1),
+            attributes: rssmb_vfs::FileAttributes {
+                archive: true,
+                ..Default::default()
+            },
+            ..test_file_info()
+        };
+        let buf = file_attribute_tag_info(&info);
+        // FileAttributeTagInformation: Attributes(4) + ReparseTag(4) = 8
+        assert_eq!(buf.len(), 8);
+        let attrs = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(attrs & 0x20, 0x20, "archive bit should be set");
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0); // ReparseTag = 0
+    }
+
+    // --- Golden-byte tests for QUERY_DIRECTORY classes ---
+
+    #[test]
+    fn test_directory_buffer_class_37_id_both_golden() {
+        let entries = vec![
+            DirEntry {
+                file_name: "a.txt".to_string(),
+                short_name: None,
+                attributes: rssmb_vfs::FileAttributes::default(),
+                size: 100,
+                allocation_size: 512,
+                file_id: Some(VfsFileId(1)),
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+            },
+        ];
+        let buf = build_directory_buffer(&entries, 37).expect("class 37 should work");
+        assert!(!buf.is_empty());
+        // First 4 bytes = next_entry_offset (0 for last entry)
+        let next_off = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(next_off, 0, "single entry should have next_entry_offset=0");
+        // file_index at offset 4
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn test_directory_buffer_class_38_id_full_golden() {
+        let entries = vec![
+            DirEntry {
+                file_name: "b.txt".to_string(),
+                short_name: None,
+                attributes: rssmb_vfs::FileAttributes::default(),
+                size: 200,
+                allocation_size: 512,
+                file_id: Some(VfsFileId(2)),
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+            },
+        ];
+        let buf = build_directory_buffer(&entries, 38).expect("class 38 should work");
+        assert!(!buf.is_empty());
+        let next_off = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(next_off, 0, "single entry should have next_entry_offset=0");
+    }
+
+    #[test]
+    fn test_directory_buffer_class_12_names_golden() {
+        let entries = vec![
+            DirEntry {
+                file_name: "only_name.txt".to_string(),
+                short_name: None,
+                attributes: rssmb_vfs::FileAttributes::default(),
+                size: 0,
+                allocation_size: 0,
+                file_id: None,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+            },
+        ];
+        let buf = build_directory_buffer(&entries, 12).expect("class 12 should work");
+        assert!(!buf.is_empty());
+        // FileNamesInformation: next_offset(4) + file_index(4) + name_length(4) + name
+        let next_off = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(next_off, 0);
+        let name_len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        assert_eq!(name_len, "only_name.txt".encode_utf16().count() as u32 * 2);
+    }
+
+    // --- Golden-byte tests for filesystem info classes ---
+
+    #[test]
+    fn test_fs_size_info_golden_bytes() {
+        let buf = fs_size_info();
+        // FileFsSizeInformation: TotalAllocUnits(8) + AvailableAllocUnits(8) + SectorsPerAlloc(4) + BytesPerSector(4) = 24
+        assert_eq!(buf.len(), 24);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 1_000_000);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 500_000);
+        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 512);
+    }
+
+    #[test]
+    fn test_fs_device_info_golden_bytes() {
+        let buf = fs_device_info();
+        // FileFsDeviceInformation: DeviceType(4) + Characteristics(4) = 8
+        assert_eq!(buf.len(), 8);
+        // Disk = 0x00000007
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x00000007);
+    }
+
+    #[test]
+    fn test_fs_full_size_info_golden_bytes() {
+        let buf = fs_full_size_info();
+        // FileFsFullSizeInformation: Total(8) + Caller(8) + Actual(8) + SectorsPerAlloc(4) + BytesPerSector(4) = 32
+        assert_eq!(buf.len(), 32);
+        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 1_000_000);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 500_000);
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 500_000);
+    }
 }

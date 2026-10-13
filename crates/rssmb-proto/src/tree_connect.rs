@@ -202,4 +202,62 @@ mod tests {
         assert_eq!(decoded.maximal_access, 0x001f_01ff);
         assert!(decoded.share_flags.encrypt_data());
     }
+
+    #[test]
+    fn test_tree_disconnect_request_roundtrip() {
+        let req = TreeDisconnectRequest::default();
+        let mut buf = Cursor::new(Vec::new());
+        req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4); // StructureSize=4 per MS-SMB2 2.2.11
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: TreeDisconnectRequest = TreeDisconnectRequest::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded, TreeDisconnectRequest::default());
+    }
+
+    #[test]
+    fn test_tree_disconnect_response_roundtrip() {
+        let resp = TreeDisconnectResponse::default();
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4); // StructureSize=4 per MS-SMB2 2.2.12
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: TreeDisconnectResponse = TreeDisconnectResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded, TreeDisconnectResponse::default());
+    }
+
+    #[test]
+    fn test_share_flags_roundtrip() {
+        let flags = ShareFlags::new()
+            .with_encrypt_data(true)
+            .with_dfs(true);
+        let mut buf = Cursor::new(Vec::new());
+        flags.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ShareFlags = ShareFlags::read_le(&mut cursor).unwrap();
+        assert!(decoded.encrypt_data());
+        assert!(decoded.dfs());
+        assert!(!decoded.dfs_root());
+    }
+
+    #[test]
+    fn test_tree_capabilities_roundtrip() {
+        let caps = TreeCapabilities::new()
+            .with_dfs(true)
+            .with_scaleout(true);
+        let mut buf = Cursor::new(Vec::new());
+        caps.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: TreeCapabilities = TreeCapabilities::read_le(&mut cursor).unwrap();
+        assert!(decoded.dfs());
+        assert!(decoded.scaleout());
+        assert!(!decoded.cluster());
+    }
 }

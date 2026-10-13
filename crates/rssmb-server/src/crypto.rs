@@ -977,4 +977,114 @@ mod tests {
         // SessionId (offset 44..52, LE).
         assert_eq!(u64::from_le_bytes(hdr[44..52].try_into().unwrap()), 0xDEAD_BEEF_CAFE_BABE);
     }
+
+    // ── 3.1.1 preauth/KDF end-to-end transcript golden test ──────────────
+    //
+    // Simulates the full SMB 3.1.1 preauth flow:
+    // 1. Start with H0 = 64 zero bytes.
+    // 2. Accumulate preauth hash over two mock messages (NEGOTIATE + SESSION_SETUP).
+    // 3. Derive signing key from session key + final preauth hash via KDF.
+    // 4. Sign a mock SMB2 message with the derived signing key (AES-128-CMAC).
+    // 5. Verify the signature round-trips.
+    //
+    // The test validates that the full chain (preauth hash → KDF → CMAC) is
+    // deterministic and self-consistent. Known-answer vectors for the KDF
+    // step are from the smb-rs reference test data (test_kdf_sp800_108_known_answer
+    // above); this test additionally validates the preauth hash chain and
+    // CMAC signing on top of the KDF output.
+
+    #[test]
+    fn test_smb311_preauth_kdf_signing_transcript() {
+        let dialect = DialectConfig::Smb311;
+
+        // Step 1: H0 = 64 zero bytes.
+        let h0: PreauthHashValue = [0u8; 64];
+
+        // Step 2: Accumulate preauth hash over mock SMB2 messages.
+        // In a real 3.1.1 session, the server hashes:
+        //   - NEGOTIATE request (wire bytes)
+        //   - NEGOTIATE response (wire bytes)
+        //   - SESSION_SETUP request(s) (wire bytes)
+        //   - SESSION_SETUP response(s) (wire bytes)
+        // We use mock messages here; the test validates determinism and
+        // chain correctness, not correctness of specific SMB2 bytes.
+        let mock_negotiate_req = b"\xfeSMB\x00\x00\x00\x00mock_negotiate_request";
+        let mock_negotiate_resp = b"\xfeSMB\x00\x00\x00\x00mock_negotiate_response";
+
+        let h1 = preauth_update(&h0, mock_negotiate_req);
+        let h2 = preauth_update(&h1, mock_negotiate_resp);
+
+        // The preauth hash must have changed at each step.
+        assert_ne!(h1, h0, "preauth hash must change after first message");
+        assert_ne!(h2, h1, "preauth hash must change after second message");
+        assert_eq!(h2.len(), 64, "preauth hash must be 64 bytes (SHA-512)");
+
+        // Step 3: Derive signing key from session key + final preauth hash.
+        let session_key: [u8; 16] = [
+            0xDA, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F,
+            0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4, 0x5C, 0xB6,
+        ];
+        let signing_key = compute_signing_key(
+            &session_key,
+            dialect,
+            KdfContext::Preauth(&h2),
+        ).unwrap();
+        assert_eq!(signing_key.len(), 16, "signing key must be 16 bytes (AES-128)");
+
+        // Step 4: Sign a mock SMB2 message with AES-128-CMAC.
+        // In a real session, the 16-byte Signature field in the SMB2 header
+        // would be zeroed before signing. We simulate that with a mock message.
+        let mock_message = b"\xfeSMB\x00\x00\x00\x00mock_signed_message_payload";
+        let signature = sign_message(&signing_key, mock_message, dialect);
+        assert_eq!(signature.len(), 16);
+
+        // Step 5: Verify the signature round-trips.
+        assert!(verify_signature(&signing_key, mock_message, &signature, dialect));
+
+        // Step 6: Verify tampering is detected.
+        let tampered = {
+            let mut m = mock_message.to_vec();
+            m[4] ^= 0x01;
+            m
+        };
+        assert!(!verify_signature(&signing_key, &tampered, &signature, dialect),
+            "tampered message must fail signature verification");
+
+        // Step 7: Verify a different preauth hash produces a different signing key.
+        let h_alt = preauth_update(&h0, b"different_message");
+        let signing_key_alt = compute_signing_key(
+            &session_key,
+            dialect,
+            KdfContext::Preauth(&h_alt),
+        ).unwrap();
+        assert_ne!(signing_key, signing_key_alt,
+            "different preauth hashes must produce different signing keys");
+
+        // Step 8: Verify the same inputs produce the same signing key (determinism).
+        let signing_key_again = compute_signing_key(
+            &session_key,
+            dialect,
+            KdfContext::Preauth(&h2),
+        ).unwrap();
+        assert_eq!(signing_key, signing_key_again,
+            "same preauth hash must produce same signing key (determinism)");
+    }
+
+    /// Verify that the 3.1.1 encryption/decryption key derivation produces
+    /// keys that differ from the signing key, confirming label isolation.
+    #[test]
+    fn test_smb311_encryption_keys_differ_from_signing_key() {
+        let session_key: [u8; 16] = [0x42u8; 16];
+        let preauth: PreauthHashValue = [0x55u8; 64];
+        let dialect = DialectConfig::Smb311;
+
+        let signing_key = compute_signing_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let enc_key = compute_encryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let dec_key = compute_decryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+
+        // All three keys must be different (different labels).
+        assert_ne!(signing_key, enc_key, "signing and encryption keys must differ");
+        assert_ne!(signing_key, dec_key, "signing and decryption keys must differ");
+        assert_ne!(enc_key, dec_key, "encryption and decryption keys must differ");
+    }
 }

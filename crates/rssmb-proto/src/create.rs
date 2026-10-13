@@ -343,14 +343,14 @@ pub struct CloseFlags {
 
 // ── Oplock/Lease break types (MS-SMB2 2.2.23–2.2.25) ──────────────
 
-/// Oplock break notification/ack/response (12 bytes).
+/// Oplock break notification/ack/response (24 bytes).
 ///
 /// MS-SMB2 2.2.23.1, 2.2.24.1, 2.2.25.1
 #[binrw::binrw]
 #[derive(Debug)]
 #[brw(little)]
 pub struct OplockBreakMsg {
-    #[bw(calc = 12)]
+    #[bw(calc = 24)]
     structure_size: u16,
     oplock_level: u8,
     reserved: u8,
@@ -439,6 +439,7 @@ pub struct LeaseFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use binrw::io::Cursor;
 
     #[test]
     fn test_file_id_display() {
@@ -447,10 +448,157 @@ mod tests {
     }
 
     #[test]
+    fn test_file_id_roundtrip() {
+        let fid = FileId { persistent: 0xDEAD_BEEF_CAFE_BABE, volatile: 0x1234_5678_9ABC_DEF0 };
+        let mut buf = Cursor::new(Vec::new());
+        fid.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 16);
+        // Golden: persistent then volatile, LE.
+        assert_eq!(&bytes[..8], &0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+        assert_eq!(&bytes[8..], &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: FileId = FileId::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded, fid);
+    }
+
+    #[test]
+    fn test_oplock_break_msg_roundtrip() {
+        let msg = OplockBreakMsg {
+            oplock_level: 2,
+            reserved: 0,
+            _reserved2: 0,
+            file_id: FileId { persistent: 1, volatile: 2 },
+        };
+        let mut buf = Cursor::new(Vec::new());
+        msg.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 24); // StructureSize=24 per MS-SMB2 2.2.23.1
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 24);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: OplockBreakMsg = OplockBreakMsg::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.oplock_level, 2);
+        assert_eq!(decoded.file_id, FileId { persistent: 1, volatile: 2 });
+    }
+
+    #[test]
+    fn test_lease_break_notify_roundtrip() {
+        let msg = LeaseBreakNotify {
+            new_epoch: 1,
+            ack_required: 1,
+            lease_key: Guid::from([0xABu8; 16]),
+            current_lease_state: LeaseState::new().with_read_caching(true),
+            new_lease_state: LeaseState::new().with_read_caching(true).with_handle_caching(true),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        msg.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 44); // StructureSize=44 per MS-SMB2 2.2.23.2
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 44);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: LeaseBreakNotify = LeaseBreakNotify::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.new_epoch, 1);
+        assert_eq!(decoded.lease_key, Guid::from([0xABu8; 16]));
+        assert!(decoded.current_lease_state.read_caching());
+        assert!(decoded.new_lease_state.handle_caching());
+    }
+
+    #[test]
+    fn test_lease_break_ack_response_roundtrip() {
+        let msg = LeaseBreakAckResponse {
+            reserved: 0,
+            _reserved2: 0,
+            lease_key: Guid::from([0x42u8; 16]),
+            lease_state: LeaseState::new().with_write_caching(true),
+            _reserved3: 0,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        msg.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 36); // StructureSize=36 per MS-SMB2 2.2.24.2
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 36);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: LeaseBreakAckResponse = LeaseBreakAckResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.lease_key, Guid::from([0x42u8; 16]));
+        assert!(decoded.lease_state.write_caching());
+    }
+
+    #[test]
     fn test_create_response_default() {
         let resp = CreateResponse::default();
         assert_eq!(resp.oplock_level, OplockLevel::None);
         assert_eq!(resp.create_action, CreateAction::Superseded);
+    }
+
+    #[test]
+    fn test_create_response_roundtrip() {
+        let resp = CreateResponse {
+            oplock_level: OplockLevel::II,
+            flags: CreateResponseFlags::new().with_reparsepoint(true),
+            create_action: CreateAction::Created,
+            creation_time: FileTime::from(132000000000000000u64),
+            last_access_time: FileTime::from(132000000000000001u64),
+            last_write_time: FileTime::from(132000000000000002u64),
+            change_time: FileTime::from(132000000000000003u64),
+            allocation_size: 4096,
+            endof_file: 2048,
+            file_attributes: FileAttributes::new().with_normal(true),
+            file_id: FileId { persistent: 0xCAFE, volatile: 0xBABE },
+            ..Default::default()
+        };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        // CreateResponse fixed part: 2+1+1+4+8+8+8+8+8+8+4+4+8+4+4 = 88 bytes
+        // (StructureSize through trailing reserved/context fields with no data)
+        assert_eq!(bytes.len(), 88);
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 89);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: CreateResponse = CreateResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.oplock_level, OplockLevel::II);
+        assert_eq!(decoded.create_action, CreateAction::Created);
+        assert_eq!(decoded.endof_file, 2048);
+        assert_eq!(decoded.file_id, FileId { persistent: 0xCAFE, volatile: 0xBABE });
+    }
+
+    #[test]
+    fn test_close_request_roundtrip() {
+        let req = CloseRequest {
+            flags: CloseFlags::new().with_postquery_attrib(true),
+            file_id: FileId { persistent: 0xAAAA, volatile: 0xBBBB },
+        };
+        let mut buf = Cursor::new(Vec::new());
+        req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 24); // StructureSize=24 per MS-SMB2 2.2.15
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 24);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: CloseRequest = CloseRequest::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.file_id, FileId { persistent: 0xAAAA, volatile: 0xBBBB });
+        assert!(decoded.flags.postquery_attrib());
+    }
+
+    #[test]
+    fn test_close_response_roundtrip() {
+        let resp = CloseResponse {
+            flags: CloseFlags::new(),
+            creation_time: FileTime::from(130000000000000000u64),
+            last_access_time: FileTime::from(130000000000000001u64),
+            last_write_time: FileTime::from(130000000000000002u64),
+            change_time: FileTime::from(130000000000000003u64),
+            allocation_size: 0,
+            endof_file: 0,
+            file_attributes: FileAttributes::new().with_directory(true),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 60); // StructureSize=60 per MS-SMB2 2.2.16
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 60);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: CloseResponse = CloseResponse::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded.file_attributes.directory(), true);
+        assert_eq!(decoded.last_write_time, FileTime::from(130000000000000002u64));
     }
 
     #[test]
@@ -467,5 +615,72 @@ mod tests {
         assert!(mask.file_read_data());
         assert!(mask.generic_all());
         assert!(!mask.file_write_data());
+    }
+
+    #[test]
+    fn test_file_access_mask_roundtrip() {
+        let mask = FileAccessMask::new()
+            .with_file_read_data(true)
+            .with_file_write_data(true)
+            .with_delete(true)
+            .with_generic_read(true);
+        let mut buf = Cursor::new(Vec::new());
+        mask.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: FileAccessMask = FileAccessMask::read_le(&mut cursor).unwrap();
+        assert!(decoded.file_read_data());
+        assert!(decoded.file_write_data());
+        assert!(decoded.delete());
+        assert!(decoded.generic_read());
+    }
+
+    #[test]
+    fn test_create_options_roundtrip() {
+        let opts = CreateOptions::new()
+            .with_directory_file(true)
+            .with_delete_on_close(true);
+        let mut buf = Cursor::new(Vec::new());
+        opts.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: CreateOptions = CreateOptions::read_le(&mut cursor).unwrap();
+        assert!(decoded.directory_file());
+        assert!(decoded.delete_on_close());
+        assert!(!decoded.write_through());
+    }
+
+    #[test]
+    fn test_share_access_flags_roundtrip() {
+        let flags = ShareAccessFlags::new()
+            .with_read(true)
+            .with_delete(true);
+        let mut buf = Cursor::new(Vec::new());
+        flags.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ShareAccessFlags = ShareAccessFlags::read_le(&mut cursor).unwrap();
+        assert!(decoded.read());
+        assert!(decoded.delete());
+        assert!(!decoded.write());
+    }
+
+    #[test]
+    fn test_lease_state_roundtrip() {
+        let state = LeaseState::new()
+            .with_read_caching(true)
+            .with_write_caching(true);
+        let mut buf = Cursor::new(Vec::new());
+        state.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 4);
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: LeaseState = LeaseState::read_le(&mut cursor).unwrap();
+        assert!(decoded.read_caching());
+        assert!(decoded.write_caching());
+        assert!(!decoded.handle_caching());
     }
 }

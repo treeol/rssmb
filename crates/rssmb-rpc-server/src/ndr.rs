@@ -591,4 +591,163 @@ mod tests {
         let level = parse_netr_server_get_info_request(&w.into_vec()).unwrap();
         assert_eq!(level, 100);
     }
+
+    // --- Golden-byte fixture: NetrShareEnum (opnum 15, level 1) ---
+
+    #[test]
+    fn netr_share_enum_golden_bytes_single_share() {
+        let shares = vec![
+            ShareInfo {
+                name: "public".to_string(),
+                comment: "Public".to_string(),
+                share_type: 0,
+                encrypt_data: false,
+            },
+        ];
+        let data = encode_netr_share_enum_response(&shares, 1);
+
+        // Walk the NDR structure:
+        // Level (u32) = 1
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
+        // Union tag (u32) = 1
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
+        // Container pointer (u32) = 1 (non-null)
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 1);
+        // EntriesRead (u32) = 1
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 1);
+        // BufferPtr (u32) = 1 (non-null)
+        assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 1);
+        // MaxCount (u32) = 1
+        assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), 1);
+
+        // TotalEntries (u32) = 1 — find it after the deferred data.
+        // WERROR (u32) = 0 — last 4 bytes.
+        let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        assert_eq!(werr, WERR_SUCCESS);
+    }
+
+    #[test]
+    fn netr_share_enum_golden_bytes_empty_shares() {
+        let data = encode_netr_share_enum_response(&[], 1);
+        // Level = 1, tag = 1, container_ptr = 0 (null), TotalEntries = 0, ResumePtr = 0, WERROR = 0
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // ContainerPtr = null
+        // TotalEntries
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 0);
+        // ResumeHandlePtr = 0
+        assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 0);
+        // WERROR = 0
+        assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), WERR_SUCCESS);
+        assert_eq!(data.len(), 24);
+    }
+
+    #[test]
+    fn netr_share_enum_roundtrip_encode_decode() {
+        let shares = test_shares(); // 3 shares
+        let data = encode_netr_share_enum_response(&shares, 1);
+
+        // Decode the response by walking the NDR structure:
+        // Level + tag + container_ptr + entries_read + buffer_ptr + max_count
+        // Then per share: netname_ptr + type + remark_ptr
+        // Then deferred netname strings, deferred remark strings
+        // Then total_entries + resume_ptr + werror
+
+        let mut r = NdrReader::new(&data);
+        let level = r.read_u32().unwrap();
+        assert_eq!(level, 1);
+        let _tag = r.read_u32().unwrap();
+        let container_present = r.read_unique_ptr().unwrap();
+        assert!(container_present);
+        let entries_read = r.read_u32().unwrap();
+        assert_eq!(entries_read, 3);
+        let buffer_present = r.read_unique_ptr().unwrap();
+        assert!(buffer_present);
+        let max_count = r.read_u32().unwrap();
+        assert_eq!(max_count, 3);
+
+        // Read 3 SHARE_INFO_1 fixed parts
+        // Share 0: "public" with comment "Public share" → remark non-null
+        // Share 1: "private" with empty comment → remark null
+        // Share 2: "IPC$" with empty comment → remark null, type 0x80000003
+        for i in 0..3 {
+            let netname_ptr = r.read_unique_ptr().unwrap();
+            assert!(netname_ptr);
+            let share_type = r.read_u32().unwrap();
+            let remark_ptr = r.read_unique_ptr().unwrap();
+            if i == 0 {
+                assert!(remark_ptr, "share 0 should have non-null remark");
+                assert_eq!(share_type, 0);
+            } else if i == 1 {
+                assert!(!remark_ptr, "share 1 should have null remark");
+                assert_eq!(share_type, 0);
+            } else {
+                assert!(!remark_ptr, "share 2 should have null remark");
+                assert_eq!(share_type, 0x80000003);
+            }
+        }
+
+        // Skip deferred netname strings (3 shares)
+        for _ in 0..3 {
+            r.skip_wstr_conformant().unwrap();
+        }
+        // Skip deferred remark strings (only share 0 has a remark)
+        r.skip_wstr_conformant().unwrap();
+
+        // TotalEntries + ResumeHandle + WERROR
+        let total_entries = r.read_u32().unwrap();
+        assert_eq!(total_entries, 3);
+        let _resume = r.read_unique_ptr().unwrap();
+        let werr = r.read_u32().unwrap();
+        assert_eq!(werr, WERR_SUCCESS);
+    }
+
+    // --- Golden-byte fixture: NetrShareGetInfo (opnum 16, level 1) ---
+
+    #[test]
+    fn netr_share_get_info_golden_bytes_found() {
+        let share = ShareInfo {
+            name: "public".to_string(),
+            comment: "Public share".to_string(),
+            share_type: 0,
+            encrypt_data: false,
+        };
+        let data = encode_netr_share_get_info_response(Some(&share), 1);
+        // Level + tag + union_ptr(non-null) + netname_ptr(non-null) + type + remark_ptr(non-null)
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
+        assert_ne!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // UnionPtr
+        // WERROR at the end
+        let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        assert_eq!(werr, WERR_SUCCESS);
+    }
+
+    #[test]
+    fn netr_share_get_info_golden_bytes_not_found() {
+        let data = encode_netr_share_get_info_response(None, 1);
+        // Level + tag + null_ptr + WERROR
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // null union ptr
+        let werr = u32::from_le_bytes(data[12..16].try_into().unwrap());
+        assert_eq!(werr, WERR_NERR_NETNAMENOTFOUND);
+    }
+
+    // --- Golden-byte fixture: NetrServerGetInfo (opnum 21, level 100) ---
+
+    #[test]
+    fn netr_server_get_info_golden_bytes_level100() {
+        let data = encode_netr_server_get_info_response("rssmb", 100);
+        // UnionPtr (u32, non-null) + Level (u32=100) + PlatformId (u32=500) +
+        // NamePtr (u32, non-null) + conformant wstr "rssmb\0" + WERROR (u32=0)
+        let union_ptr = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        assert_ne!(union_ptr, 0);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 100); // Level
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 500); // PlatformId
+        let name_ptr = u32::from_le_bytes(data[12..16].try_into().unwrap());
+        assert_ne!(name_ptr, 0);
+        // WERROR at end
+        let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        assert_eq!(werr, WERR_SUCCESS);
+    }
 }
