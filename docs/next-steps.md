@@ -550,8 +550,9 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
   replaced with `rssmb_proto::` (Step 9.1c-swap). `smb-rs/` moved to
   `.reference/smb-rs/` (gitignored, not a workspace dependency). The protocol
   crate `rssmb-proto` handles all wire encoding/decoding. Base SHA `7c7d4a6`.
-- **`rust-version` set to 1.75** (MSRV for `std::fs::FileTimes` and
-  `std::sync::OnceLock`). `rust-toolchain.toml` pins the version with
+- **`rust-version` set to 1.78** (MSRV for `std::fs::FileTimes` and
+  `std::sync::OnceLock`, and the minimum for `Cargo.lock` v4).
+  `rust-toolchain.toml` pins the version with
   rustfmt + clippy. CI uses the pinned toolchain + `Swatinem/rust-cache`.
   All warnings fixed — `RUSTFLAGS="-D warnings"` builds clean (Step 9.4).
 - **ID allocation** (9.5 — done): SessionId is random non-zero with collision

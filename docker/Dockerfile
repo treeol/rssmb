@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for RSSMB
 # Stage 1: Build
-# MSRV is 1.75 (rust-toolchain.toml); use a recent stable for the build image.
+# MSRV is 1.78 (rust-toolchain.toml, needed for Cargo.lock v4).
 FROM rust:1.90-bookworm AS builder
 
 WORKDIR /build
