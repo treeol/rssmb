@@ -563,8 +563,10 @@ async/pending pipe reads, `FSCTL_PIPE_WAIT`/`FSCTL_PIPE_PEEK`.
   hardcodes `ShareAccess::all()`, so cross-connection share-mode conflicts are
   not enforced. Wire it in as part of oplock/lease work (Phase 5), where
   share-mode tracking and `STATUS_SHARING_VIOLATION` are needed.
-- **Logging:** the binrw backtrace dumps are huge. Log a one-line summary at
-  warn and the full error at trace. (9.7 — pending)
+- **Logging** (9.7 — done): decode errors use `{e}` (Display) instead of
+  `{e:?}` (verbose debug) in `WireError::DecodeError` strings; hex preview
+  (first 128 bytes) at debug level on parse failure; panic hook routes
+  panics through `tracing::error!` (one line + location) in production.
 
 ---
 
