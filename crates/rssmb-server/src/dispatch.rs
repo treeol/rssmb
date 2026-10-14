@@ -76,12 +76,17 @@ pub struct ConnState {
     // NOTE: PreauthTarget is defined above this struct.
     /// Unique connection identifier assigned by the connection engine.
     pub conn_id: u64,
+    /// Remote peer IP address — used for auth throttling and audit logging.
+    pub remote_addr: std::net::IpAddr,
     /// Active sessions for this connection (SMB allows multiple).
     pub sessions: std::sync::Arc<tokio::sync::RwLock<Vec<Arc<Session>>>>,
     /// Sender half of the connection's write channel.
     pub write_tx: mpsc::Sender<Bytes>,
     /// In-progress authentication state (one per connection until session established).
     pub auth_state: std::sync::Arc<tokio::sync::Mutex<Option<rssmb_auth::AuthState>>>,
+    /// Per-connection auth failure count — never reset on SessionId=0.
+    /// Exceeding auth_max_failures_per_conn drops the connection.
+    pub auth_failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Negotiation record for this connection (set by NEGOTIATE, used by
     /// SESSION_SETUP, signing, and VALIDATE_NEGOTIATE_INFO).
     pub negotiate_record: std::sync::Arc<tokio::sync::Mutex<Option<NegotiateRecord>>>,
@@ -935,6 +940,40 @@ async fn handle_session_setup(
         _ => return error_response_for(Command::SessionSetup, NtStatus::InvalidParameter, &req.header),
     };
 
+    // Auth throttle: if the source IP is in cooldown from too many recent
+    // failures, refuse SESSION_SETUP immediately. This check runs before
+    // any auth processing so it costs the attacker nothing but a LOGON_FAILURE.
+    // Only applies to new auth conversations (SessionId == 0); continuation
+    // rounds for an already-pending session are not throttled.
+    if req.header.session_id == 0 {
+        match state.auth_limiter.check(&conn_state.remote_addr) {
+            crate::auth_limiter::AuthThrottleResult::Refuse => {
+                // Count this as a per-connection failure too — a connection
+                // that keeps trying during cooldown should hit the per-conn
+                // cap and get disconnected, not spin forever.
+                let conn_fails = conn_state.auth_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    conn_id = conn_state.conn_id,
+                    ip = %conn_state.remote_addr,
+                    conn_failures = conn_fails,
+                    "SESSION_SETUP refused — auth cooldown active",
+                );
+                if state.auth_limiter.conn_failure_exceeds(conn_fails) {
+                    warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
+                        "per-connection auth failure cap exceeded — disconnecting");
+                    return FramedResponse::Disconnect;
+                }
+                return error_response_for(
+                    Command::SessionSetup,
+                    NtStatus::LogonFailure,
+                    &req.header,
+                );
+            }
+            crate::auth_limiter::AuthThrottleResult::Allow => {}
+        }
+    }
+
     // Get or create auth state
     let mut auth_guard = conn_state.auth_state.lock().await;
     let auth_state = auth_guard.get_or_insert_with(|| rssmb_auth::AuthState::new());
@@ -1351,6 +1390,35 @@ async fn handle_session_setup(
             *auth_guard = None; // Clear auth state
             conn_state.pending_sessions.write().await.remove(&session_id);
             conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
+            // Throttle: record failure, apply delay, check per-connection cap.
+            // The delay is applied after dropping auth_guard (the lock is no
+            // longer needed). The failure is recorded BEFORE the delay so
+            // disconnecting during the wait cannot evade accounting.
+            drop(auth_guard);
+            let delay = state.auth_limiter.record_failure(conn_state.remote_addr);
+            let conn_fails = conn_state.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::warn!(
+                conn_id = conn_state.conn_id,
+                ip = %conn_state.remote_addr,
+                reason = %reason,
+                delay_ms = delay.as_millis() as u64,
+                conn_failures = conn_fails,
+                "auth failure",
+            );
+            if state.auth_limiter.conn_failure_exceeds(conn_fails) {
+                warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
+                    "per-connection auth failure cap exceeded — disconnecting");
+                return FramedResponse::Disconnect;
+            }
+            if !delay.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = state.shutdown.notified() => {
+                        debug!(conn_id = conn_state.conn_id, "shutdown during auth delay");
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
             error_response_for(Command::SessionSetup, NtStatus::LogonFailure, &req.header)
         }
         Err(e) => {
@@ -1358,6 +1426,31 @@ async fn handle_session_setup(
             *auth_guard = None;
             conn_state.pending_sessions.write().await.remove(&session_id);
             conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
+            drop(auth_guard);
+            let delay = state.auth_limiter.record_failure(conn_state.remote_addr);
+            let conn_fails = conn_state.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::warn!(
+                conn_id = conn_state.conn_id,
+                ip = %conn_state.remote_addr,
+                error = %e,
+                delay_ms = delay.as_millis() as u64,
+                conn_failures = conn_fails,
+                "auth error (throttled)",
+            );
+            if state.auth_limiter.conn_failure_exceeds(conn_fails) {
+                warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
+                    "per-connection auth failure cap exceeded — disconnecting");
+                return FramedResponse::Disconnect;
+            }
+            if !delay.is_zero() {
+                tokio::select! {
+                    biased;
+                    _ = state.shutdown.notified() => {
+                        debug!(conn_id = conn_state.conn_id, "shutdown during auth delay");
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
             error_response_for(Command::SessionSetup, NtStatus::LogonFailure, &req.header)
         }
     }
@@ -3217,9 +3310,11 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Bytes>(16);
         ConnState {
             conn_id: 1,
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: tx,
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
+            auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
             trees: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             opens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

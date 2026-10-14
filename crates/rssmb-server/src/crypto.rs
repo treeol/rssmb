@@ -304,7 +304,7 @@ impl NonceSource {
     pub fn next(&self) -> Result<[u8; 16], EncryptionError> {
         use std::sync::atomic::Ordering;
         // fetch_update is non-wrapping: at u64::MAX it returns Err.
-        let n = self.counter.fetch_update(
+        let n = self.counter.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |x| {

@@ -6,6 +6,7 @@
 //! - Handlers run as spawned tasks, enabling STATUS_PENDING, cancellation,
 //!   and unsolicited breaks (oplock/lease) without deadlock.
 
+pub mod auth_limiter;
 pub mod connection;
 pub mod session;
 pub mod tree;
@@ -58,6 +59,8 @@ pub struct ServerState {
     pub identities: Arc<rssmb_auth::IdentityStore>,
     /// Connection limiter (global + per-IP).
     pub conn_limiter: Arc<crate::connection::ConnectionLimiter>,
+    /// Auth failure limiter (per-IP token bucket with growing delay + cooldown).
+    pub auth_limiter: Arc<crate::auth_limiter::AuthLimiter>,
     /// Shutdown signal.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Stable server GUID (generated once, used for all negotiate responses).
@@ -88,12 +91,21 @@ impl ServerState {
             config.max_connections_per_ip,
         ));
 
+        let auth_limiter = Arc::new(crate::auth_limiter::AuthLimiter::new(
+            config.auth_max_failures,
+            config.auth_window_secs,
+            config.auth_delay_max_ms,
+            config.auth_cooldown_secs,
+            config.auth_max_failures_per_conn,
+        ));
+
         Self {
             config: Arc::new(config),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             open_table: Arc::new(opens::OpenTable::new()),
             identities,
             conn_limiter,
+            auth_limiter,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             server_guid: guid,
         }

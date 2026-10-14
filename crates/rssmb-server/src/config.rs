@@ -69,6 +69,31 @@ pub struct ServerConfig {
     #[serde(default = "default_max_credits")]
     pub max_credits: u32,
 
+    /// Maximum auth failures per IP within the rolling window before delay
+    /// and cooldown kick in. 0 = disabled (no throttling).
+    #[serde(default = "default_auth_max_failures")]
+    pub auth_max_failures: u32,
+
+    /// Rolling window (seconds) for auth failure counting per IP.
+    #[serde(default = "default_auth_window_secs")]
+    pub auth_window_secs: u64,
+
+    /// Maximum delay (milliseconds) before sending LOGON_FAILURE after the
+    /// failure threshold is exceeded. When the growing delay would exceed this,
+    /// the IP enters cooldown instead.
+    #[serde(default = "default_auth_delay_max_ms")]
+    pub auth_delay_max_ms: u64,
+
+    /// Cooldown duration (seconds) during which SESSION_SETUP from a
+    /// throttled IP is refused immediately.
+    #[serde(default = "default_auth_cooldown_secs")]
+    pub auth_cooldown_secs: u64,
+
+    /// Maximum auth failures per TCP connection before the connection is
+    /// dropped. 0 = disabled (no per-connection cap).
+    #[serde(default = "default_auth_max_failures_per_conn")]
+    pub auth_max_failures_per_conn: u32,
+
     /// Server name (for SrvSvc NetrServerGetInfo). Defaults to "rssmb" if empty.
     #[serde(default)]
     pub server_name: String,
@@ -118,6 +143,11 @@ fn default_smb_port() -> u16 { 445 }
 fn default_max_frame_size() -> usize { 1_048_576 }
 fn default_health_port() -> u16 { 8080 }
 fn default_max_credits() -> u32 { 1024 }
+fn default_auth_max_failures() -> u32 { 5 }
+fn default_auth_window_secs() -> u64 { 60 }
+fn default_auth_delay_max_ms() -> u64 { 5000 }
+fn default_auth_cooldown_secs() -> u64 { 60 }
+fn default_auth_max_failures_per_conn() -> u32 { 10 }
 fn default_max_dialect() -> DialectConfig { DialectConfig::Smb311 }
 fn default_idle_timeout() -> u64 { 900 }
 fn default_health_bind_addr() -> String { "127.0.0.1".to_string() }
@@ -236,6 +266,19 @@ impl ServerConfig {
         if self.shares.iter().any(|(k, _)| k.eq_ignore_ascii_case("IPC$")) {
             return Err("share named 'IPC$' is reserved — cannot configure a disk share with that name".to_string());
         }
+        // Auth throttle validation: when throttling is enabled, the window,
+        // delay cap, and cooldown must be positive and non-trivial.
+        if self.auth_max_failures > 0 {
+            if self.auth_window_secs == 0 {
+                return Err("auth_window_secs must be > 0 when auth_max_failures > 0".to_string());
+            }
+            if self.auth_delay_max_ms == 0 {
+                return Err("auth_delay_max_ms must be > 0 when auth_max_failures > 0".to_string());
+            }
+            if self.auth_cooldown_secs == 0 {
+                return Err("auth_cooldown_secs must be > 0 when auth_max_failures > 0".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -269,6 +312,11 @@ impl ServerConfig {
             health_port: 8080,
             health_bind_addr: "127.0.0.1".to_string(),
             max_credits: 1024,
+            auth_max_failures: 5,
+            auth_window_secs: 60,
+            auth_delay_max_ms: 5000,
+            auth_cooldown_secs: 60,
+            auth_max_failures_per_conn: 10,
             server_name: "rssmb".to_string(),
             users: vec![],
         }

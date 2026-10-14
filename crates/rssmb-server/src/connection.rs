@@ -234,9 +234,11 @@ impl Connection {
         // later (after SESSION_SETUP); for Phase 1 it stays `None`.
         let conn_state = ConnState {
             conn_id,
+            remote_addr: remote_addr.ip(),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: write_tx.clone(),
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
+            auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
             trees: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             opens: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -1250,9 +1252,11 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Bytes>(4);
         let conn_state = ConnState {
             conn_id: 77,
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: tx,
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
+            auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
             trees: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             opens: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),

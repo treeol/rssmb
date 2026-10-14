@@ -343,16 +343,28 @@ impl AuthProvider for NtlmAuthProvider {
             // proof ourselves using the pre-computed NT hash from the
             // identity store, and compute the session key directly — no
             // plaintext password is needed.
+            //
+            // Timing equalization: when the user is unknown, we still run
+            // verify_with_nt_hash against a dummy hash so that the
+            // auth-failure path takes approximately the same time as a
+            // known-user-with-wrong-password. This is not "constant-time
+            // authentication" — the HashMap lookup, string comparisons, and
+            // field parsing add small timing differences — but it
+            // eliminates the most obvious oracle: unknown-user fast-fail
+            // before crypto vs. known-user crypto-verify-then-fail.
             let wire_user = ssp
                 .query_context_names()
                 .map(|n| account_name(&n.username))
                 .map_err(|e| AuthError::LogonFailure(format!("no user in AUTHENTICATE: {e}")))?;
 
-            // Look up the pre-computed NT hash for this user.
-            let stored = self
-                .identities
-                .lookup(&wire_user)
-                .ok_or_else(|| AuthError::LogonFailure(format!("unknown user {wire_user:?}")))?;
+            // Look up the pre-computed NT hash for this user, or use a dummy
+            // hash so the verification path runs regardless. A matching proof
+            // against the dummy hash never authenticates: `stored` is None
+            // for unknown users, and proof_verified is only set when both
+            // the user exists and the proof matches.
+            let stored = self.identities.lookup(&wire_user);
+            let dummy_hash = [0u8; 16];
+            let nt_hash: &[u8] = stored.as_ref().map(|s| &s.nt_hash[..]).unwrap_or(&dummy_hash);
 
             let challenge = state
                 .server_challenge
@@ -364,11 +376,24 @@ impl AuthProvider for NtlmAuthProvider {
             if account_name_str(&parsed_user) != wire_user {
                 return Err(AuthError::LogonFailure("AUTHENTICATE user mismatch".into()));
             }
-            // Verify the NTLMv2 proof using the pre-computed NT hash.
-            if !ntlmv2::verify_with_nt_hash(&fields, &stored.nt_hash, &challenge) {
+            // Verify the NTLMv2 proof. For unknown users this runs against
+            // the dummy hash and will fail; for known users it runs against
+            // the real hash. Both paths do the same HMAC-MD5 work.
+            if !ntlmv2::verify_with_nt_hash(&fields, nt_hash, &challenge) {
                 tracing::debug!(user = %wire_user, "NTLMv2 proof mismatch");
                 return Err(AuthError::LogonFailure("NTLMv2 proof mismatch".into()));
             }
+            // The proof matched — but if the user is unknown (stored is None),
+            // this was a match against the dummy hash. Never authenticate
+            // an unknown user, even if their proof happened to match the
+            // all-zeros dummy.
+            let stored = match stored {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(user = %wire_user, "proof matched dummy hash — refusing unknown user");
+                    return Err(AuthError::LogonFailure("unknown user".into()));
+                }
+            };
             state.proof_verified = true;
 
             // Save the negotiate flags for the mechListMIC computation.
