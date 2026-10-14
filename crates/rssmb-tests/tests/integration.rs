@@ -166,6 +166,7 @@ fn make_config() -> (ServerConfig, tempfile::TempDir) {
             guest_ok: true,
             valid_users: vec![],
             encrypt_data: false,
+            follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
         },
     );
 

@@ -15,6 +15,20 @@ pub mod path;
 
 pub use path::NormalizedPath;
 
+/// Symlink policy for a share's local filesystem backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowSymlinks {
+    /// Never follow symlinks. Report them as reparse points
+    /// (`FILE_ATTRIBUTE_REPARSE_POINT`). Opening through a symlink returns
+    /// `AccessDenied` / `STATUS_STOPPED_ON_SYMLINK`.
+    #[default]
+    Never,
+    /// Follow symlinks only if the resolved target is within the share root.
+    /// Out-of-share symlink targets are refused.
+    WithinShare,
+}
+
 /// Opaque handle to an open file or directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpenId(pub u64);
@@ -249,6 +263,8 @@ pub enum VfsError {
     InvalidHandle,
     #[error("path traversal detected")]
     PathTraversal,
+    #[error("invalid path name")]
+    InvalidName,
     #[error("directory not empty")]
     DirectoryNotEmpty,
     #[error("io error: {0}")]

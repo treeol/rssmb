@@ -40,6 +40,8 @@ pub enum NtStatus {
     ObjectNameNotFound,
     /// Object name collision (0xC0000035)
     ObjectNameCollision,
+    /// Object name invalid (0xC0000033) — invalid path/name
+    ObjectNameInvalid,
     /// Sharing violation (0xC0000043)
     SharingViolation,
     /// File is a directory (0xC00000BA)
@@ -92,6 +94,7 @@ impl NtStatus {
             NtStatus::AccessDenied => 0xC0000022,
             NtStatus::ObjectNameNotFound => 0xC0000034,
             NtStatus::ObjectNameCollision => 0xC0000035,
+            NtStatus::ObjectNameInvalid => 0xC0000033,
             NtStatus::SharingViolation => 0xC0000043,
             NtStatus::FileIsADirectory => 0xC00000BA,
             NtStatus::NotADirectory => 0xC0000103,
@@ -125,6 +128,7 @@ impl NtStatus {
             0xC0000022 => NtStatus::AccessDenied,
             0xC0000034 => NtStatus::ObjectNameNotFound,
             0xC0000035 => NtStatus::ObjectNameCollision,
+            0xC0000033 => NtStatus::ObjectNameInvalid,
             0xC0000043 => NtStatus::SharingViolation,
             0xC00000BA => NtStatus::FileIsADirectory,
             0xC0000103 => NtStatus::NotADirectory,

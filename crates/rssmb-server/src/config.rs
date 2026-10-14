@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use serde::Deserialize;
+use rssmb_vfs::FollowSymlinks;
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -235,6 +236,12 @@ pub struct ShareConfig {
     /// Only effective for 3.x dialects; ignored for 2.x.
     #[serde(default)]
     pub encrypt_data: bool,
+
+    /// Symlink policy for this share:
+    /// - `never` (default): never follow symlinks; report them as reparse points
+    /// - `within`: follow symlinks only if their target is within the share root
+    #[serde(default)]
+    pub follow_symlinks: FollowSymlinks,
 }
 
 fn default_true() -> bool { true }
@@ -294,6 +301,7 @@ impl ServerConfig {
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
         });
 
         Self {
@@ -458,6 +466,7 @@ disabled = false
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: true,
+            follow_symlinks: FollowSymlinks::Never,
         });
         assert!(config.validate().is_err(), "encrypt_data under disabled must be rejected");
     }
@@ -475,6 +484,7 @@ disabled = false
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: true,
+            follow_symlinks: FollowSymlinks::Never,
         });
         assert!(config.validate().is_ok());
     }
@@ -491,6 +501,7 @@ disabled = false
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
         });
         assert!(config.validate().is_err(), "IPC$ share name must be rejected");
     }
@@ -507,6 +518,7 @@ disabled = false
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
         });
         assert!(config.validate().is_err(), "ipc$ share name must be rejected (case-insensitive)");
     }

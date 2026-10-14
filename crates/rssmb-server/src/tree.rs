@@ -221,6 +221,7 @@ mod tests {
             guest_ok: false,
             valid_users: vec![],
             encrypt_data: false,
+            follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
         }
     }
 

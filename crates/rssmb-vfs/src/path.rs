@@ -1,10 +1,27 @@
-//! Path normalization for SMB paths.
+//! Path normalization and validation for SMB paths.
 //!
 //! SMB clients use `\` as the path separator. The server must normalize
-//! paths to the OS-native format, enforce case policy, and prevent
-//! path traversal attacks.
+//! paths to the OS-native format, enforce case policy, prevent path
+//! traversal attacks, and reject invalid path names per MS-SMB2 / MS-FSCC.
+//!
+//! All input paths are NFC-normalized to handle macOS NFD clients.
 
 use std::path::PathBuf;
+use unicode_normalization::UnicodeNormalization;
+
+/// Maximum path length in UTF-16 code units (MS-FSCC MAX_PATH).
+const MAX_PATH_UTF16: usize = 32_767;
+
+/// Maximum component (name) length in UTF-16 code units (NTFS limit).
+const MAX_COMPONENT_UTF16: usize = 255;
+
+/// Characters that are forbidden in SMB path names.
+///
+/// - 0x00–0x1F: C0 control characters (NUL, CR, LF, …)
+/// - 0x7F: DEL
+/// - `< > : " | ? *`: reserved by Windows / SMB (note: `:` is the stream
+///   separator in MS-FSCC §2.1.5)
+const RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
 
 /// A normalized path within a share.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,13 +36,15 @@ impl NormalizedPath {
     /// Normalize an SMB path from the wire (using `\` separators).
     ///
     /// This function:
-    /// 1. Splits on `\` and `/`
-    /// 2. Resolves `.` (current directory) — skipped
-    /// 3. Rejects `..` (parent directory) — path traversal prevention
-    /// 4. Converts to OS-native path separators
-    /// 5. Applies case policy (case-insensitive by default)
+    /// 1. NFC-normalizes the input (macOS sends NFD).
+    /// 2. Splits on `\` and `/`
+    /// 3. Resolves `.` (current directory) — skipped
+    /// 4. Rejects `..` (parent directory) — path traversal prevention
+    /// 5. Rejects control/reserved characters, trailing dot/space, and
+    ///    over-length components or total path
+    /// 6. Converts to OS-native path separators
     ///
-    /// Returns an error if path traversal is detected.
+    /// Returns an error if path traversal is detected or the name is invalid.
     pub fn from_smb_path(path: &str) -> Result<Self, PathError> {
         if path.is_empty() {
             return Ok(Self {
@@ -34,10 +53,13 @@ impl NormalizedPath {
             });
         }
 
-        let is_directory = path.ends_with('\\') || path.ends_with('/');
+        // NFC normalization — macOS clients send NFD (decomposed) form.
+        let nfc = path.nfc().collect::<String>();
+
+        let is_directory = nfc.ends_with('\\') || nfc.ends_with('/');
 
         let mut components = Vec::new();
-        for part in path.split(|c| c == '\\' || c == '/') {
+        for part in nfc.split(|c| c == '\\' || c == '/') {
             if part.is_empty() || part == "." {
                 continue;
             }
@@ -45,9 +67,21 @@ impl NormalizedPath {
                 // Path traversal — never allow escaping share root
                 return Err(PathError::TraversalDetected);
             }
-            // Normalize: on case-insensitive filesystems, lowercase the component
-            // The actual case-folding strategy is up to the VFS backend
+
+            // Validate the component name.
+            validate_component(part)?;
+
             components.push(part.to_string());
+        }
+
+        // Total UTF-16 length check (sum of components + separators).
+        let total_utf16: usize = components
+            .iter()
+            .map(|c| c.encode_utf16().count())
+            .sum::<usize>()
+            + components.len().saturating_sub(1); // separators
+        if total_utf16 > MAX_PATH_UTF16 {
+            return Err(PathError::InvalidName);
         }
 
         Ok(Self {
@@ -97,20 +131,49 @@ impl NormalizedPath {
             is_directory: true,
         })
     }
+}
 
-    /// Check if this path could be a symlink escape.
-    /// The VFS backend must do its own realpath check; this is a first-pass filter.
-    pub fn is_safe(&self) -> bool {
-        // We already rejected `..` in from_smb_path, so all components are clean.
-        // The real symlink check must be done by the VFS after openat.
-        true
+/// Validate a single path component (file/directory name).
+///
+/// Rejects:
+/// - C0 control characters (0x00–0x1F) and DEL (0x7F)
+/// - Reserved characters: `< > : " | ? *`
+/// - Trailing dot or space (Windows strips them, causing ambiguity)
+/// - Component length > 255 UTF-16 code units
+fn validate_component(name: &str) -> Result<(), PathError> {
+    // Length check: count UTF-16 code units (not chars — supplementary
+    // plane characters like emoji use 2 UTF-16 units).
+    let utf16_len: usize = name.encode_utf16().count();
+    if utf16_len > MAX_COMPONENT_UTF16 {
+        return Err(PathError::InvalidName);
     }
+
+    // Character check: reject control chars, DEL, and reserved chars.
+    for ch in name.chars() {
+        let code = ch as u32;
+        if code <= 0x1F || code == 0x7F {
+            return Err(PathError::InvalidName);
+        }
+        if RESERVED_CHARS.contains(&ch) {
+            return Err(PathError::InvalidName);
+        }
+    }
+
+    // Trailing dot or space — Windows silently strips these, which can
+    // cause security issues (e.g., `file.txt. ` vs `file.txt`).
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err(PathError::InvalidName);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     #[error("path traversal detected (contains '..')")]
     TraversalDetected,
+    #[error("invalid path name")]
+    InvalidName,
     #[error("invalid path encoding")]
     InvalidEncoding,
 }
@@ -173,5 +236,112 @@ mod tests {
         let p = NormalizedPath::from_smb_path("docs\\file.txt").unwrap();
         let pb = p.to_pathbuf();
         assert_eq!(pb, PathBuf::from("docs").join("file.txt"));
+    }
+
+    // --- Name validation tests (Phase 1.2) ---
+
+    #[test]
+    fn test_reject_control_chars() {
+        assert!(NormalizedPath::from_smb_path("file\x00.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\x01.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\x1f.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\x7f.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\n.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\r.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\t.txt").is_err());
+    }
+
+    #[test]
+    fn test_reject_reserved_chars() {
+        assert!(NormalizedPath::from_smb_path("file<.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file>.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file:.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file\".txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file|.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file?.txt").is_err());
+        assert!(NormalizedPath::from_smb_path("file*.txt").is_err());
+    }
+
+    #[test]
+    fn test_reject_trailing_dot() {
+        assert!(NormalizedPath::from_smb_path("file.").is_err());
+        assert!(NormalizedPath::from_smb_path("file.txt.").is_err());
+        assert!(NormalizedPath::from_smb_path("dir.\\file.txt").is_err());
+    }
+
+    #[test]
+    fn test_reject_trailing_space() {
+        assert!(NormalizedPath::from_smb_path("file ").is_err());
+        assert!(NormalizedPath::from_smb_path("file.txt ").is_err());
+        assert!(NormalizedPath::from_smb_path("dir \\file.txt").is_err());
+    }
+
+    #[test]
+    fn test_accept_valid_names() {
+        assert!(NormalizedPath::from_smb_path("file.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file with spaces.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file.with.dots.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file-with-dashes.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file_with_underscores.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file+plus.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("café.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file; semicolon.txt").is_ok());
+        assert!(NormalizedPath::from_smb_path("file, comma.txt").is_ok());
+    }
+
+    #[test]
+    fn test_nfc_normalization() {
+        // NFD form: é = U+0065 + U+0301 (e + combining acute)
+        let nfd = "caf\u{0065}\u{0301}.txt";
+        let p = NormalizedPath::from_smb_path(nfd).unwrap();
+        assert_eq!(p.file_name(), Some("café.txt"));
+        // NFC form should be identical
+        let nfc = "café.txt";
+        let p2 = NormalizedPath::from_smb_path(nfc).unwrap();
+        assert_eq!(p.to_smb_string(), p2.to_smb_string());
+    }
+
+    #[test]
+    fn test_reject_long_component() {
+        let long_name = "a".repeat(256);
+        assert!(NormalizedPath::from_smb_path(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_utf16_supplementary_chars_counted_correctly() {
+        // U+1F600 (😀) is a supplementary plane character — 1 char but
+        // 2 UTF-16 code units. 128 of these = 256 UTF-16 units, which
+        // should pass the 255 limit if counted as chars but fail as UTF-16.
+        let emoji_128: String = "😀".repeat(128);
+        assert!(
+            NormalizedPath::from_smb_path(&emoji_128).is_err(),
+            "128 emoji = 256 UTF-16 units, should exceed 255 limit"
+        );
+        // 127 emoji = 254 UTF-16 units — should pass.
+        let emoji_127: String = "😀".repeat(127);
+        assert!(
+            NormalizedPath::from_smb_path(&emoji_127).is_ok(),
+            "127 emoji = 254 UTF-16 units, should pass"
+        );
+    }
+
+    #[test]
+    fn test_accept_max_component() {
+        let max_name = "a".repeat(255);
+        assert!(NormalizedPath::from_smb_path(&max_name).is_ok());
+    }
+
+    #[test]
+    fn test_reject_long_path() {
+        // 255-char components * 130 = 255*130 + 129 separators = 33179 > 32767 (MAX_PATH).
+        let max_component = "a".repeat(255);
+        let mut path = String::new();
+        for _ in 0..130 {
+            if !path.is_empty() {
+                path.push('\\');
+            }
+            path.push_str(&max_component);
+        }
+        assert!(NormalizedPath::from_smb_path(&path).is_err());
     }
 }

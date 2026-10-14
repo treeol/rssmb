@@ -53,6 +53,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 notify = "6"
 
+# External — VFS confinement
+cap-std = "3"
+unicode-normalization = "0.1"
+
 # External — auth
 sspi = "0.21"
 
