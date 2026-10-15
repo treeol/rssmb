@@ -358,7 +358,7 @@ mod tests {
         DurableEntry {
             vfs: Arc::new(StubVfs) as Arc<dyn Vfs>,
             open_id: OpenId(1),
-            file_id: Some(FileId(42)),
+            file_id: Some(FileId { dev: 0, ino: 42 }),
             session_id: 100,
             tree_id: 1,
             share_name: "test".to_string(),

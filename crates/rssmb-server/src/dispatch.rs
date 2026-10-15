@@ -2514,7 +2514,7 @@ async fn handle_create(
             )
             .await
             .unwrap_or(rssmb_vfs::FileInfo {
-                file_id: rssmb_vfs::FileId(0),
+                file_id: rssmb_vfs::FileId { dev: 0, ino: 0 },
                 attributes: rssmb_vfs::FileAttributes::default(),
                 size: 0,
                 allocation_size: 0,
@@ -2775,7 +2775,7 @@ async fn handle_create(
                 .query_info(open_id, rssmb_vfs::InfoClass::FileStandardInfo)
                 .await
                 .unwrap_or(rssmb_vfs::FileInfo {
-                    file_id: rssmb_vfs::FileId(0),
+                    file_id: rssmb_vfs::FileId { dev: 0, ino: 0 },
                     attributes: rssmb_vfs::FileAttributes::default(),
                     size: 0,
                     allocation_size: 0,
@@ -2876,7 +2876,7 @@ async fn handle_close(
                     .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
                     .await
                     .unwrap_or(rssmb_vfs::FileInfo {
-                        file_id: rssmb_vfs::FileId(0),
+                        file_id: rssmb_vfs::FileId { dev: 0, ino: 0 },
                         attributes: rssmb_vfs::FileAttributes::default(),
                         size: 0,
                         allocation_size: 0,
@@ -2909,13 +2909,14 @@ async fn handle_close(
 
             // Close via VFS (skip for pipe opens — no VFS handle).
             // For disk opens, remove from the global open table first.
-            // If this was the last open and any open had delete_on_close,
-            // the VFS close will unlink the file (LocalFs.close honors
-            // delete_on_close on the handle). For multi-open files, the
-            // delete is deferred to the last close — but LocalFs currently
-            // only has per-handle delete_on_close. The open table tracks
-            // delete_on_close per-open, and the last close triggers the
-            // actual unlink.
+            // The OpenTable tracks delete_on_close per-open. remove()
+            // returns any_delete_on_close = true if the file's
+            // delete_pending disposition was set (by this open or a
+            // previously-closed one). When this is the last open,
+            // was_last=true and any_delete_on_close=true → the file
+            // must be unlinked. The VFS close() unlinks if the handle's
+            // delete_on_close flag is set; for DOC set via SET_INFO
+            // (not at create time), vfs.delete() is called instead.
             if !entry.is_pipe {
                 // Remove from the global open table and check if this was
                 // the last open with delete-on-close pending.
@@ -4018,7 +4019,7 @@ async fn handle_change_notify(
             .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
             .await
             .unwrap_or(rssmb_vfs::FileInfo {
-                file_id: rssmb_vfs::FileId(0),
+                file_id: rssmb_vfs::FileId { dev: 0, ino: 0 },
                 attributes: rssmb_vfs::FileAttributes::default(),
                 size: 0,
                 allocation_size: 0,

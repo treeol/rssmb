@@ -73,12 +73,12 @@ fn attributes_from_metadata(meta: &std::fs::Metadata) -> FileAttributes {
 /// Compute the file identity. On Unix this is the inode number; elsewhere 0.
 #[cfg(unix)]
 fn file_id_from_metadata(meta: &std::fs::Metadata) -> FileId {
-    FileId(meta.ino())
+    FileId { dev: meta.dev(), ino: meta.ino() }
 }
 
 #[cfg(not(unix))]
 fn file_id_from_metadata(_meta: &std::fs::Metadata) -> FileId {
-    FileId(0)
+    FileId { dev: 0, ino: 0 }
 }
 
 /// An open handle tracked by `LocalFs`.
@@ -711,7 +711,7 @@ impl Vfs for LocalFs {
             #[cfg(unix)]
             let file_id = {
                 use cap_std::fs::MetadataExt;
-                Some(FileId(meta.ino()))
+                Some(FileId { dev: meta.dev(), ino: meta.ino() })
             };
             #[cfg(not(unix))]
             let file_id = None;
@@ -827,13 +827,46 @@ impl Vfs for LocalFs {
 
         let new_rel = self.resolve_rel(new_path)?;
 
-        if !replace && self.dir.exists(&new_rel) {
-            return Err(VfsError::AlreadyExists);
+        // Use renameat2(RENAME_NOREPLACE) when replace=false for an atomic
+        // check-and-rename with no TOCTOU window. On Linux, this is a single
+        // syscall: the kernel atomically refuses if the target exists. On
+        // platforms without RENAME_NOREPLACE, fall back to cap-std's
+        // check-then-rename (which has a narrow TOCTOU window).
+        #[cfg(target_os = "linux")]
+        {
+            if !replace {
+                use std::os::fd::AsFd;
+                use rustix::fs::{renameat_with, RenameFlags};
+                match renameat_with(
+                    self.dir.as_fd(),
+                    &old_rel,
+                    self.dir.as_fd(),
+                    &new_rel,
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::EXIST) => {
+                        return Err(VfsError::AlreadyExists);
+                    }
+                    Err(e) => {
+                        return Err(VfsError::Io(format!("renameat2(NOREPLACE): {e}")));
+                    }
+                }
+            } else {
+                self.dir
+                    .rename(&old_rel, &self.dir, &new_rel)
+                    .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
+            }
         }
-
-        self.dir
-            .rename(&old_rel, &self.dir, &new_rel)
-            .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            if !replace && self.dir.exists(&new_rel) {
+                return Err(VfsError::AlreadyExists);
+            }
+            self.dir
+                .rename(&old_rel, &self.dir, &new_rel)
+                .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
+        }
 
         let mut handle_guard = handle.lock().await;
         handle_guard.rel_path = new_rel.clone();
@@ -1147,7 +1180,7 @@ mod tests {
         };
         let open = fs.create("", "id.txt", &create).await.unwrap();
         let id = fs.file_id(open).await.unwrap();
-        assert_ne!(id, FileId(0));
+        assert_ne!(id, FileId { dev: 0, ino: 0 });
         fs.close(open).await.unwrap();
     }
 

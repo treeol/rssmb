@@ -18,6 +18,24 @@ SMBTORTURE=${SMBTORTURE:-smbtorture}
 HOST=${RSSMB_HOST:-127.0.0.1}
 PORT=${RSSMB_PORT:-4450}
 
+FAIL=0
+
+run_test() {
+    local label="$1"
+    shift
+    echo "=== Load test: $label ==="
+    set +e
+    "$@"
+    local rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        echo "PASS: $label"
+    else
+        echo "FAIL: $label (exit code $rc)"
+        FAIL=1
+    fi
+}
+
 # Setup share tree
 rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private
 echo "hello from rssmb" > /tmp/rssmb-live/public/README.txt
@@ -28,48 +46,44 @@ SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 sleep 1
 
-echo "=== Load test 1: 1000 idle connections ==="
-# Open 1000 connections without sending any data. Tests memory and
-# connection table handling.
-${SMBTORTURE} "//$HOST/public" smb2.connect \
+run_test "1000 idle connections" \
+    ${SMBTORTURE} "//$HOST/public" smb2.connect \
     --option="torture:host=$HOST" \
     --option="torture:port=$PORT" \
     --option="torture:username=alice" \
-    --option="torture:password=TestPass123" \
-    2>&1 | tail -5
-echo "PASS: 1000 idle connections"
+    --option="torture:password=TestPass123"
 
-echo "=== Load test 2: Sustained 1 MiB READ/WRITE ==="
-${SMBTORTURE} "//$HOST/public" smb2.read \
+run_test "1 MiB READ/WRITE" \
+    ${SMBTORTURE} "//$HOST/public" smb2.read \
     --option="torture:host=$HOST" \
     --option="torture:port=$PORT" \
     --option="torture:username=alice" \
-    --option="torture:password=TestPass123" \
-    2>&1 | tail -5
-echo "PASS: 1 MiB READ/WRITE"
+    --option="torture:password=TestPass123"
 
-echo "=== Load test 3: 100k directory entries ==="
+echo "=== Load test: 100k directory entries ==="
 # Create a directory with many entries to test enumeration performance.
 mkdir -p /tmp/rssmb-live/public/bigdir
 for i in $(seq 1 10000); do
     echo "entry $i" > /tmp/rssmb-live/public/bigdir/file_$i.txt
 done
-${SMBTORTURE} "//$HOST/public" smb2.dir \
+run_test "100k directory entries" \
+    ${SMBTORTURE} "//$HOST/public" smb2.dir \
     --option="torture:host=$HOST" \
     --option="torture:port=$PORT" \
     --option="torture:username=alice" \
-    --option="torture:password=TestPass123" \
-    2>&1 | tail -5
-echo "PASS: 100k directory entries"
+    --option="torture:password=TestPass123"
 
-echo "=== Load test 4: Concurrent CHANGE_NOTIFY ==="
-${SMBTORTURE} "//$HOST/public" smb2.notify \
+run_test "concurrent CHANGE_NOTIFY" \
+    ${SMBTORTURE} "//$HOST/public" smb2.notify \
     --option="torture:host=$HOST" \
     --option="torture:port=$PORT" \
     --option="torture:username=alice" \
-    --option="torture:password=TestPass123" \
-    2>&1 | tail -5
-echo "PASS: concurrent CHANGE_NOTIFY"
+    --option="torture:password=TestPass123"
 
 echo ""
-echo "All load tests passed."
+if [ "$FAIL" -eq 0 ]; then
+    echo "All load tests passed."
+else
+    echo "Some load tests FAILED."
+fi
+exit $FAIL

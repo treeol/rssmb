@@ -35,8 +35,17 @@ pub struct OpenId(pub u64);
 
 /// Opaque file identity for cross-session open tracking.
 /// Must be stable across rename and hard links within a share.
+///
+/// On Unix this is `(st_dev, st_ino)` — the device ID plus the inode.
+/// Using the inode alone would collide across filesystems (two shares on
+/// different mounts with the same inode number would share an open table
+/// entry, a lock list, or a delete-pending disposition). Including the
+/// device ID namespaces per-filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileId(pub u64);
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
 
 /// Create disposition (MS-SMB2 §2.2.13 CREATE disposition values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

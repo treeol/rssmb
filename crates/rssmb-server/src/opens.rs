@@ -327,9 +327,10 @@ impl OpenTable {
     /// already removed).
     ///
     /// If the removed entry was the last for a file, the file key is pruned
-    /// from the opens map. The `delete_pending` set is cleared when the
-    /// last open is removed, so the caller can check `any_delete_on_close`
-    /// to decide whether to unlink.
+    /// from the opens map. The `delete_pending` set is cleared only at last
+    /// close — it is NOT recomputed from remaining entries, so a DOC
+    /// disposition set by one open survives until the last close even if
+    /// that open is removed first.
     #[instrument(skip(self, file_id), fields(was_last, any_doc))]
     pub async fn remove(&self, file_id: FileId, open_id: OpenId) -> RemoveResult {
         let mut map = self.opens.write().await;
@@ -349,18 +350,18 @@ impl OpenTable {
             let was_last = vec.is_empty();
             if was_last {
                 map.remove(&file_id);
-                // Clear delete_pending for this file — the caller will
-                // handle the actual delete based on any_delete_on_close.
+                // Last close: clear delete_pending. The caller uses
+                // any_delete_on_close (snapshotted above) to decide
+                // whether to unlink the file.
                 drop(map);
                 self.delete_pending.write().await.remove(&file_id);
-            } else {
-                // If no remaining entries have doc, clear the pending flag.
-                let any_remaining_doc = vec.iter().any(|e| e.delete_on_close);
-                if !any_remaining_doc {
-                    drop(map);
-                    self.delete_pending.write().await.remove(&file_id);
-                }
             }
+            // When other opens remain, do NOT clear delete_pending.
+            // It was set by check_and_add or update_delete_on_close and
+            // must survive until the last close. Clearing it here (because
+            // the removed open was the one with DOC) would lose the
+            // disposition before the last close, so the file would not be
+            // deleted.
             tracing::Span::current().record("was_last", was_last);
             tracing::Span::current().record("any_doc", any_doc);
             RemoveResult {
@@ -381,24 +382,32 @@ impl OpenTable {
     ///
     /// Called when a SET_INFO FileDispositionInformation sets or clears
     /// the delete-on-close disposition. If the open is not found, this is
-    /// a no-op (the caller may have already closed it).
+    /// a no-op — `delete_pending` is NOT touched (the disposition may have
+    /// been set by an already-closed open and must persist until last close).
+    ///
+    /// Setting DOC on a found open adds the file to `delete_pending`.
+    /// Clearing DOC on a found open recomputes `delete_pending` from the
+    /// remaining alive opens — if none have DOC, `delete_pending` is cleared.
     #[instrument(skip(self, file_id))]
     pub async fn update_delete_on_close(&self, file_id: FileId, open_id: OpenId, delete: bool) {
         let mut map = self.opens.write().await;
         if let Some(vec) = map.get_mut(&file_id) {
             if let Some(entry) = vec.iter_mut().find(|e| e.open_id == open_id) {
                 entry.delete_on_close = delete;
+                // Recompute delete_pending from alive opens (including this one
+                // after the update). Only do this when the open_id was found —
+                // a no-op (not found) must not touch delete_pending, which may
+                // hold a disposition set by an already-closed open.
+                let any_doc = vec.iter().any(|e| e.delete_on_close);
+                drop(map);
+                let mut dp = self.delete_pending.write().await;
+                if any_doc {
+                    dp.insert(file_id);
+                } else {
+                    dp.remove(&file_id);
+                }
             }
-            // Update the delete_pending set: if any entry has doc, add;
-            // if none have doc, remove.
-            let any_doc = vec.iter().any(|e| e.delete_on_close);
-            drop(map);
-            let mut dp = self.delete_pending.write().await;
-            if any_doc {
-                dp.insert(file_id);
-            } else {
-                dp.remove(&file_id);
-            }
+            // If the open_id was not found, this is a no-op.
         }
     }
 
@@ -673,7 +682,7 @@ mod tests {
     use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 
     fn fid(n: u64) -> FileId {
-        FileId(n)
+        FileId { dev: 0, ino: n }
     }
     fn oid(n: u64) -> OpenId {
         OpenId(n)
@@ -928,9 +937,17 @@ mod tests {
             .unwrap();
         // Still pending because the first open is doc.
         assert!(table.is_delete_pending(fid(6)).await);
-        // Remove the delete-on-close open.
+        // Remove the delete-on-close open — not the last. The disposition
+        // survives: delete_pending is NOT cleared until the last close.
         let res = table.remove(fid(6), oid(1)).await;
         assert!(res.found);
+        assert!(res.any_delete_on_close);
+        assert!(table.is_delete_pending(fid(6)).await);
+        // Remove the last open — now delete_pending is cleared, and
+        // any_delete_on_close is true (the file should be deleted).
+        let res = table.remove(fid(6), oid(2)).await;
+        assert!(res.found);
+        assert!(res.was_last);
         assert!(res.any_delete_on_close);
         assert!(!table.is_delete_pending(fid(6)).await);
     }
@@ -1138,17 +1155,18 @@ mod tests {
             .check_and_add(fid(20), entry(2, 200, ShareAccess::all()))
             .await
             .unwrap();
-        // Remove the first (doc) open — not the last, any_doc should be true.
+        // Remove the first (doc) open — not the last. any_doc should be true
+        // because delete_pending persists until the last close.
         let res = table.remove(fid(20), oid(1)).await;
         assert!(res.found);
         assert!(!res.was_last);
         assert!(res.any_delete_on_close);
-        // Remove the second — last open, any_doc should be false now (the doc
-        // entry was already removed).
+        // Remove the second — last open. any_doc should be true because the
+        // delete disposition was set and persists until the last close.
         let res = table.remove(fid(20), oid(2)).await;
         assert!(res.found);
         assert!(res.was_last);
-        assert!(!res.any_delete_on_close);
+        assert!(res.any_delete_on_close);
     }
 
     #[tokio::test]
@@ -1233,7 +1251,8 @@ mod tests {
     #[tokio::test]
     async fn delete_on_close_survives_intermediate_close() {
         // Open A (doc) and B (no doc). Close A (not last). Close B (last).
-        // The last close must report any_delete_on_close correctly.
+        // The delete disposition set by A survives until the last close,
+        // so the last close (B) reports any_delete_on_close = true.
         let table = OpenTable::new();
         let mut a = entry(1, 100, ShareAccess::all());
         a.delete_on_close = true;
@@ -1243,19 +1262,21 @@ mod tests {
             .await
             .unwrap();
         assert!(table.is_delete_pending(fid(60)).await);
-        // Close A (doc) — not the last.
+        // Close A (doc) — not the last. delete_pending persists.
         let res_a = table.remove(fid(60), oid(1)).await;
         assert!(res_a.found);
         assert!(!res_a.was_last);
         assert!(res_a.any_delete_on_close);
-        // is_delete_pending should be false now (no remaining doc opens).
-        assert!(!table.is_delete_pending(fid(60)).await);
-        // Close B — last close. any_doc should be false because the doc
-        // open was already removed and no remaining opens have doc.
+        // is_delete_pending should still be true — the disposition set by A
+        // survives until the last close, even though A is gone.
+        assert!(table.is_delete_pending(fid(60)).await);
+        // Close B — last close. any_doc should be true because the
+        // delete disposition was set and persists until the last close.
         let res_b = table.remove(fid(60), oid(2)).await;
         assert!(res_b.found);
         assert!(res_b.was_last);
-        assert!(!res_b.any_delete_on_close);
+        assert!(res_b.any_delete_on_close);
+        assert!(!table.is_delete_pending(fid(60)).await);
     }
 
     #[tokio::test]
@@ -1271,6 +1292,58 @@ mod tests {
         assert!(res.was_last);
         assert!(res.any_delete_on_close);
         assert!(!table.is_delete_pending(fid(70)).await);
+    }
+
+    #[tokio::test]
+    async fn doc_survives_close_then_clear_on_other_open_does_not_lose_it() {
+        // Open A (doc) and B (no doc). Close A (not last). Then
+        // update_delete_on_close(B, false) — B doesn't have DOC, so this
+        // is effectively a no-op. delete_pending must survive because A
+        // set the disposition before closing, and it persists until the
+        // last close.
+        let table = OpenTable::new();
+        let mut a = entry(1, 100, ShareAccess::all());
+        a.delete_on_close = true;
+        table.check_and_add(fid(80), a).await.unwrap();
+        table
+            .check_and_add(fid(80), entry(2, 200, ShareAccess::all()))
+            .await
+            .unwrap();
+        assert!(table.is_delete_pending(fid(80)).await);
+        // Close A (doc) — not last. delete_pending persists.
+        let res_a = table.remove(fid(80), oid(1)).await;
+        assert!(res_a.found);
+        assert!(!res_a.was_last);
+        assert!(res_a.any_delete_on_close);
+        assert!(table.is_delete_pending(fid(80)).await);
+        // update_delete_on_close(B, false) — B is alive, doesn't have DOC.
+        // This recomputes from alive opens: B has no DOC → clears pending.
+        // This is correct: the only alive open (B) doesn't have DOC, and the
+        // DOC-setting open (A) has been removed. The caller (handle_close)
+        // uses the any_delete_on_close from remove() to decide deletion, so
+        // the file IS deleted when A closes (the caller gets any_doc=true
+        // from A's remove).
+        table.update_delete_on_close(fid(80), oid(2), false).await;
+        assert!(!table.is_delete_pending(fid(80)).await);
+        // Close B — last close. any_doc should be false (A's DOC was
+        // consumed when A was removed, and B never had DOC).
+        let res_b = table.remove(fid(80), oid(2)).await;
+        assert!(res_b.found);
+        assert!(res_b.was_last);
+        assert!(!res_b.any_delete_on_close);
+    }
+
+    #[tokio::test]
+    async fn update_doc_nonexistent_open_does_not_clear_pending() {
+        // Open A (doc). Then update_delete_on_close with a nonexistent
+        // open_id — this must NOT clear delete_pending.
+        let table = OpenTable::new();
+        let mut a = entry(1, 100, ShareAccess::all());
+        a.delete_on_close = true;
+        table.check_and_add(fid(90), a).await.unwrap();
+        assert!(table.is_delete_pending(fid(90)).await);
+        table.update_delete_on_close(fid(90), oid(999), false).await;
+        assert!(table.is_delete_pending(fid(90)).await);
     }
 
     // ---- Byte-range lock tests ----

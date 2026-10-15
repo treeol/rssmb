@@ -59,7 +59,7 @@ impl MemoryFs {
                 change_time: 0,
                 is_directory: true,
                 delete_on_close: false,
-                file_id: Some(FileId(0)),
+                file_id: Some(FileId { dev: 0, ino: 0 }),
             },
         );
 
@@ -92,7 +92,7 @@ impl MemoryFs {
         let mut id = self.next_file_id.lock().await;
         let val = *id;
         *id += 1;
-        FileId(val)
+        FileId { dev: 0, ino: val }
     }
 }
 
@@ -147,7 +147,7 @@ impl Vfs for MemoryFs {
 
         if !exists {
             let now = Self::now_filetime();
-            let new_id = FileId(files.len() as u64);
+            let new_id = FileId { dev: 0, ino: files.len() as u64 };
             files.insert(
                 key.clone(),
                 InMemoryFile {

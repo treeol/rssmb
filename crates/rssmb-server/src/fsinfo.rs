@@ -70,7 +70,7 @@ pub fn file_standard_info(info: &FileInfo) -> Vec<u8> {
 
 pub fn file_internal_info(info: &FileInfo) -> Vec<u8> {
     serialize(&FileInternalInformation {
-        index_number: info.file_id.0,
+        index_number: info.file_id.ino,
     })
 }
 
@@ -127,7 +127,7 @@ pub fn file_all_info(info: &FileInfo, name: &str, granted_access: u32) -> Vec<u8
     b.push(0); // DeletePending
     b.push(info.attributes.directory as u8);
     b.extend_from_slice(&0u16.to_le_bytes());
-    b.extend_from_slice(&info.file_id.0.to_le_bytes());
+    b.extend_from_slice(&info.file_id.ino.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes()); // EaSize
     b.extend_from_slice(&granted_access.to_le_bytes());
     b.extend_from_slice(&0u64.to_le_bytes()); // CurrentByteOffset
@@ -577,7 +577,7 @@ pub fn build_directory_buffer(entries: &[DirEntry], class_id: u8) -> Option<Vec<
                         ea_size: 0,
                         short_name_length: (short.encode_utf16().count() * 2) as u8,
                         short_name: rssmb_proto::FixedWideString::from_str(short),
-                        file_id: e.file_id.map(|f| f.0).unwrap_or(0),
+                        file_id: e.file_id.map(|f| f.ino).unwrap_or(0),
                         file_name: e.file_name.as_str().into(),
                     }
                 })
@@ -598,7 +598,7 @@ pub fn build_directory_buffer(entries: &[DirEntry], class_id: u8) -> Option<Vec<
                     allocation_size: e.allocation_size,
                     file_attributes: file_attributes_to_fscc(&e.attributes),
                     ea_size: 0,
-                    file_id: e.file_id.map(|f| f.0).unwrap_or(0),
+                    file_id: e.file_id.map(|f| f.ino).unwrap_or(0),
                     file_name: e.file_name.as_str().into(),
                 })
                 .collect();
@@ -627,7 +627,7 @@ pub fn synthesize_dot_entries() -> Vec<DirEntry> {
             },
             size: 0,
             allocation_size: 0,
-            file_id: Some(VfsFileId(0)),
+            file_id: Some(VfsFileId { dev: 0, ino: 0 }),
             creation_time: now,
             last_access_time: now,
             last_write_time: now,
@@ -642,7 +642,7 @@ pub fn synthesize_dot_entries() -> Vec<DirEntry> {
             },
             size: 0,
             allocation_size: 0,
-            file_id: Some(VfsFileId(0)),
+            file_id: Some(VfsFileId { dev: 0, ino: 0 }),
             creation_time: now,
             last_access_time: now,
             last_write_time: now,
@@ -657,7 +657,7 @@ mod tests {
 
     fn test_file_info() -> FileInfo {
         FileInfo {
-            file_id: VfsFileId(42),
+            file_id: VfsFileId { dev: 0, ino: 42 },
             attributes: rssmb_vfs::FileAttributes {
                 directory: true,
                 ..Default::default()
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn test_file_standard_info_serialization() {
         let info = FileInfo {
-            file_id: VfsFileId(1),
+            file_id: VfsFileId { dev: 0, ino: 1 },
             attributes: rssmb_vfs::FileAttributes::default(),
             size: 1024,
             allocation_size: 4096,
@@ -715,7 +715,7 @@ mod tests {
                 attributes: rssmb_vfs::FileAttributes::default(),
                 size: 100,
                 allocation_size: 512,
-                file_id: Some(VfsFileId(1)),
+                file_id: Some(VfsFileId { dev: 0, ino: 1 }),
                 creation_time: 0,
                 last_access_time: 0,
                 last_write_time: 0,
@@ -727,7 +727,7 @@ mod tests {
                 attributes: rssmb_vfs::FileAttributes::default(),
                 size: 200,
                 allocation_size: 512,
-                file_id: Some(VfsFileId(2)),
+                file_id: Some(VfsFileId { dev: 0, ino: 2 }),
                 creation_time: 0,
                 last_access_time: 0,
                 last_write_time: 0,
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn test_file_basic_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(42),
+            file_id: VfsFileId { dev: 0, ino: 42 },
             attributes: rssmb_vfs::FileAttributes {
                 directory: true,
                 ..Default::default()
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn test_file_standard_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(1),
+            file_id: VfsFileId { dev: 0, ino: 1 },
             attributes: rssmb_vfs::FileAttributes::default(),
             size: 1024,
             allocation_size: 4096,
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn test_file_internal_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(0xDEADBEEF),
+            file_id: VfsFileId { dev: 0, ino: 0xDEADBEEF },
             ..test_file_info()
         };
         let buf = file_internal_info(&info);
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn test_file_network_open_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(1),
+            file_id: VfsFileId { dev: 0, ino: 1 },
             attributes: rssmb_vfs::FileAttributes {
                 read_only: true,
                 ..Default::default()
@@ -850,7 +850,7 @@ mod tests {
     #[test]
     fn test_file_all_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(42),
+            file_id: VfsFileId { dev: 0, ino: 42 },
             attributes: rssmb_vfs::FileAttributes {
                 directory: true,
                 ..Default::default()
@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn test_file_attribute_tag_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId(1),
+            file_id: VfsFileId { dev: 0, ino: 1 },
             attributes: rssmb_vfs::FileAttributes {
                 archive: true,
                 ..Default::default()
@@ -908,7 +908,7 @@ mod tests {
             attributes: rssmb_vfs::FileAttributes::default(),
             size: 100,
             allocation_size: 512,
-            file_id: Some(VfsFileId(1)),
+            file_id: Some(VfsFileId { dev: 0, ino: 1 }),
             creation_time: 0,
             last_access_time: 0,
             last_write_time: 0,
@@ -931,7 +931,7 @@ mod tests {
             attributes: rssmb_vfs::FileAttributes::default(),
             size: 200,
             allocation_size: 512,
-            file_id: Some(VfsFileId(2)),
+            file_id: Some(VfsFileId { dev: 0, ino: 2 }),
             creation_time: 0,
             last_access_time: 0,
             last_write_time: 0,
