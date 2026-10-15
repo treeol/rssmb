@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["RSSMB Contributors"]
 
@@ -61,6 +61,8 @@ unicode-normalization = "0.1"
 sspi = "0.21"
 
 # Dev/test
+proptest = "1"
+
 [profile.dev]
 opt-level = 1
 

@@ -55,7 +55,10 @@ pub fn parse_authenticate_fields(msg: &[u8]) -> Option<AuthenticateFields> {
 
 /// Extract the 8-byte ServerChallenge from a CHALLENGE (type 2) message.
 pub fn server_challenge(challenge_msg: &[u8]) -> Option<[u8; 8]> {
-    if challenge_msg.len() < 32 || &challenge_msg[..8] != b"NTLMSSP\0" || u32_le(challenge_msg, 8)? != 2 {
+    if challenge_msg.len() < 32
+        || &challenge_msg[..8] != b"NTLMSSP\0"
+        || u32_le(challenge_msg, 8)? != 2
+    {
         return None;
     }
     challenge_msg[24..32].try_into().ok()
@@ -209,7 +212,8 @@ pub fn verify_authenticate_mic(
     if authenticate_msg.len() < AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN {
         return false;
     }
-    let mic = &authenticate_msg[AUTHENTICATE_MIC_OFFSET..AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN];
+    let mic =
+        &authenticate_msg[AUTHENTICATE_MIC_OFFSET..AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN];
     if mic.iter().all(|&b| b == 0) {
         return false; // MIC not actually set
     }
@@ -223,7 +227,11 @@ pub fn verify_authenticate_mic(
     mac.update(challenge_msg);
     mac.update(&auth_zeroed);
     let expected = mac.finalize().into_bytes();
-    expected.iter().zip(mic).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    expected
+        .iter()
+        .zip(mic)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 fn u16_le(b: &[u8], o: usize) -> Option<u16> {
@@ -236,7 +244,10 @@ fn string_to_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 fn utf16le_to_string(b: &[u8]) -> String {
-    let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -250,7 +261,8 @@ mod tests {
         let server_challenge = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
         // NTProofStr from MS-NLMP 4.2.4.2.2
         let proof = [
-            0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96, 0xaa, 0xbc, 0x92, 0x7b, 0xeb, 0xef, 0x6a, 0x1c,
+            0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96, 0xaa, 0xbc, 0x92, 0x7b, 0xeb, 0xef,
+            0x6a, 0x1c,
         ];
         // temp = 0x0101 0000 | 0x00000000 | time(0) | client challenge aa*8 | 0x00000000 | AvPairs | 0x00000000
         let mut blob = vec![0x01, 0x01, 0, 0, 0, 0, 0, 0];
@@ -308,10 +320,16 @@ mod tests {
     fn user_case_insensitive_domain_exact() {
         let (mut f, sc) = ms_nlmp_vector();
         f.user_utf16 = string_to_utf16le("USER");
-        assert!(verify(&f, "Password", &sc), "user name is upper-cased before hashing");
+        assert!(
+            verify(&f, "Password", &sc),
+            "user name is upper-cased before hashing"
+        );
         let (mut f, sc) = ms_nlmp_vector();
         f.domain_utf16 = string_to_utf16le("DOMAIN");
-        assert!(!verify(&f, "Password", &sc), "domain is hashed as sent, case-sensitively");
+        assert!(
+            !verify(&f, "Password", &sc),
+            "domain is hashed as sent, case-sensitively"
+        );
     }
 
     #[test]
@@ -338,7 +356,7 @@ mod tests {
     #[test]
     fn compute_session_key_matches_ntlmv2_spec() {
         // MS-NLMP 4.2.4.3: SessionBaseKey for the test vector is known.
-        let (f, sc) = ms_nlmp_vector();
+        let (f, _sc) = ms_nlmp_vector();
         let hash = nt_hash("Password");
         let key = compute_session_key(&hash, &f);
         assert_eq!(key.len(), 16, "SessionBaseKey is 16 bytes");
@@ -366,7 +384,7 @@ mod tests {
     ) -> Vec<u8> {
         // Build NTLMv2 blob: Signature(4) + Reserved(4) + Timestamp(8) +
         // ClientChallenge(8) + Reserved(4) + AvPairs
-        let mut blob = vec![0u8; 28]; // header
+        let blob = vec![0u8; 28]; // header
 
         // AvPairs: MsvAvFlags (MIC present) + optional MsvAvTimestamp + EOL
         let mut av_pairs = Vec::new();
@@ -420,7 +438,7 @@ mod tests {
         msg.extend_from_slice(&[0u8; 8]);
         // NegFlags
         msg.extend_from_slice(&0x0008_2882u32.to_le_bytes()); // ESS | 128 | KEY_EXCH | ...
-        // Version (8 bytes)
+                                                              // Version (8 bytes)
         msg.extend_from_slice(&[0u8; 8]);
         // MIC placeholder (16 bytes) — will be filled in
         msg.extend_from_slice(&[0u8; 16]);
@@ -527,7 +545,7 @@ mod tests {
     fn has_mic_flag_wrong_length_rejected() {
         // MsvAvFlags with length != 4 should not be accepted
         let mut nt_response = vec![0u8; 44]; // 16 NTProofStr + 28 blob header
-        // MsvAvFlags with length 2 (too short)
+                                             // MsvAvFlags with length 2 (too short)
         nt_response.extend_from_slice(&MSV_AV_FLAGS.to_le_bytes());
         nt_response.extend_from_slice(&2u16.to_le_bytes());
         nt_response.extend_from_slice(&[0u8; 2]);

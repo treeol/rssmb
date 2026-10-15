@@ -65,7 +65,7 @@ pub fn extract_mech_types(input: &[u8]) -> Option<Vec<u8>> {
     // We need the inner 30 (SEQUENCE OF) inside the second A0.
     let mut p = 1; // skip 0x60
     p += der_len_size(&input[p..])?; // skip outer length
-    // Skip the SPNEGO OID (06 <len> <bytes>).
+                                     // Skip the SPNEGO OID (06 <len> <bytes>).
     if input.get(p) != Some(&0x06) {
         return None;
     }
@@ -73,27 +73,27 @@ pub fn extract_mech_types(input: &[u8]) -> Option<Vec<u8>> {
     let oid_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?; // skip length
     p += oid_len; // skip OID bytes
-    // Now expect A0 (negTokenInit [0]).
+                  // Now expect A0 (negTokenInit [0]).
     if input.get(p) != Some(&0xA0) {
         return None;
     }
     p += 1; // skip A0
     let _init_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?; // skip length
-    // Inside negTokenInit: expect 30 (SEQUENCE).
+                                     // Inside negTokenInit: expect 30 (SEQUENCE).
     if input.get(p) != Some(&0x30) {
         return None;
     }
     p += 1; // skip 0x30
     p += der_len_size(&input[p..])?; // skip SEQUENCE length
-    // Now expect A0 (mechTypes [0]).
+                                     // Now expect A0 (mechTypes [0]).
     if input.get(p) != Some(&0xA0) {
         return None;
     }
     p += 1; // skip A0
     let mt_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?; // skip length
-    // p now points at the inner 0x30 SEQUENCE OF — this is what gets signed.
+                                     // p now points at the inner 0x30 SEQUENCE OF — this is what gets signed.
     let end = p + mt_len;
     input.get(p..end).map(|s| s.to_vec())
 }
@@ -151,9 +151,7 @@ impl AuthenticateSummary {
     /// NtChallengeResponse, an LM response that is empty or a single zero
     /// byte, and an empty user name.
     pub fn is_anonymous(&self) -> bool {
-        self.nt_len == 0
-            && (self.lm_len == 0 || self.lm_is_single_zero)
-            && self.user_len == 0
+        self.nt_len == 0 && (self.lm_len == 0 || self.lm_is_single_zero) && self.user_len == 0
     }
 }
 
@@ -165,7 +163,8 @@ pub fn parse_authenticate(token: &[u8]) -> Option<AuthenticateSummary> {
         return None;
     }
     let u16_at = |o: usize| u16::from_le_bytes([token[o], token[o + 1]]);
-    let u32_at = |o: usize| u32::from_le_bytes([token[o], token[o + 1], token[o + 2], token[o + 3]]);
+    let u32_at =
+        |o: usize| u32::from_le_bytes([token[o], token[o + 1], token[o + 2], token[o + 3]]);
     if u32_at(8) != 3 {
         return None;
     }
@@ -207,8 +206,8 @@ pub fn wrap_ntlm_response(ntlm_token: &[u8]) -> Vec<u8> {
     let inner_octet = der_tlv(0x04, ntlm_token);
     let ctx2 = der_tlv(0xA2, &inner_octet);
     let seq = der_tlv(0x30, &ctx2);
-    let outer = der_tlv(0xA1, &seq);
-    outer
+
+    der_tlv(0xA1, &seq)
 }
 
 /// Build a SPNEGO negTokenResp for the final accept-completed leg,
@@ -243,8 +242,8 @@ pub fn wrap_accept_completed(mech_list_mic: Option<&[u8]>) -> Vec<u8> {
     }
 
     let seq = der_tlv(0x30, &inner);
-    let outer = der_tlv(0xA1, &seq);
-    outer
+
+    der_tlv(0xA1, &seq)
 }
 
 /// Build a DER TLV (Tag-Length-Value) element.

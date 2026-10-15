@@ -7,27 +7,27 @@
 //!   and unsolicited breaks (oplock/lease) without deadlock.
 
 pub mod auth_limiter;
-pub mod connection;
-pub mod durable;
-pub mod metrics;
-pub mod session;
-pub mod tree;
-pub mod opens;
-pub mod dispatch;
 pub mod config;
+pub mod connection;
 pub mod crypto;
+pub mod dispatch;
+pub mod durable;
 pub mod fsinfo;
+pub mod metrics;
 pub mod negotiate_ctx;
 pub mod notify;
+pub mod opens;
+pub mod session;
 pub mod signing;
+pub mod tree;
 
 pub use config::{ServerConfig, ShareConfig};
 pub use connection::Connection;
 pub use session::Session;
 pub use tree::Tree;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use thiserror::Error;
 
@@ -152,12 +152,14 @@ impl ServerState {
         // pre-computed here so the plaintext password is never retained
         // or rebuilt per SESSION_SETUP. Disabled users are excluded.
         let identities = Arc::new(rssmb_auth::IdentityStore::from_users(
-            config.users.iter().map(|u| (
-                u.username.clone(),
-                u.password.clone(),
-                u.nt_hash.clone(),
-                u.disabled,
-            )),
+            config.users.iter().map(|u| {
+                (
+                    u.username.clone(),
+                    u.password.clone(),
+                    u.nt_hash.clone(),
+                    u.disabled,
+                )
+            }),
         ));
 
         let conn_limiter = Arc::new(crate::connection::ConnectionLimiter::new(
@@ -210,7 +212,9 @@ impl ServerState {
     }
 
     /// Get the current (live-reloadable) shares map.
-    pub fn shares_snapshot(&self) -> Arc<std::collections::HashMap<String, crate::config::ShareConfig>> {
+    pub fn shares_snapshot(
+        &self,
+    ) -> Arc<std::collections::HashMap<String, crate::config::ShareConfig>> {
         self.shares_swap.read().unwrap().clone()
     }
 
@@ -227,12 +231,14 @@ impl ServerState {
     pub fn reload(&self, new_config: ServerConfig) {
         // Build a new identity store from the reloaded users.
         let new_identities = Arc::new(rssmb_auth::IdentityStore::from_users(
-            new_config.users.iter().map(|u| (
-                u.username.clone(),
-                u.password.clone(),
-                u.nt_hash.clone(),
-                u.disabled,
-            )),
+            new_config.users.iter().map(|u| {
+                (
+                    u.username.clone(),
+                    u.password.clone(),
+                    u.nt_hash.clone(),
+                    u.disabled,
+                )
+            }),
         ));
 
         // Swap identities and shares atomically (each behind StdRwLock).

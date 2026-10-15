@@ -81,7 +81,10 @@ mod tests {
     #[test]
     fn test_lock_request_roundtrip() {
         let req = LockRequest {
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
             locks: vec![LockElement {
                 offset: 0,
                 length: 1024,
@@ -116,10 +119,21 @@ mod tests {
     #[test]
     fn test_lock_request_multiple_elements() {
         let req = LockRequest {
-            file_id: FileId { persistent: 10, volatile: 20 },
+            file_id: FileId {
+                persistent: 10,
+                volatile: 20,
+            },
             locks: vec![
-                LockElement { offset: 0, length: 100, flags: lock_flags::SHARED },
-                LockElement { offset: 200, length: 50, flags: lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY },
+                LockElement {
+                    offset: 0,
+                    length: 100,
+                    flags: lock_flags::SHARED,
+                },
+                LockElement {
+                    offset: 200,
+                    length: 50,
+                    flags: lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY,
+                },
             ],
         };
         let mut buf = Cursor::new(Vec::new());
@@ -130,6 +144,9 @@ mod tests {
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: LockRequest = LockRequest::read_le(&mut cursor).unwrap();
         assert_eq!(decoded.locks.len(), 2);
-        assert_eq!(decoded.locks[1].flags, lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY);
+        assert_eq!(
+            decoded.locks[1].flags,
+            lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY
+        );
     }
 }

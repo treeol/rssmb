@@ -263,7 +263,7 @@ pub fn build_bind_ack(
         ptype: PTYPE_BIND_ACK,
         pfc_flags,
         drep: [0x10, 0, 0, 0], // little-endian, ASCII
-        frag_length: 0,       // patched
+        frag_length: 0,        // patched
         auth_length: 0,
         call_id,
     };
@@ -292,15 +292,10 @@ pub fn build_bind_ack(
     // Pad to 4-byte boundary from PDU start (header is 16 bytes, already 4-aligned).
     let offset_from_pdu_start = buf.len() - header_start;
     let pad = (4 - (offset_from_pdu_start % 4)) % 4;
-    for _ in 0..pad {
-        buf.push(0);
-    }
+    buf.extend(std::iter::repeat_n(0u8, pad));
 
     // Results: num_results, reserved, reserved2
-    let results: Vec<BindAckResult> = ctx_items
-        .iter()
-        .map(|ctx| evaluate_bind_context(ctx))
-        .collect();
+    let results: Vec<BindAckResult> = ctx_items.iter().map(evaluate_bind_context).collect();
     buf.push(results.len() as u8);
     buf.push(0); // reserved
     buf.extend_from_slice(&0u16.to_le_bytes()); // reserved2
@@ -332,7 +327,7 @@ pub fn evaluate_bind_context(ctx: &BindContextElement) -> BindAckResult {
     );
 
     // Check for NDR20 in the transfer syntaxes.
-    let has_ndr20 = ctx.transfer_syntaxes.iter().any(|ts| *ts == NDR20_SYNTAX);
+    let has_ndr20 = ctx.transfer_syntaxes.contains(&NDR20_SYNTAX);
 
     if is_srvsvc && has_ndr20 {
         return BindAckResult {
@@ -343,7 +338,7 @@ pub fn evaluate_bind_context(ctx: &BindContextElement) -> BindAckResult {
     }
 
     // Check for bind-time feature negotiation.
-    let has_btn = ctx.transfer_syntaxes.iter().any(|ts| *ts == BTN_SYNTAX);
+    let has_btn = ctx.transfer_syntaxes.contains(&BTN_SYNTAX);
     if has_btn {
         return BindAckResult {
             result: RESULT_NEGOTIATE_ACK,
@@ -383,7 +378,7 @@ pub fn build_bind_nak(call_id: u32, reason: u16) -> Vec<u8> {
     buf.push(1); // num_protocols
     buf.push(5); // version major
     buf.push(0); // version minor
-    // Pad to frag_length
+                 // Pad to frag_length
     let frag_length = buf.len() as u16;
     let fl_pos = header_start + 8;
     buf[fl_pos..fl_pos + 2].copy_from_slice(&frag_length.to_le_bytes());
@@ -435,7 +430,9 @@ pub fn fragment_response(
     if max_stub == 0 || stub_data.is_empty() {
         // Single fragment (even if empty).
         let flags = PFC_FIRST_FRAG | PFC_LAST_FRAG;
-        return vec![build_response(call_id, p_cont_id, stub_data, flags, max_frag)];
+        return vec![build_response(
+            call_id, p_cont_id, stub_data, flags, max_frag,
+        )];
     }
     let mut pdus = Vec::new();
     let mut offset = 0;
@@ -458,12 +455,7 @@ pub fn fragment_response(
 }
 
 /// Build a FAULT PDU.
-pub fn build_fault(
-    call_id: u32,
-    p_cont_id: u16,
-    status: u32,
-    pfc_flags: u8,
-) -> Vec<u8> {
+pub fn build_fault(call_id: u32, p_cont_id: u16, status: u32, pfc_flags: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     let header_start = buf.len();
     let header = PduHeader {
@@ -507,8 +499,10 @@ mod tests {
     #[test]
     fn parse_header_rejects_incomplete_frag() {
         let mut data = vec![0u8; 20];
-        data[0] = 5; data[1] = 0;
-        data[8] = 0xff; data[9] = 0xff; // frag_length=0xffff > 20
+        data[0] = 5;
+        data[1] = 0;
+        data[8] = 0xff;
+        data[9] = 0xff; // frag_length=0xffff > 20
         assert!(PduHeader::parse(&data).is_none());
     }
 
@@ -522,7 +516,7 @@ mod tests {
         bind_body.push(1); // num_ctx_items
         bind_body.push(0); // reserved
         bind_body.extend_from_slice(&0u16.to_le_bytes()); // reserved2
-        // Context element: p_cont_id=0, num_trans=1, abstract=SRVSVC, trans=NDR20
+                                                          // Context element: p_cont_id=0, num_trans=1, abstract=SRVSVC, trans=NDR20
         bind_body.extend_from_slice(&0u16.to_le_bytes()); // context_id
         bind_body.push(1); // num_transfer_syntaxes
         bind_body.push(0); // reserved
@@ -642,7 +636,7 @@ mod tests {
         let (first_hdr, _) = PduHeader::parse(&pdus[0]).expect("parse first");
         assert!(first_hdr.is_first());
         assert!(!first_hdr.is_last());
-        let (last_hdr, _) = PduHeader::parse(&pdus.last().unwrap()).expect("parse last");
+        let (last_hdr, _) = PduHeader::parse(pdus.last().unwrap()).expect("parse last");
         assert!(!last_hdr.is_first());
         assert!(last_hdr.is_last());
         // All PDUs should be ≤ max_frag bytes.
@@ -653,7 +647,12 @@ mod tests {
 
     #[test]
     fn fault_pdu_structure() {
-        let pdu = build_fault(9, 0, FAULT_NCA_S_OP_RNG_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG);
+        let pdu = build_fault(
+            9,
+            0,
+            FAULT_NCA_S_OP_RNG_ERROR,
+            PFC_FIRST_FRAG | PFC_LAST_FRAG,
+        );
         let (hdr, body) = PduHeader::parse(&pdu).expect("parse");
         assert_eq!(hdr.ptype, PTYPE_FAULT);
         assert_eq!(hdr.call_id, 9);

@@ -1,8 +1,11 @@
 //! Frame-level parsing: recognize SMB2 plain, transform, compress, and SMB1
 //! magic bytes at the framing layer.
 
+use crate::{
+    FramedMessage, WireError, COMPRESS_MAGIC, MAX_FRAME_SIZE, SMB1_MAGIC, SMB2_MAGIC,
+    TRANSFORM_MAGIC,
+};
 use bytes::{Buf, BufMut, BytesMut};
-use crate::{SMB2_MAGIC, TRANSFORM_MAGIC, COMPRESS_MAGIC, SMB1_MAGIC, MAX_FRAME_SIZE, WireError, FramedMessage};
 use rssmb_proto::plain::PlainRequest;
 
 /// Read a NetBIOS-framed SMB message from a buffer.
@@ -266,15 +269,18 @@ mod tests {
         let result = parse_payload(&data);
         // Will likely fail to decode fully, but should attempt Plain parse
         // (the magic detection is what we're testing)
-        assert!(matches!(result, Err(WireError::DecodeError(_)) | Ok(FramedMessage::Plain(_))));
+        assert!(matches!(
+            result,
+            Err(WireError::DecodeError(_)) | Ok(FramedMessage::Plain(_))
+        ));
     }
 
     #[test]
     fn test_compound_parse_two_echo() {
         // Build two ECHO requests chained via next_command and parse them.
         use binrw::BinWrite;
-        use rssmb_proto::header::{Header, Command, HeaderFlags};
         use rssmb_proto::echo::EchoRequest;
+        use rssmb_proto::header::{Command, Header, HeaderFlags};
         use rssmb_proto::plain::{PlainRequest, RequestContent};
 
         fn make_echo(msg_id: u64, next_command: u32) -> PlainRequest {
@@ -302,13 +308,17 @@ mod tests {
 
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
-        echo1.write_le(&mut std::io::Cursor::new(&mut buf1)).unwrap();
-        echo2.write_le(&mut std::io::Cursor::new(&mut buf2)).unwrap();
+        echo1
+            .write_le(&mut std::io::Cursor::new(&mut buf1))
+            .unwrap();
+        echo2
+            .write_le(&mut std::io::Cursor::new(&mut buf2))
+            .unwrap();
 
         // Pad buf1 to 8-byte alignment.
         let aligned1 = (buf1.len() + 7) & !7;
         let pad = aligned1 - buf1.len();
-        buf1.extend(std::iter::repeat(0u8).take(pad));
+        buf1.extend(std::iter::repeat_n(0u8, pad));
         // Patch next_command = aligned1 in buf1 (bytes 20-23).
         let nc = aligned1 as u32;
         buf1[20..24].copy_from_slice(&nc.to_le_bytes());
@@ -334,10 +344,10 @@ mod tests {
     #[test]
     fn test_negotiate_with_unknown_context_decodes() {
         use binrw::BinWrite;
-        use rssmb_proto::Guid;
         use rssmb_proto::header::{Command, Header, HeaderFlags};
         use rssmb_proto::negotiate::*;
         use rssmb_proto::plain::{PlainRequest, RequestContent};
+        use rssmb_proto::Guid;
 
         let posix_ctx_data: Vec<u8> = (0u8..16).collect();
         let neg = NegotiateRequest {
@@ -398,7 +408,10 @@ mod tests {
         assert_eq!(ctxs.len(), 3);
         assert_eq!(ctxs[1].context_type, NegotiateContextType::Unknown(0x0100));
         assert_eq!(ctxs[1].context_type.id(), 0x0100);
-        assert_eq!(ctxs[1].data.get_matching_type(), NegotiateContextType::Unknown(0x0100));
+        assert_eq!(
+            ctxs[1].data.get_matching_type(),
+            NegotiateContextType::Unknown(0x0100)
+        );
         match &ctxs[1].data {
             NegotiateContextValue::Unknown { type_id, data } => {
                 assert_eq!(*type_id, 0x0100);
@@ -489,7 +502,10 @@ mod tests {
             assert_eq!(ctxs[1].context_type, NegotiateContextType::Unknown(0x0100));
             assert_eq!(
                 ctxs[1].data,
-                NegotiateContextValue::Unknown { type_id: 0x0100, data: unk.clone() },
+                NegotiateContextValue::Unknown {
+                    type_id: 0x0100,
+                    data: unk.clone()
+                },
                 "len={len}"
             );
             assert_eq!(
@@ -546,11 +562,7 @@ mod tests {
             v.extend_from_slice(&0x00AAu16.to_le_bytes()); // unknown algo
             v
         };
-        let raw = raw_negotiate(&[
-            (0x0001, &preauth),
-            (0x0002, &enc),
-            (0x0008, &signing),
-        ]);
+        let raw = raw_negotiate(&[(0x0001, &preauth), (0x0002, &enc), (0x0008, &signing)]);
         let ctxs = negotiate_contexts(&raw);
         assert_eq!(ctxs.len(), 3);
 
@@ -586,8 +598,8 @@ mod tests {
     fn test_compound_parse_single_with_next_command() {
         // If next_command is set but points to end, should fail.
         use binrw::BinWrite;
-        use rssmb_proto::header::{Header, Command, HeaderFlags};
         use rssmb_proto::echo::EchoRequest;
+        use rssmb_proto::header::{Command, Header, HeaderFlags};
         use rssmb_proto::plain::{PlainRequest, RequestContent};
 
         let echo = PlainRequest {

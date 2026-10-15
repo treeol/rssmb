@@ -48,7 +48,11 @@ impl MemoryFs {
             "".to_string(),
             InMemoryFile {
                 data: vec![],
-                attributes: FileAttributes { directory: true, normal: false, ..Default::default() },
+                attributes: FileAttributes {
+                    directory: true,
+                    normal: false,
+                    ..Default::default()
+                },
                 creation_time: 0,
                 last_access_time: 0,
                 last_write_time: 0,
@@ -106,8 +110,8 @@ impl Vfs for MemoryFs {
         path: &str,
         args: &CreateArgs,
     ) -> Result<OpenId, VfsError> {
-        let normalized = NormalizedPath::from_smb_path(path)
-            .map_err(|_| VfsError::PathTraversal)?;
+        let normalized =
+            NormalizedPath::from_smb_path(path).map_err(|_| VfsError::PathTraversal)?;
         let key = normalized.to_smb_string();
 
         let mut files = self.files.lock().await;
@@ -162,7 +166,12 @@ impl Vfs for MemoryFs {
                     file_id: Some(new_id),
                 },
             );
-        } else if matches!(args.disposition, CreateDisposition::Supersede | CreateDisposition::Overwrite | CreateDisposition::OverwriteIf) {
+        } else if matches!(
+            args.disposition,
+            CreateDisposition::Supersede
+                | CreateDisposition::Overwrite
+                | CreateDisposition::OverwriteIf
+        ) {
             // Truncate
             if let Some(f) = files.get_mut(&key) {
                 f.data.clear();
@@ -185,12 +194,7 @@ impl Vfs for MemoryFs {
         Ok(open_id)
     }
 
-    async fn read_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        len: u32,
-    ) -> Result<Bytes, VfsError> {
+    async fn read_at(&self, open: OpenId, offset: u64, len: u32) -> Result<Bytes, VfsError> {
         let opens = self.opens.lock().await;
         let open_info = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
         let key = open_info.file_key.clone();
@@ -212,12 +216,7 @@ impl Vfs for MemoryFs {
         Ok(Bytes::copy_from_slice(&file.data[offset..end]))
     }
 
-    async fn write_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u32, VfsError> {
+    async fn write_at(&self, open: OpenId, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
         let opens = self.opens.lock().await;
         let open_info = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
         let key = open_info.file_key.clone();
@@ -259,7 +258,12 @@ impl Vfs for MemoryFs {
         Ok(())
     }
 
-    async fn lock(&self, _open: OpenId, _range: LockRange, _exclusive: bool) -> Result<(), VfsError> {
+    async fn lock(
+        &self,
+        _open: OpenId,
+        _range: LockRange,
+        _exclusive: bool,
+    ) -> Result<(), VfsError> {
         // In-memory — locks are tracked by the server's global table
         Ok(())
     }
@@ -268,11 +272,7 @@ impl Vfs for MemoryFs {
         Ok(())
     }
 
-    async fn query_info(
-        &self,
-        open: OpenId,
-        _class: InfoClass,
-    ) -> Result<FileInfo, VfsError> {
+    async fn query_info(&self, open: OpenId, _class: InfoClass) -> Result<FileInfo, VfsError> {
         let opens = self.opens.lock().await;
         let open_info = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
         let key = open_info.file_key.clone();
@@ -390,19 +390,14 @@ impl Vfs for MemoryFs {
         Ok(())
     }
 
-    async fn rename(
-        &self,
-        open: OpenId,
-        new_path: &str,
-        _replace: bool,
-    ) -> Result<(), VfsError> {
+    async fn rename(&self, open: OpenId, new_path: &str, _replace: bool) -> Result<(), VfsError> {
         let opens = self.opens.lock().await;
         let open_info = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
         let old_key = open_info.file_key.clone();
         drop(opens);
 
-        let normalized = NormalizedPath::from_smb_path(new_path)
-            .map_err(|_| VfsError::PathTraversal)?;
+        let normalized =
+            NormalizedPath::from_smb_path(new_path).map_err(|_| VfsError::PathTraversal)?;
         let new_key = normalized.to_smb_string();
 
         let mut files = self.files.lock().await;
@@ -443,13 +438,15 @@ impl Vfs for MemoryFs {
         let opens = self.opens.lock().await;
         let file_open = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
         let files = self.files.lock().await;
-        let file = files
-            .get(&file_open.file_key)
-            .ok_or(VfsError::NotFound)?;
+        let file = files.get(&file_open.file_key).ok_or(VfsError::NotFound)?;
         Ok(SecurityInfo {
             uid: 0,
             gid: 0,
-            mode: if file.attributes.read_only { 0o444 } else { 0o644 },
+            mode: if file.attributes.read_only {
+                0o444
+            } else {
+                0o644
+            },
         })
     }
 }
@@ -535,7 +532,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_existing_fails() {
         let fs = MemoryFs::new();
-        let args = CreateArgs { disposition: CreateDisposition::Create, ..CreateArgs::open_readonly() };
+        let args = CreateArgs {
+            disposition: CreateDisposition::Create,
+            ..CreateArgs::open_readonly()
+        };
 
         fs.create("", "file.txt", &args).await.unwrap();
         let result = fs.create("", "file.txt", &args).await;
@@ -579,7 +579,10 @@ mod tests {
         let fs = MemoryFs::new();
 
         // Create some files
-        let args = CreateArgs { disposition: CreateDisposition::Create, ..CreateArgs::open_readonly() };
+        let args = CreateArgs {
+            disposition: CreateDisposition::Create,
+            ..CreateArgs::open_readonly()
+        };
         fs.create("", "file1.txt", &args).await.unwrap();
         fs.create("", "file2.txt", &args).await.unwrap();
         fs.create("", "file3.log", &args).await.unwrap();
@@ -587,17 +590,26 @@ mod tests {
         // Open root directory
         let dir_args = CreateArgs {
             disposition: CreateDisposition::Open,
-            create_options: CreateOptions { directory: true, ..Default::default() },
+            create_options: CreateOptions {
+                directory: true,
+                ..Default::default()
+            },
             ..CreateArgs::open_readonly()
         };
         let dir_open = fs.create("", "", &dir_args).await.unwrap();
 
         // List all
-        let entries = fs.query_dir(dir_open, "*", DirInfoClass::DirectoryInfo, true, 100).await.unwrap();
+        let entries = fs
+            .query_dir(dir_open, "*", DirInfoClass::DirectoryInfo, true, 100)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 3);
 
         // List *.txt
-        let entries = fs.query_dir(dir_open, "*.txt", DirInfoClass::DirectoryInfo, true, 100).await.unwrap();
+        let entries = fs
+            .query_dir(dir_open, "*.txt", DirInfoClass::DirectoryInfo, true, 100)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
     }
 

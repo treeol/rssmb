@@ -223,7 +223,10 @@ mod tests {
     #[test]
     fn test_flush_request_roundtrip() {
         let req = FlushRequest {
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
         };
         let mut buf = Cursor::new(Vec::new());
         req.write_le(&mut buf).unwrap();
@@ -231,7 +234,13 @@ mod tests {
         assert_eq!(bytes.len(), 24);
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: FlushRequest = FlushRequest::read_le(&mut cursor).unwrap();
-        assert_eq!(decoded.file_id, FileId { persistent: 1, volatile: 2 });
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                persistent: 1,
+                volatile: 2
+            }
+        );
     }
 
     #[test]
@@ -240,7 +249,10 @@ mod tests {
             flags: ReadFlags::new(),
             length: 1024,
             offset: 0,
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
             minimum_count: 1,
         };
         let mut buf = Cursor::new(Vec::new());
@@ -254,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_write_response_roundtrip() {
-        let resp = WriteResponse { count: 42, ..Default::default() };
+        let resp = WriteResponse { count: 42 };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();
@@ -268,7 +280,10 @@ mod tests {
         let req = WriteRequest {
             length: 1024,
             offset: 4096,
-            file_id: FileId { persistent: 0xDEAD, volatile: 0xBEEF },
+            file_id: FileId {
+                persistent: 0xDEAD,
+                volatile: 0xBEEF,
+            },
             flags: WriteFlags::new().with_write_through(true),
             _write_offset: (),
         };
@@ -283,7 +298,13 @@ mod tests {
         let decoded: WriteRequest = WriteRequest::read_le(&mut cursor).unwrap();
         assert_eq!(decoded.length, 1024);
         assert_eq!(decoded.offset, 4096);
-        assert_eq!(decoded.file_id, FileId { persistent: 0xDEAD, volatile: 0xBEEF });
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                persistent: 0xDEAD,
+                volatile: 0xBEEF
+            }
+        );
         assert!(decoded.flags.write_through());
     }
 
@@ -291,7 +312,6 @@ mod tests {
     fn test_read_response_roundtrip_with_data() {
         let resp = ReadResponse {
             buffer: vec![0x41; 16],
-            ..Default::default()
         };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();

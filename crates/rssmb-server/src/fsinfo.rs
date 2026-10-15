@@ -4,20 +4,19 @@
 //! Used by QUERY_INFO and QUERY_DIRECTORY handlers.
 
 use binrw::BinWrite;
-use rssmb_proto::FileTime;
 use rssmb_proto::fscc::{
-    FileAttributes, FileBasicInformation, FileStandardInformation, FileInternalInformation,
-    FileEaInformation, FileNetworkOpenInformation, FileAttributeTagInformation,
-    FileDirectoryInformation, FileFullDirectoryInformation, FileBothDirectoryInformation,
-    FileIdBothDirectoryInformation, FileIdFullDirectoryInformation, FileNamesInformation,
-    FileFsVolumeInformation, FileFsSizeInformation, FileFsAttributeInformation,
-    FileFsDeviceInformation, FileFsFullSizeInformation, FsDeviceType, FsDeviceCharacteristics,
-    FileSystemAttributes, ChainedItemList, ReparseTag,
-    FileStreamInformation,
+    ChainedItemList, FileAttributeTagInformation, FileAttributes, FileBasicInformation,
+    FileBothDirectoryInformation, FileDirectoryInformation, FileEaInformation,
+    FileFsAttributeInformation, FileFsDeviceInformation, FileFsFullSizeInformation,
+    FileFsSizeInformation, FileFsVolumeInformation, FileFullDirectoryInformation,
+    FileIdBothDirectoryInformation, FileIdFullDirectoryInformation, FileInternalInformation,
+    FileNamesInformation, FileNetworkOpenInformation, FileStandardInformation,
+    FileStreamInformation, FileSystemAttributes, FsDeviceCharacteristics, FsDeviceType, ReparseTag,
 };
 use rssmb_proto::Boolean;
+use rssmb_proto::FileTime;
 
-use rssmb_vfs::{FileInfo, DirEntry, FileId as VfsFileId, FsStats, SecurityInfo};
+use rssmb_vfs::{DirEntry, FileId as VfsFileId, FileInfo, FsStats, SecurityInfo};
 
 /// Serialize a value with BinWrite into a Vec<u8>. Returns empty on failure
 /// (the caller should check and return STATUS_INTERNAL_ERROR).
@@ -112,7 +111,12 @@ pub fn file_all_info(info: &FileInfo, name: &str, granted_access: u32) -> Vec<u8
     let mut b = Vec::with_capacity(104 + name.len() * 2);
     let attrs = file_attributes_to_fscc(&info.attributes);
     let attrs_u32 = u32::from_le_bytes(attrs.into_bytes());
-    for t in [info.creation_time, info.last_access_time, info.last_write_time, info.change_time] {
+    for t in [
+        info.creation_time,
+        info.last_access_time,
+        info.last_write_time,
+        info.change_time,
+    ] {
         b.extend_from_slice(&t.to_le_bytes());
     }
     b.extend_from_slice(&attrs_u32.to_le_bytes());
@@ -301,9 +305,9 @@ pub fn synthesize_security_descriptor(sec_info: &SecurityInfo, additional_info: 
     // SACL is never present (offset 0).
     let sacl_offset = 0u32;
 
-    let dacl_offset = if dacl.is_some() {
+    let dacl_offset = if let Some(dacl) = dacl.as_ref() {
         let off = offset;
-        offset += dacl.as_ref().unwrap().len() as u32;
+        offset += dacl.len() as u32;
         off
     } else {
         0
@@ -481,14 +485,13 @@ fn build_ace_allowed(mask: u32, sid: &[u8]) -> Vec<u8> {
 /// 37=FileIdBothDirectoryInformation, 38=FileIdFullDirectoryInformation.
 ///
 /// Returns `Some(buffer)` or `None` if the class is unknown.
-pub fn build_directory_buffer(
-    entries: &[DirEntry],
-    class_id: u8,
-) -> Option<Vec<u8>> {
+pub fn build_directory_buffer(entries: &[DirEntry], class_id: u8) -> Option<Vec<u8>> {
     match class_id {
         1 => {
-            let list: ChainedItemList<FileDirectoryInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                FileDirectoryInformation {
+            let list: ChainedItemList<FileDirectoryInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| FileDirectoryInformation {
                     file_index: i as u32,
                     creation_time: FileTime::from(e.creation_time),
                     last_access_time: FileTime::from(e.last_access_time),
@@ -498,13 +501,15 @@ pub fn build_directory_buffer(
                     allocation_size: e.allocation_size,
                     file_attributes: file_attributes_to_fscc(&e.attributes),
                     file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+                })
+                .collect();
             Some(serialize(&list))
         }
         2 => {
-            let list: ChainedItemList<FileFullDirectoryInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                FileFullDirectoryInformation {
+            let list: ChainedItemList<FileFullDirectoryInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| FileFullDirectoryInformation {
                     file_index: i as u32,
                     creation_time: FileTime::from(e.creation_time),
                     last_access_time: FileTime::from(e.last_access_time),
@@ -515,63 +520,75 @@ pub fn build_directory_buffer(
                     file_attributes: file_attributes_to_fscc(&e.attributes),
                     ea_size: 0,
                     file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+                })
+                .collect();
             Some(serialize(&list))
         }
         3 => {
-            let list: ChainedItemList<FileBothDirectoryInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                let short = e.short_name.as_deref().unwrap_or("");
-                FileBothDirectoryInformation {
-                    file_index: i as u32,
-                    creation_time: FileTime::from(e.creation_time),
-                    last_access_time: FileTime::from(e.last_access_time),
-                    last_write_time: FileTime::from(e.last_write_time),
-                    change_time: FileTime::from(e.change_time),
-                    end_of_file: e.size,
-                    allocation_size: e.allocation_size,
-                    file_attributes: file_attributes_to_fscc(&e.attributes),
-                    ea_size: 0,
-                    short_name_length: (short.encode_utf16().count() * 2) as u8,
-                    short_name: rssmb_proto::FixedWideString::from_str(short),
-                    file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+            let list: ChainedItemList<FileBothDirectoryInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let short = e.short_name.as_deref().unwrap_or("");
+                    FileBothDirectoryInformation {
+                        file_index: i as u32,
+                        creation_time: FileTime::from(e.creation_time),
+                        last_access_time: FileTime::from(e.last_access_time),
+                        last_write_time: FileTime::from(e.last_write_time),
+                        change_time: FileTime::from(e.change_time),
+                        end_of_file: e.size,
+                        allocation_size: e.allocation_size,
+                        file_attributes: file_attributes_to_fscc(&e.attributes),
+                        ea_size: 0,
+                        short_name_length: (short.encode_utf16().count() * 2) as u8,
+                        short_name: rssmb_proto::FixedWideString::from_str(short),
+                        file_name: e.file_name.as_str().into(),
+                    }
+                })
+                .collect();
             Some(serialize(&list))
         }
         12 => {
-            let list: ChainedItemList<FileNamesInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                FileNamesInformation {
+            let list: ChainedItemList<FileNamesInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| FileNamesInformation {
                     file_index: i as u32,
                     file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+                })
+                .collect();
             Some(serialize(&list))
         }
         37 => {
-            let list: ChainedItemList<FileIdBothDirectoryInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                let short = e.short_name.as_deref().unwrap_or("");
-                FileIdBothDirectoryInformation {
-                    file_index: i as u32,
-                    creation_time: FileTime::from(e.creation_time),
-                    last_access_time: FileTime::from(e.last_access_time),
-                    last_write_time: FileTime::from(e.last_write_time),
-                    change_time: FileTime::from(e.change_time),
-                    end_of_file: e.size,
-                    allocation_size: e.allocation_size,
-                    file_attributes: file_attributes_to_fscc(&e.attributes),
-                    ea_size: 0,
-                    short_name_length: (short.encode_utf16().count() * 2) as u8,
-                    short_name: rssmb_proto::FixedWideString::from_str(short),
-                    file_id: e.file_id.map(|f| f.0).unwrap_or(0),
-                    file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+            let list: ChainedItemList<FileIdBothDirectoryInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let short = e.short_name.as_deref().unwrap_or("");
+                    FileIdBothDirectoryInformation {
+                        file_index: i as u32,
+                        creation_time: FileTime::from(e.creation_time),
+                        last_access_time: FileTime::from(e.last_access_time),
+                        last_write_time: FileTime::from(e.last_write_time),
+                        change_time: FileTime::from(e.change_time),
+                        end_of_file: e.size,
+                        allocation_size: e.allocation_size,
+                        file_attributes: file_attributes_to_fscc(&e.attributes),
+                        ea_size: 0,
+                        short_name_length: (short.encode_utf16().count() * 2) as u8,
+                        short_name: rssmb_proto::FixedWideString::from_str(short),
+                        file_id: e.file_id.map(|f| f.0).unwrap_or(0),
+                        file_name: e.file_name.as_str().into(),
+                    }
+                })
+                .collect();
             Some(serialize(&list))
         }
         38 => {
-            let list: ChainedItemList<FileIdFullDirectoryInformation, 8> = entries.iter().enumerate().map(|(i, e)| {
-                FileIdFullDirectoryInformation {
+            let list: ChainedItemList<FileIdFullDirectoryInformation, 8> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| FileIdFullDirectoryInformation {
                     file_index: i as u32,
                     creation_time: FileTime::from(e.creation_time),
                     last_access_time: FileTime::from(e.last_access_time),
@@ -583,8 +600,8 @@ pub fn build_directory_buffer(
                     ea_size: 0,
                     file_id: e.file_id.map(|f| f.0).unwrap_or(0),
                     file_name: e.file_name.as_str().into(),
-                }
-            }).collect();
+                })
+                .collect();
             Some(serialize(&list))
         }
         _ => None,
@@ -682,7 +699,10 @@ mod tests {
     #[test]
     fn test_fs_attribute_info_has_ntfs_name() {
         let buf = fs_attribute_info();
-        let ntfs_utf16: Vec<u8> = "NTFS".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let ntfs_utf16: Vec<u8> = "NTFS"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
         assert!(buf.windows(8).any(|w| w == &ntfs_utf16[..]));
     }
 
@@ -718,7 +738,10 @@ mod tests {
         assert!(!buf.is_empty());
         // First 4 bytes = next_entry_offset (non-zero since there are 2 entries)
         let next_offset = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        assert!(next_offset > 0, "first entry should have non-zero next_entry_offset");
+        assert!(
+            next_offset > 0,
+            "first entry should have non-zero next_entry_offset"
+        );
     }
 
     #[test]
@@ -792,7 +815,10 @@ mod tests {
         let buf = file_internal_info(&info);
         // FileInternalInformation: IndexNumber(u64) = 8 bytes
         assert_eq!(buf.len(), 8);
-        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 0xDEADBEEF);
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            0xDEADBEEF
+        );
     }
 
     #[test]
@@ -876,20 +902,18 @@ mod tests {
 
     #[test]
     fn test_directory_buffer_class_37_id_both_golden() {
-        let entries = vec![
-            DirEntry {
-                file_name: "a.txt".to_string(),
-                short_name: None,
-                attributes: rssmb_vfs::FileAttributes::default(),
-                size: 100,
-                allocation_size: 512,
-                file_id: Some(VfsFileId(1)),
-                creation_time: 0,
-                last_access_time: 0,
-                last_write_time: 0,
-                change_time: 0,
-            },
-        ];
+        let entries = vec![DirEntry {
+            file_name: "a.txt".to_string(),
+            short_name: None,
+            attributes: rssmb_vfs::FileAttributes::default(),
+            size: 100,
+            allocation_size: 512,
+            file_id: Some(VfsFileId(1)),
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+        }];
         let buf = build_directory_buffer(&entries, 37).expect("class 37 should work");
         assert!(!buf.is_empty());
         // First 4 bytes = next_entry_offset (0 for last entry)
@@ -901,20 +925,18 @@ mod tests {
 
     #[test]
     fn test_directory_buffer_class_38_id_full_golden() {
-        let entries = vec![
-            DirEntry {
-                file_name: "b.txt".to_string(),
-                short_name: None,
-                attributes: rssmb_vfs::FileAttributes::default(),
-                size: 200,
-                allocation_size: 512,
-                file_id: Some(VfsFileId(2)),
-                creation_time: 0,
-                last_access_time: 0,
-                last_write_time: 0,
-                change_time: 0,
-            },
-        ];
+        let entries = vec![DirEntry {
+            file_name: "b.txt".to_string(),
+            short_name: None,
+            attributes: rssmb_vfs::FileAttributes::default(),
+            size: 200,
+            allocation_size: 512,
+            file_id: Some(VfsFileId(2)),
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+        }];
         let buf = build_directory_buffer(&entries, 38).expect("class 38 should work");
         assert!(!buf.is_empty());
         let next_off = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -923,20 +945,18 @@ mod tests {
 
     #[test]
     fn test_directory_buffer_class_12_names_golden() {
-        let entries = vec![
-            DirEntry {
-                file_name: "only_name.txt".to_string(),
-                short_name: None,
-                attributes: rssmb_vfs::FileAttributes::default(),
-                size: 0,
-                allocation_size: 0,
-                file_id: None,
-                creation_time: 0,
-                last_access_time: 0,
-                last_write_time: 0,
-                change_time: 0,
-            },
-        ];
+        let entries = vec![DirEntry {
+            file_name: "only_name.txt".to_string(),
+            short_name: None,
+            attributes: rssmb_vfs::FileAttributes::default(),
+            size: 0,
+            allocation_size: 0,
+            file_id: None,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+        }];
         let buf = build_directory_buffer(&entries, 12).expect("class 12 should work");
         assert!(!buf.is_empty());
         // FileNamesInformation: next_offset(4) + file_index(4) + name_length(4) + name
@@ -972,7 +992,10 @@ mod tests {
         // FileFsDeviceInformation: DeviceType(4) + Characteristics(4) = 8
         assert_eq!(buf.len(), 8);
         // Disk = 0x00000007
-        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x00000007);
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            0x00000007
+        );
     }
 
     #[test]
@@ -1010,8 +1033,13 @@ mod tests {
 
     #[test]
     fn test_sd_synthesis_basic() {
-        let sec = SecurityInfo { uid: 1000, gid: 1000, mode: 0o755 };
-        let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
+        let sec = SecurityInfo {
+            uid: 1000,
+            gid: 1000,
+            mode: 0o755,
+        };
+        let sd =
+            synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
         // Header is 20 bytes, must be at least that.
         assert!(sd.len() > 20);
         // Revision = 1
@@ -1023,7 +1051,11 @@ mod tests {
 
     #[test]
     fn test_sd_synthesis_no_dacl() {
-        let sec = SecurityInfo { uid: 0, gid: 0, mode: 0o644 };
+        let sec = SecurityInfo {
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        };
         let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP);
         // Without DACL: header(20) + owner SID + group SID
         // S-1-22-1-0: revision(1) + count(1) + auth(6) + 2×subauth(4+4) = 16 bytes
@@ -1043,22 +1075,27 @@ mod tests {
 
     #[test]
     fn test_sd_synthesis_owner_offset() {
-        let sec = SecurityInfo { uid: 42, gid: 42, mode: 0o700 };
-        let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
+        let sec = SecurityInfo {
+            uid: 42,
+            gid: 42,
+            mode: 0o700,
+        };
+        let sd =
+            synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
         // Owner offset at bytes 4..8
         let owner_off = u32::from_le_bytes(sd[4..8].try_into().unwrap());
         assert_eq!(owner_off, 20); // right after header
-        // Group offset at bytes 8..12
+                                   // Group offset at bytes 8..12
         let group_off = u32::from_le_bytes(sd[8..12].try_into().unwrap());
         // S-1-22-1-42 = 16 bytes, so group is at 20+16 = 36
         assert_eq!(group_off, 36);
         // The SID at owner_off should start with revision=1
         assert_eq!(sd[owner_off as usize], 1); // revision
-        // SubAuthorityCount at offset+1
+                                               // SubAuthorityCount at offset+1
         let sub_auth_count = sd[owner_off as usize + 1];
         assert_eq!(sub_auth_count, 2); // [1, uid]
-        // IdentifierAuthority is 6 bytes big-endian at offset+2
-        // For authority 22: bytes are [0,0,0,0,0,22]
+                                       // IdentifierAuthority is 6 bytes big-endian at offset+2
+                                       // For authority 22: bytes are [0,0,0,0,0,22]
         let auth_byte = sd[owner_off as usize + 2 + 5]; // last byte of authority
         assert_eq!(auth_byte, 22);
         // Control: SE_SELF_RELATIVE | SE_DACL_PRESENT = 0x8004

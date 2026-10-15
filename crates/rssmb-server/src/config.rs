@@ -1,8 +1,8 @@
 //! Server and share configuration.
 
-use std::collections::HashMap;
-use serde::Deserialize;
 use rssmb_vfs::FollowSymlinks;
+use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -154,76 +154,101 @@ impl std::fmt::Debug for UserConfig {
         f.debug_struct("UserConfig")
             .field("username", &self.username)
             .field("password", &"<redacted>")
-            .field("nt_hash", &self.nt_hash.as_str().is_empty().then(|| "<unset>").unwrap_or("<redacted>"))
+            .field(
+                "nt_hash",
+                &if self.nt_hash.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
             .field("disabled", &self.disabled)
             .finish()
     }
 }
 
-fn default_listen_addr() -> String { "0.0.0.0".to_string() }
-fn default_smb_port() -> u16 { 445 }
-fn default_max_frame_size() -> usize { 1_048_576 }
-fn default_health_port() -> u16 { 8080 }
-fn default_max_credits() -> u32 { 1024 }
-fn default_auth_max_failures() -> u32 { 5 }
-fn default_auth_window_secs() -> u64 { 60 }
-fn default_auth_delay_max_ms() -> u64 { 5000 }
-fn default_auth_cooldown_secs() -> u64 { 60 }
-fn default_auth_max_failures_per_conn() -> u32 { 10 }
-fn default_durable_timeout_secs() -> u64 { 900 }
-fn default_shutdown_grace_secs() -> u64 { 10 }
-fn default_max_dialect() -> DialectConfig { DialectConfig::Smb311 }
-fn default_idle_timeout() -> u64 { 900 }
-fn default_health_bind_addr() -> String { "127.0.0.1".to_string() }
+fn default_listen_addr() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_smb_port() -> u16 {
+    445
+}
+fn default_max_frame_size() -> usize {
+    1_048_576
+}
+fn default_health_port() -> u16 {
+    8080
+}
+fn default_max_credits() -> u32 {
+    1024
+}
+fn default_auth_max_failures() -> u32 {
+    5
+}
+fn default_auth_window_secs() -> u64 {
+    60
+}
+fn default_auth_delay_max_ms() -> u64 {
+    5000
+}
+fn default_auth_cooldown_secs() -> u64 {
+    60
+}
+fn default_auth_max_failures_per_conn() -> u32 {
+    10
+}
+fn default_durable_timeout_secs() -> u64 {
+    900
+}
+fn default_shutdown_grace_secs() -> u64 {
+    10
+}
+fn default_max_dialect() -> DialectConfig {
+    DialectConfig::Smb311
+}
+fn default_idle_timeout() -> u64 {
+    900
+}
+fn default_health_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum DialectConfig {
     Smb2002,
+    #[default]
     Smb21,
     Smb30,
     Smb302,
     Smb311,
 }
 
-impl Default for DialectConfig {
-    fn default() -> Self {
-        DialectConfig::Smb21
-    }
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SigningPolicy {
     /// Signing is not offered
     Disabled,
     /// Signing is offered but not required
     Desired,
     /// Signing is required
+    #[default]
     Required,
-}
-
-impl Default for SigningPolicy {
-    fn default() -> Self {
-        SigningPolicy::Required
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum EncryptionPolicy {
     /// Encryption is not offered
     Disabled,
     /// Encryption is offered but not required
+    #[default]
     Desired,
     /// Encryption is required
     Required,
-}
-
-impl Default for EncryptionPolicy {
-    fn default() -> Self {
-        EncryptionPolicy::Desired
-    }
 }
 
 /// Per-share configuration.
@@ -293,8 +318,12 @@ pub struct ShareConfig {
     pub case_sensitive: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
 
 impl ServerConfig {
     /// Load from TOML string.
@@ -345,19 +374,22 @@ impl ServerConfig {
                     ));
                 }
                 // Validate nt_hash is valid hex if present.
-                if !user.nt_hash.is_empty() {
-                    if user.nt_hash.len() != 32 || !user.nt_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                        return Err(format!(
-                            "user '{}': nt_hash must be 32 hex characters (16 bytes), got {} chars",
-                            user.username, user.nt_hash.len()
-                        ));
-                    }
+                if !user.nt_hash.is_empty()
+                    && (user.nt_hash.len() != 32
+                        || !user.nt_hash.chars().all(|c| c.is_ascii_hexdigit()))
+                {
+                    return Err(format!(
+                        "user '{}': nt_hash must be 32 hex characters (16 bytes), got {} chars",
+                        user.username,
+                        user.nt_hash.len()
+                    ));
                 }
             }
         }
         // Encryption required with a dialect below 3.0 — encryption is only
         // available in SMB 3.x, so requiring it with 2.x is a contradiction.
-        if self.encryption == EncryptionPolicy::Required && self.max_dialect < DialectConfig::Smb30 {
+        if self.encryption == EncryptionPolicy::Required && self.max_dialect < DialectConfig::Smb30
+        {
             return Err(format!(
                 "encryption = 'required' but max_dialect ({:?}) < smb30 — \
                  encryption is only available in SMB 3.x",
@@ -378,8 +410,15 @@ impl ServerConfig {
         // IPC$ is a reserved share name (the named-pipe share). A configured
         // share with that name would shadow the built-in IPC$ tree and break
         // share enumeration.
-        if self.shares.iter().any(|(k, _)| k.eq_ignore_ascii_case("IPC$")) {
-            return Err("share named 'IPC$' is reserved — cannot configure a disk share with that name".to_string());
+        if self
+            .shares
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("IPC$"))
+        {
+            return Err(
+                "share named 'IPC$' is reserved — cannot configure a disk share with that name"
+                    .to_string(),
+            );
         }
         // Auth throttle validation: when throttling is enabled, the window,
         // delay cap, and cooldown must be positive and non-trivial.
@@ -484,21 +523,24 @@ impl ServerConfig {
     /// Default config for testing.
     pub fn for_testing() -> Self {
         let mut shares = HashMap::new();
-        shares.insert("test".to_string(), ShareConfig {
-            name: "test".to_string(),
-            path: "/tmp/rssmb-test".to_string(),
-            comment: "Test share".to_string(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
+        shares.insert(
+            "test".to_string(),
+            ShareConfig {
+                name: "test".to_string(),
+                path: "/tmp/rssmb-test".to_string(),
+                comment: "Test share".to_string(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
 
         Self {
             listen_addr: "127.0.0.1".to_string(),
@@ -656,128 +698,161 @@ disabled = false
     fn test_validate_rejects_encrypt_data_under_disabled() {
         let mut config = ServerConfig::for_testing();
         config.encryption = EncryptionPolicy::Disabled;
-        config.shares.insert("enc_share".to_string(), ShareConfig {
-            name: "enc_share".to_string(),
-            path: "/tmp/rssmb-enc".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: true,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
-        assert!(config.validate().is_err(), "encrypt_data under disabled must be rejected");
+        config.shares.insert(
+            "enc_share".to_string(),
+            ShareConfig {
+                name: "enc_share".to_string(),
+                path: "/tmp/rssmb-enc".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: true,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
+        assert!(
+            config.validate().is_err(),
+            "encrypt_data under disabled must be rejected"
+        );
     }
 
     #[test]
     fn test_validate_ok_encrypt_data_under_desired() {
         let mut config = ServerConfig::for_testing();
         config.encryption = EncryptionPolicy::Desired;
-        config.shares.insert("enc_share".to_string(), ShareConfig {
-            name: "enc_share".to_string(),
-            path: "/tmp/rssmb-enc".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: true,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
+        config.shares.insert(
+            "enc_share".to_string(),
+            ShareConfig {
+                name: "enc_share".to_string(),
+                path: "/tmp/rssmb-enc".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: true,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_validate_rejects_ipc_share_name() {
         let mut config = ServerConfig::for_testing();
-        config.shares.insert("IPC$".to_string(), ShareConfig {
-            name: "IPC$".to_string(),
-            path: "/tmp/ipc".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
-        assert!(config.validate().is_err(), "IPC$ share name must be rejected");
+        config.shares.insert(
+            "IPC$".to_string(),
+            ShareConfig {
+                name: "IPC$".to_string(),
+                path: "/tmp/ipc".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
+        assert!(
+            config.validate().is_err(),
+            "IPC$ share name must be rejected"
+        );
     }
 
     #[test]
     fn test_validate_rejects_ipc_case_insensitive() {
         let mut config = ServerConfig::for_testing();
-        config.shares.insert("ipc$".to_string(), ShareConfig {
-            name: "ipc$".to_string(),
-            path: "/tmp/ipc".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
-        assert!(config.validate().is_err(), "ipc$ share name must be rejected (case-insensitive)");
+        config.shares.insert(
+            "ipc$".to_string(),
+            ShareConfig {
+                name: "ipc$".to_string(),
+                path: "/tmp/ipc".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
+        assert!(
+            config.validate().is_err(),
+            "ipc$ share name must be rejected (case-insensitive)"
+        );
     }
 
     #[test]
     fn test_validate_rejects_write_users_on_read_only_share() {
         let mut config = ServerConfig::for_testing();
-        config.shares.insert("ro_share".to_string(), ShareConfig {
-            name: "ro_share".to_string(),
-            path: "/tmp/ro".to_string(),
-            comment: String::new(),
-            read_only: true,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec!["alice".to_string()],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
-        assert!(config.validate().is_err(), "write_users on read_only share must be rejected");
+        config.shares.insert(
+            "ro_share".to_string(),
+            ShareConfig {
+                name: "ro_share".to_string(),
+                path: "/tmp/ro".to_string(),
+                comment: String::new(),
+                read_only: true,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec!["alice".to_string()],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
+        assert!(
+            config.validate().is_err(),
+            "write_users on read_only share must be rejected"
+        );
     }
 
     #[test]
     fn test_validate_ok_write_users_on_read_write_share() {
         let mut config = ServerConfig::for_testing();
-        config.shares.insert("rw_share".to_string(), ShareConfig {
-            name: "rw_share".to_string(),
-            path: "/tmp/rw".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: false,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec!["alice".to_string()],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
-        assert!(config.validate().is_ok(), "write_users on read-write share should be accepted");
+        config.shares.insert(
+            "rw_share".to_string(),
+            ShareConfig {
+                name: "rw_share".to_string(),
+                path: "/tmp/rw".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: false,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec!["alice".to_string()],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
+        assert!(
+            config.validate().is_ok(),
+            "write_users on read-write share should be accepted"
+        );
     }
 
     #[test]
@@ -785,7 +860,10 @@ disabled = false
         let mut config = ServerConfig::for_testing();
         config.min_dialect = DialectConfig::Smb311;
         config.max_dialect = DialectConfig::Smb21;
-        assert!(config.validate().is_err(), "min > max dialect must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "min > max dialect must be rejected"
+        );
     }
 
     #[test]
@@ -793,21 +871,30 @@ disabled = false
         let mut config = ServerConfig::for_testing();
         config.port = 8080;
         config.health_port = 8080;
-        assert!(config.validate().is_err(), "port == health_port must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "port == health_port must be rejected"
+        );
     }
 
     #[test]
     fn test_validate_rejects_small_frame_size() {
         let mut config = ServerConfig::for_testing();
         config.max_frame_size = 1024;
-        assert!(config.validate().is_err(), "max_frame_size < 65536 must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "max_frame_size < 65536 must be rejected"
+        );
     }
 
     #[test]
     fn test_validate_rejects_zero_credits() {
         let mut config = ServerConfig::for_testing();
         config.max_credits = 0;
-        assert!(config.validate().is_err(), "max_credits = 0 must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "max_credits = 0 must be rejected"
+        );
     }
 
     #[test]
@@ -819,7 +906,10 @@ disabled = false
             nt_hash: String::new(),
             disabled: false,
         }];
-        assert!(config.validate().is_err(), "non-disabled user without credentials must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "non-disabled user without credentials must be rejected"
+        );
     }
 
     #[test]
@@ -831,7 +921,10 @@ disabled = false
             nt_hash: String::new(),
             disabled: true,
         }];
-        assert!(config.validate().is_ok(), "disabled user without credentials should be accepted");
+        assert!(
+            config.validate().is_ok(),
+            "disabled user without credentials should be accepted"
+        );
     }
 
     #[test]
@@ -840,8 +933,13 @@ disabled = false
         config.listen_addr = "0.0.0.0".to_string();
         config.signing = SigningPolicy::Desired;
         let warnings = config.warnings();
-        assert!(warnings.iter().any(|w| w.contains("signing is not 'required'")),
-            "should warn about signing on non-loopback: {:?}", warnings);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("signing is not 'required'")),
+            "should warn about signing on non-loopback: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -849,32 +947,41 @@ disabled = false
         let config = ServerConfig::for_testing();
         // for_testing uses 127.0.0.1 + signing=Required — no signing warning.
         let warnings = config.warnings();
-        assert!(!warnings.iter().any(|w| w.contains("signing")),
-            "should not warn about signing on loopback with required: {:?}", warnings);
+        assert!(
+            !warnings.iter().any(|w| w.contains("signing")),
+            "should not warn about signing on loopback with required: {:?}",
+            warnings
+        );
     }
 
     #[test]
     fn test_warnings_guest_ok_with_server_guest_disabled() {
         let mut config = ServerConfig::for_testing();
         config.guest_access = false;
-        config.shares.insert("guest_share".to_string(), ShareConfig {
-            name: "guest_share".to_string(),
-            path: "/tmp/guest".to_string(),
-            comment: String::new(),
-            read_only: false,
-            browseable: true,
-            guest_ok: true,
-            valid_users: vec![],
-            read_users: vec![],
-            write_users: vec![],
-            encrypt_data: false,
-            follow_symlinks: FollowSymlinks::Never,
-            strict_sync: true,
-            case_sensitive: false,
-        });
+        config.shares.insert(
+            "guest_share".to_string(),
+            ShareConfig {
+                name: "guest_share".to_string(),
+                path: "/tmp/guest".to_string(),
+                comment: String::new(),
+                read_only: false,
+                browseable: true,
+                guest_ok: true,
+                valid_users: vec![],
+                read_users: vec![],
+                write_users: vec![],
+                encrypt_data: false,
+                follow_symlinks: FollowSymlinks::Never,
+                strict_sync: true,
+                case_sensitive: false,
+            },
+        );
         let warnings = config.warnings();
-        assert!(warnings.iter().any(|w| w.contains("guest_access = false")),
-            "should warn about guest_ok with server guest disabled: {:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("guest_access = false")),
+            "should warn about guest_ok with server guest disabled: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -885,7 +992,10 @@ port = 445
 unknown_field = "should be rejected"
 "#;
         let result = ServerConfig::from_toml(toml_str);
-        assert!(result.is_err(), "deny_unknown_fields should reject unknown keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields should reject unknown keys"
+        );
     }
 
     #[test]
@@ -897,7 +1007,10 @@ unknown_field = "should be rejected"
             nt_hash: "short".to_string(),
             disabled: false,
         }];
-        assert!(config.validate().is_err(), "nt_hash with wrong length must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "nt_hash with wrong length must be rejected"
+        );
     }
 
     #[test]
@@ -909,7 +1022,10 @@ unknown_field = "should be rejected"
             nt_hash: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(), // 32 chars but not hex
             disabled: false,
         }];
-        assert!(config.validate().is_err(), "nt_hash with non-hex chars must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "nt_hash with non-hex chars must be rejected"
+        );
     }
 
     #[test]
@@ -917,8 +1033,10 @@ unknown_field = "should be rejected"
         let mut config = ServerConfig::for_testing();
         config.encryption = EncryptionPolicy::Required;
         config.max_dialect = DialectConfig::Smb21;
-        assert!(config.validate().is_err(),
-            "encryption=required with max_dialect < smb30 must be rejected");
+        assert!(
+            config.validate().is_err(),
+            "encryption=required with max_dialect < smb30 must be rejected"
+        );
     }
 
     #[test]
@@ -926,8 +1044,10 @@ unknown_field = "should be rejected"
         let mut config = ServerConfig::for_testing();
         config.encryption = EncryptionPolicy::Desired;
         config.max_dialect = DialectConfig::Smb21;
-        assert!(config.validate().is_ok(),
-            "encryption=desired with smb21 should be accepted");
+        assert!(
+            config.validate().is_ok(),
+            "encryption=desired with smb21 should be accepted"
+        );
     }
 
     #[test]
@@ -943,7 +1063,10 @@ path = "/data/public"
 bogus_field = true
 "#;
         let result = ServerConfig::from_toml(toml_str);
-        assert!(result.is_err(), "deny_unknown_fields should reject unknown share keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields should reject unknown share keys"
+        );
     }
 
     #[test]
@@ -959,6 +1082,9 @@ password = "secret"
 bogus_field = true
 "#;
         let result = ServerConfig::from_toml(toml_str);
-        assert!(result.is_err(), "deny_unknown_fields should reject unknown user keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields should reject unknown user keys"
+        );
     }
 }

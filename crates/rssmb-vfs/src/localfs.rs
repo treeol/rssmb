@@ -20,10 +20,10 @@ use cap_std::fs::OpenOptions as CapOpenOptions;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
-use std::sync::Arc;
 
 use crate::*;
 
@@ -140,7 +140,9 @@ impl LocalFs {
     fn resolve_rel(&self, path: &str) -> Result<PathBuf, VfsError> {
         let normalized = NormalizedPath::from_smb_path(path).map_err(|e| match e {
             path::PathError::TraversalDetected => VfsError::PathTraversal,
-            path::PathError::InvalidName | path::PathError::InvalidEncoding => VfsError::InvalidName,
+            path::PathError::InvalidName | path::PathError::InvalidEncoding => {
+                VfsError::InvalidName
+            }
         })?;
         Ok(normalized.to_pathbuf())
     }
@@ -231,16 +233,13 @@ impl LocalFs {
 
     /// Check if a relative path is a directory.
     fn is_dir_rel(&self, rel: &Path) -> Result<bool, VfsError> {
-        self.dir
-            .metadata(rel)
-            .map(|m| m.is_dir())
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    VfsError::NotFound
-                } else {
-                    VfsError::Io(format!("metadata: {e}"))
-                }
-            })
+        self.dir.metadata(rel).map(|m| m.is_dir()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                VfsError::NotFound
+            } else {
+                VfsError::Io(format!("metadata: {e}"))
+            }
+        })
     }
 }
 
@@ -406,12 +405,7 @@ impl Vfs for LocalFs {
         Ok(open_id)
     }
 
-    async fn read_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        len: u32,
-    ) -> Result<Bytes, VfsError> {
+    async fn read_at(&self, open: OpenId, offset: u64, len: u32) -> Result<Bytes, VfsError> {
         let handle = {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
@@ -435,12 +429,7 @@ impl Vfs for LocalFs {
         Ok(Bytes::from(buf))
     }
 
-    async fn write_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u32, VfsError> {
+    async fn write_at(&self, open: OpenId, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
         let handle = {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
@@ -471,7 +460,11 @@ impl Vfs for LocalFs {
         // the lock (and the Arc, which closes the fd) before doing I/O.
         let (rel, is_dir, delete_on_close) = {
             let handle = handle_arc.lock().await;
-            (handle.rel_path.clone(), handle.is_directory, handle.delete_on_close)
+            (
+                handle.rel_path.clone(),
+                handle.is_directory,
+                handle.delete_on_close,
+            )
         };
         // handle_arc is dropped here, closing the fd.
         drop(handle_arc);
@@ -515,11 +508,7 @@ impl Vfs for LocalFs {
         Ok(())
     }
 
-    async fn query_info(
-        &self,
-        open: OpenId,
-        _class: InfoClass,
-    ) -> Result<FileInfo, VfsError> {
+    async fn query_info(&self, open: OpenId, _class: InfoClass) -> Result<FileInfo, VfsError> {
         let handle = {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
@@ -541,18 +530,14 @@ impl Vfs for LocalFs {
             attributes: attrs,
             size,
             allocation_size: size,
-            creation_time: system_time_to_filetime(
-                meta.created().unwrap_or(std::time::UNIX_EPOCH),
-            ),
+            creation_time: system_time_to_filetime(meta.created().unwrap_or(std::time::UNIX_EPOCH)),
             last_access_time: system_time_to_filetime(
                 meta.accessed().unwrap_or(std::time::UNIX_EPOCH),
             ),
             last_write_time: system_time_to_filetime(
                 meta.modified().unwrap_or(std::time::UNIX_EPOCH),
             ),
-            change_time: system_time_to_filetime(
-                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-            ),
+            change_time: system_time_to_filetime(meta.modified().unwrap_or(std::time::UNIX_EPOCH)),
             file_name,
         })
     }
@@ -608,8 +593,8 @@ impl Vfs for LocalFs {
         //   not persisted (Phase 2.8 partial).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             use cap_std::fs::PermissionsExt as CapPermissionsExt;
+            use std::os::unix::fs::PermissionsExt;
             let readonly = info.attributes.read_only;
             // Only apply attribute changes when the caller is setting
             // FileBasicInfo (class 4). For other classes, skip to avoid
@@ -675,7 +660,11 @@ impl Vfs for LocalFs {
                 .map_err(|e| VfsError::Io(format!("read_dir: {e}")))?
         };
 
-        let cap = if max_results == 0 { usize::MAX } else { max_results };
+        let cap = if max_results == 0 {
+            usize::MAX
+        } else {
+            max_results
+        };
         for entry in read_dir {
             let entry = entry.map_err(|e| VfsError::Io(format!("dir entry: {e}")))?;
             let name = entry.file_name().to_string_lossy().to_string();
@@ -722,7 +711,7 @@ impl Vfs for LocalFs {
             #[cfg(unix)]
             let file_id = {
                 use cap_std::fs::MetadataExt;
-                Some(FileId(meta.ino() as u64))
+                Some(FileId(meta.ino()))
             };
             #[cfg(not(unix))]
             let file_id = None;
@@ -827,12 +816,7 @@ impl Vfs for LocalFs {
         }
     }
 
-    async fn rename(
-        &self,
-        open: OpenId,
-        new_path: &str,
-        replace: bool,
-    ) -> Result<(), VfsError> {
+    async fn rename(&self, open: OpenId, new_path: &str, replace: bool) -> Result<(), VfsError> {
         let handle = {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
@@ -1036,7 +1020,9 @@ mod tests {
     async fn test_open_missing_fails() {
         let dir = tmp_root();
         let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
-        let result = fs.create("", "nope.txt", &CreateArgs::open_readonly()).await;
+        let result = fs
+            .create("", "nope.txt", &CreateArgs::open_readonly())
+            .await;
         assert!(matches!(result, Err(VfsError::NotFound)));
     }
 
@@ -1088,7 +1074,9 @@ mod tests {
         fs.close(open).await.unwrap();
 
         // Open with different case — should fail with NotFound.
-        let result = fs.create("", "myfile.txt", &CreateArgs::open_readonly()).await;
+        let result = fs
+            .create("", "myfile.txt", &CreateArgs::open_readonly())
+            .await;
         assert!(matches!(result, Err(VfsError::NotFound)));
     }
 
@@ -1142,10 +1130,7 @@ mod tests {
         };
         let open = fs.create("", "info.txt", &create).await.unwrap();
         fs.write_at(open, 0, b"abc").await.unwrap();
-        let info = fs
-            .query_info(open, InfoClass::FileBasicInfo)
-            .await
-            .unwrap();
+        let info = fs.query_info(open, InfoClass::FileBasicInfo).await.unwrap();
         assert_eq!(info.size, 3);
         assert!(!info.attributes.directory);
         assert!(!info.file_name.is_empty());
@@ -1244,10 +1229,7 @@ mod tests {
         };
         let open = fs.create("", "old.txt", &create).await.unwrap();
         fs.rename(open, "new.txt", false).await.unwrap();
-        let info = fs
-            .query_info(open, InfoClass::FileBasicInfo)
-            .await
-            .unwrap();
+        let info = fs.query_info(open, InfoClass::FileBasicInfo).await.unwrap();
         assert_eq!(info.file_name, "new.txt");
         fs.close(open).await.unwrap();
         let result = fs.create("", "old.txt", &CreateArgs::open_readonly()).await;
@@ -1320,12 +1302,25 @@ mod tests {
             ..CreateArgs::open_readonly()
         };
         let open = fs.create("", "lock.txt", &create).await.unwrap();
-        fs.lock(open, LockRange { offset: 0, length: 10 }, true)
-            .await
-            .unwrap();
-        fs.unlock(open, LockRange { offset: 0, length: 10 })
-            .await
-            .unwrap();
+        fs.lock(
+            open,
+            LockRange {
+                offset: 0,
+                length: 10,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        fs.unlock(
+            open,
+            LockRange {
+                offset: 0,
+                length: 10,
+            },
+        )
+        .await
+        .unwrap();
         fs.close(open).await.unwrap();
     }
 

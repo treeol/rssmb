@@ -5,7 +5,7 @@
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{PosMarker, SizedWideString, SizedStringSize};
+use crate::dtyp::{PosMarker, SizedStringSize, SizedWideString};
 
 /// SMB2 TREE_CONNECT Request.
 ///
@@ -73,16 +73,12 @@ pub struct TreeConnectResponse {
 /// MS-SMB2 2.2.10
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
 #[brw(repr(u8))]
+#[derive(Default)]
 pub enum ShareType {
+    #[default]
     Disk = 0x1,
     Pipe = 0x2,
     Print = 0x3,
-}
-
-impl Default for ShareType {
-    fn default() -> Self {
-        ShareType::Disk
-    }
 }
 
 /// Share flags indicating various share properties.
@@ -191,7 +187,6 @@ mod tests {
             share_flags: ShareFlags::new().with_encrypt_data(true),
             capabilities: TreeCapabilities::new(),
             maximal_access: 0x001f_01ff,
-            ..Default::default()
         };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();
@@ -231,9 +226,7 @@ mod tests {
 
     #[test]
     fn test_share_flags_roundtrip() {
-        let flags = ShareFlags::new()
-            .with_encrypt_data(true)
-            .with_dfs(true);
+        let flags = ShareFlags::new().with_encrypt_data(true).with_dfs(true);
         let mut buf = Cursor::new(Vec::new());
         flags.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();
@@ -247,9 +240,7 @@ mod tests {
 
     #[test]
     fn test_tree_capabilities_roundtrip() {
-        let caps = TreeCapabilities::new()
-            .with_dfs(true)
-            .with_scaleout(true);
+        let caps = TreeCapabilities::new().with_dfs(true).with_scaleout(true);
         let mut buf = Cursor::new(Vec::new());
         caps.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();

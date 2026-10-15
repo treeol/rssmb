@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn test_cancel_roundtrip() {
-        let req = CancelRequest { reserved: 0, ..Default::default() };
+        let req = CancelRequest { reserved: 0 };
         let mut buf = Cursor::new(Vec::new());
         req.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();

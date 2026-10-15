@@ -21,13 +21,15 @@
 //! - Encryption (GCM)
 //! - File I/O round-trips
 //! - Tree connect / create / read / write
+//!
 //! These are covered by the impacket-driven live tests in tests/live/.
 
+use binrw::BinWrite;
 use rssmb_proto::{
     header::{Command, Header, HeaderFlags},
     negotiate::{
-        Dialect, GlobalCapabilities, HashAlgorithm, NegotiateRequest,
-        NegotiateSecurityMode, PreauthIntegrityCapabilities,
+        Dialect, GlobalCapabilities, HashAlgorithm, NegotiateRequest, NegotiateSecurityMode,
+        PreauthIntegrityCapabilities,
     },
     plain::{PlainRequest, PlainResponse, RequestContent, ResponseContent},
     Guid,
@@ -35,7 +37,6 @@ use rssmb_proto::{
 use rssmb_server::ServerConfig;
 use rssmb_tests::TestServer;
 use rssmb_wire_adapter::framing::write_netbios_frame;
-use binrw::BinWrite;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -49,13 +50,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Build a NEGOTIATE request for the given dialects.
 fn make_negotiate(dialects: Vec<Dialect>, message_id: u64) -> PlainRequest {
     let negotiate_context_list = if dialects.contains(&Dialect::Smb0311) {
-        Some(vec![
-            PreauthIntegrityCapabilities {
-                hash_algorithms: vec![HashAlgorithm::Sha512],
-                salt: vec![0xab; 32],
-            }
-            .into(),
-        ])
+        Some(vec![PreauthIntegrityCapabilities {
+            hash_algorithms: vec![HashAlgorithm::Sha512],
+            salt: vec![0xab; 32],
+        }
+        .into()])
     } else {
         None
     };
@@ -187,10 +186,7 @@ fn make_config() -> (ServerConfig, tempfile::TempDir) {
 }
 
 /// Send a request and read the response (one frame).
-async fn send_and_recv(
-    stream: &mut TcpStream,
-    req: &PlainRequest,
-) -> Option<PlainResponse> {
+async fn send_and_recv(stream: &mut TcpStream, req: &PlainRequest) -> Option<PlainResponse> {
     let wire = encode_request(req);
     stream.write_all(&wire).await.expect("write request");
     stream.flush().await.expect("flush");
@@ -214,10 +210,7 @@ async fn test_negotiate_smb21() {
 
     let resp = resp.expect("got a response");
     assert_eq!(resp.header.command, Command::Negotiate);
-    assert_eq!(
-        resp.header.status, 0,
-        "negotiate should succeed (status 0)"
-    );
+    assert_eq!(resp.header.status, 0, "negotiate should succeed (status 0)");
     match resp.content {
         ResponseContent::Negotiate(neg) => {
             assert_eq!(
@@ -308,7 +301,12 @@ async fn test_negotiate_max_common_dialect() {
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
     let req = make_negotiate(
-        vec![Dialect::Smb021, Dialect::Smb030, Dialect::Smb0302, Dialect::Smb0311],
+        vec![
+            Dialect::Smb021,
+            Dialect::Smb030,
+            Dialect::Smb0302,
+            Dialect::Smb0311,
+        ],
         0,
     );
     let resp = send_and_recv(&mut stream, &req).await;
@@ -336,7 +334,9 @@ async fn test_echo_after_negotiate() {
 
     // Must negotiate first — the negotiate gate rejects pre-NEGOTIATE commands.
     let neg_req = make_negotiate(vec![Dialect::Smb021], 0);
-    let neg_resp = send_and_recv(&mut stream, &neg_req).await.expect("negotiate response");
+    let neg_resp = send_and_recv(&mut stream, &neg_req)
+        .await
+        .expect("negotiate response");
     assert_eq!(neg_resp.header.command, Command::Negotiate);
     assert_eq!(neg_resp.header.status, 0, "negotiate should succeed");
 
@@ -347,7 +347,10 @@ async fn test_echo_after_negotiate() {
 
     let resp = resp.expect("echo should produce a response");
     assert_eq!(resp.header.command, Command::Echo);
-    assert_eq!(resp.header.status, 0, "echo should succeed after negotiation");
+    assert_eq!(
+        resp.header.status, 0,
+        "echo should succeed after negotiation"
+    );
 }
 
 #[tokio::test]
@@ -368,7 +371,7 @@ async fn test_compound_negotiate_rejected() {
     neg1.write_le(&mut cursor1).unwrap();
     let aligned1 = (buf1.len() + 7) & !7;
     let pad = aligned1 - buf1.len();
-    buf1.extend(std::iter::repeat(0u8).take(pad));
+    buf1.extend(std::iter::repeat_n(0u8, pad));
     let nc = aligned1 as u32;
     buf1[20..24].copy_from_slice(&nc.to_le_bytes());
 
@@ -389,7 +392,10 @@ async fn test_compound_negotiate_rejected() {
 
     // The server should respond with an error (STATUS_INVALID_PARAMETER),
     // not silently drop the connection.
-    assert!(body.is_some(), "compound negotiate should produce a response");
+    assert!(
+        body.is_some(),
+        "compound negotiate should produce a response"
+    );
 
     let resp = decode_response(&body.unwrap());
     assert_eq!(resp.header.command, Command::Negotiate);
@@ -423,10 +429,16 @@ async fn test_smb1_magic_dropped() {
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
-    assert!(resp.is_some(), "server should respond to SMB2 after dropping SMB1");
+    assert!(
+        resp.is_some(),
+        "server should respond to SMB2 after dropping SMB1"
+    );
     let resp = resp.unwrap();
     assert_eq!(resp.header.command, Command::Negotiate);
-    assert_eq!(resp.header.status, 0, "SMB2 negotiate should succeed after SMB1 was dropped");
+    assert_eq!(
+        resp.header.status, 0,
+        "SMB2 negotiate should succeed after SMB1 was dropped"
+    );
 }
 
 #[tokio::test]
@@ -450,10 +462,16 @@ async fn test_bad_magic_dropped() {
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
-    assert!(resp.is_some(), "server should still respond after bad-magic frame");
+    assert!(
+        resp.is_some(),
+        "server should still respond after bad-magic frame"
+    );
     let resp = resp.unwrap();
     assert_eq!(resp.header.command, Command::Negotiate);
-    assert_eq!(resp.header.status, 0, "negotiate after bad magic should succeed");
+    assert_eq!(
+        resp.header.status, 0,
+        "negotiate after bad magic should succeed"
+    );
 }
 
 #[tokio::test]
@@ -485,7 +503,10 @@ async fn test_malformed_body_gets_error_response() {
     let body = body.expect("malformed body should produce an error response");
     let resp = decode_response(&body);
     assert_eq!(resp.header.command, Command::Negotiate);
-    assert_ne!(resp.header.status, 0, "malformed body should yield an error status");
+    assert_ne!(
+        resp.header.status, 0,
+        "malformed body should yield an error status"
+    );
 }
 
 #[tokio::test]
@@ -508,7 +529,10 @@ async fn test_empty_payload_ignored() {
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
-    assert!(resp.is_some(), "server should still respond after empty frame");
+    assert!(
+        resp.is_some(),
+        "server should still respond after empty frame"
+    );
     let resp = resp.unwrap();
     assert_eq!(resp.header.command, Command::Negotiate);
     assert_eq!(resp.header.status, 0);
@@ -555,7 +579,10 @@ async fn test_multiple_negotiates_same_connection() {
     // so the client sees EOF (read returns None).
     let req2 = make_negotiate(vec![Dialect::Smb021], 2);
     let wire = encode_request(&req2);
-    stream.write_all(&wire).await.expect("write second negotiate");
+    stream
+        .write_all(&wire)
+        .await
+        .expect("write second negotiate");
     stream.flush().await.expect("flush");
 
     // The server closes the connection — we should get EOF (None) or
@@ -566,7 +593,10 @@ async fn test_multiple_negotiates_same_connection() {
     // A repeat NEGOTIATE triggers Disconnect → the read loop returns Err
     // → the connection task exits → the TCP connection is closed.
     // The client sees EOF: read_one_frame returns None.
-    assert!(body.is_none(), "second negotiate should disconnect (EOF), got: {body:?}");
+    assert!(
+        body.is_none(),
+        "second negotiate should disconnect (EOF), got: {body:?}"
+    );
 }
 
 #[tokio::test]
@@ -583,5 +613,8 @@ async fn test_server_shutdown_completes() {
 
     // Stop the server — this should complete within a reasonable time.
     let stop_result = timeout(Duration::from_secs(10), server.stop()).await;
-    assert!(stop_result.is_ok(), "server.stop() should complete within 10s");
+    assert!(
+        stop_result.is_ok(),
+        "server.stop() should complete within 10s"
+    );
 }

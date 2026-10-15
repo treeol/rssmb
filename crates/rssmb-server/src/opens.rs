@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use tokio::sync::RwLock;
 
-use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
+use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 
 use thiserror::Error;
 use tracing::{debug, instrument};
@@ -209,8 +209,12 @@ impl OpenTable {
         let mut map = self.opens.write().await;
         if let Some(existing) = map.get(&file_id) {
             // Categorize the new open's desired access into read/write/delete.
-            let new_wants_read = entry.desired_access.read || entry.desired_access.generic_read || entry.desired_access.generic_all;
-            let new_wants_write = entry.desired_access.write || entry.desired_access.generic_write || entry.desired_access.generic_all;
+            let new_wants_read = entry.desired_access.read
+                || entry.desired_access.generic_read
+                || entry.desired_access.generic_all;
+            let new_wants_write = entry.desired_access.write
+                || entry.desired_access.generic_write
+                || entry.desired_access.generic_all;
             let new_wants_delete = entry.desired_access.delete || entry.desired_access.generic_all;
 
             for ex in existing {
@@ -256,8 +260,12 @@ impl OpenTable {
                 }
 
                 // (b) New must share what the existing open wants.
-                let ex_wants_read = ex.desired_access.read || ex.desired_access.generic_read || ex.desired_access.generic_all;
-                let ex_wants_write = ex.desired_access.write || ex.desired_access.generic_write || ex.desired_access.generic_all;
+                let ex_wants_read = ex.desired_access.read
+                    || ex.desired_access.generic_read
+                    || ex.desired_access.generic_all;
+                let ex_wants_write = ex.desired_access.write
+                    || ex.desired_access.generic_write
+                    || ex.desired_access.generic_all;
                 let ex_wants_delete = ex.desired_access.delete || ex.desired_access.generic_all;
 
                 if ex_wants_read && !entry.share_access.read {
@@ -302,7 +310,7 @@ impl OpenTable {
             }
         }
         // No conflict: insert the new open.
-        map.entry(file_id).or_default().push(entry.clone());
+        map.entry(file_id).or_default().push(entry);
         // Track delete-pending state.
         if entry.delete_on_close {
             drop(map);
@@ -375,12 +383,7 @@ impl OpenTable {
     /// the delete-on-close disposition. If the open is not found, this is
     /// a no-op (the caller may have already closed it).
     #[instrument(skip(self, file_id))]
-    pub async fn update_delete_on_close(
-        &self,
-        file_id: FileId,
-        open_id: OpenId,
-        delete: bool,
-    ) {
+    pub async fn update_delete_on_close(&self, file_id: FileId, open_id: OpenId, delete: bool) {
         let mut map = self.opens.write().await;
         if let Some(vec) = map.get_mut(&file_id) {
             if let Some(entry) = vec.iter_mut().find(|e| e.open_id == open_id) {
@@ -511,6 +514,7 @@ impl OpenTable {
     /// (even shared) conflicts. For a shared lock, only an overlapping
     /// exclusive lock by a different open conflicts.
     #[instrument(skip(self, file_id, owner_open_id))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn acquire_range_lock(
         &self,
         file_id: FileId,
@@ -572,9 +576,7 @@ impl OpenTable {
         let mut locks = self.range_locks.write().await;
         if let Some(list) = locks.get_mut(&file_id) {
             list.retain(|l| {
-                !(l.open_id == owner_open_id
-                    && l.offset == offset
-                    && l.length == length)
+                !(l.open_id == owner_open_id && l.offset == offset && l.length == length)
             });
             if list.is_empty() {
                 locks.remove(&file_id);
@@ -594,7 +596,11 @@ impl OpenTable {
                 let before = list.len();
                 list.retain(|l| l.open_id != owner_open_id);
                 released += before - list.len();
-                if list.is_empty() { Some(*fid) } else { None }
+                if list.is_empty() {
+                    Some(*fid)
+                } else {
+                    None
+                }
             })
             .collect();
         for key in empty_keys {
@@ -615,7 +621,11 @@ impl OpenTable {
                 let before = list.len();
                 list.retain(|l| l.tree_id != tree_id);
                 released += before - list.len();
-                if list.is_empty() { Some(*fid) } else { None }
+                if list.is_empty() {
+                    Some(*fid)
+                } else {
+                    None
+                }
             })
             .collect();
         for key in empty_keys {
@@ -636,7 +646,11 @@ impl OpenTable {
                 let before = list.len();
                 list.retain(|l| l.session_id != session_id);
                 released += before - list.len();
-                if list.is_empty() { Some(*fid) } else { None }
+                if list.is_empty() {
+                    Some(*fid)
+                } else {
+                    None
+                }
             })
             .collect();
         for key in empty_keys {
@@ -655,7 +669,8 @@ impl Default for OpenTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
+    use proptest::prelude::*;
+    use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 
     fn fid(n: u64) -> FileId {
         FileId(n)
@@ -685,7 +700,12 @@ mod tests {
 
     /// Like `entry` but with explicit desired access (for tests that need
     /// share and desired to differ).
-    fn entry_da(open_id: u64, session_id: u64, share: ShareAccess, desired: DesiredAccess) -> OpenEntry {
+    fn entry_da(
+        open_id: u64,
+        session_id: u64,
+        share: ShareAccess,
+        desired: DesiredAccess,
+    ) -> OpenEntry {
         OpenEntry {
             open_id: oid(open_id),
             session_id,
@@ -700,7 +720,10 @@ mod tests {
     async fn add_first_open_succeeds() {
         let table = OpenTable::new();
         let e = entry(1, 100, ShareAccess::all());
-        table.check_and_add(fid(1), e).await.expect("first open always succeeds");
+        table
+            .check_and_add(fid(1), e)
+            .await
+            .expect("first open always succeeds");
         assert_eq!(table.count(fid(1)).await, 1);
     }
 
@@ -716,9 +739,13 @@ mod tests {
         // Bidirectional: existing wants read → new shares read (yes).
         // New wants read → existing shares read (yes). OK.
         let new_entry = entry_da(
-            2, 200,
+            2,
+            200,
             ShareAccess::all(),
-            DesiredAccess { read: true, ..Default::default() },
+            DesiredAccess {
+                read: true,
+                ..Default::default()
+            },
         );
         table
             .check_and_add(fid(1), new_entry)
@@ -734,13 +761,32 @@ mod tests {
         table
             .check_and_add(
                 fid(1),
-                entry(1, 100, ShareAccess { read: false, write: true, delete: true }),
+                entry(
+                    1,
+                    100,
+                    ShareAccess {
+                        read: false,
+                        write: true,
+                        delete: true,
+                    },
+                ),
             )
             .await
             .unwrap();
         // New open wants read (share_access.read = true).
         let err = table
-            .check_and_add(fid(1), entry(2, 200, ShareAccess { read: true, write: false, delete: false }))
+            .check_and_add(
+                fid(1),
+                entry(
+                    2,
+                    200,
+                    ShareAccess {
+                        read: true,
+                        write: false,
+                        delete: false,
+                    },
+                ),
+            )
             .await
             .expect_err("read should be denied");
         match err {
@@ -763,13 +809,32 @@ mod tests {
         table
             .check_and_add(
                 fid(2),
-                entry(1, 100, ShareAccess { read: true, write: false, delete: true }),
+                entry(
+                    1,
+                    100,
+                    ShareAccess {
+                        read: true,
+                        write: false,
+                        delete: true,
+                    },
+                ),
             )
             .await
             .unwrap();
         // New open wants write.
         let err = table
-            .check_and_add(fid(2), entry(2, 200, ShareAccess { read: false, write: true, delete: false }))
+            .check_and_add(
+                fid(2),
+                entry(
+                    2,
+                    200,
+                    ShareAccess {
+                        read: false,
+                        write: true,
+                        delete: false,
+                    },
+                ),
+            )
             .await
             .expect_err("write should be denied");
         assert!(matches!(err, OpenConflict::WriteNotShared { .. }));
@@ -781,13 +846,32 @@ mod tests {
         table
             .check_and_add(
                 fid(3),
-                entry(1, 100, ShareAccess { read: true, write: true, delete: false }),
+                entry(
+                    1,
+                    100,
+                    ShareAccess {
+                        read: true,
+                        write: true,
+                        delete: false,
+                    },
+                ),
             )
             .await
             .unwrap();
         // New open wants delete.
         let err = table
-            .check_and_add(fid(3), entry(2, 200, ShareAccess { read: false, write: false, delete: true }))
+            .check_and_add(
+                fid(3),
+                entry(
+                    2,
+                    200,
+                    ShareAccess {
+                        read: false,
+                        write: false,
+                        delete: true,
+                    },
+                ),
+            )
             .await
             .expect_err("delete should be denied");
         assert!(matches!(err, OpenConflict::DeleteNotShared { .. }));
@@ -865,7 +949,11 @@ mod tests {
             .expect_err("should conflict");
         // The conflict must reference the *existing* open (1, session 300).
         match err {
-            OpenConflict::ReadNotShared { existing_open_id, existing_session_id, .. } => {
+            OpenConflict::ReadNotShared {
+                existing_open_id,
+                existing_session_id,
+                ..
+            } => {
                 assert_eq!(existing_open_id, oid(1));
                 assert_eq!(existing_session_id, 300);
             }
@@ -883,24 +971,35 @@ mod tests {
         table.check_and_add(fid(8), first).await.unwrap();
         // Second open: shares everything except read, wants nothing.
         let second = entry_da(
-            2, 200,
-            ShareAccess { read: false, write: true, delete: true },
+            2,
+            200,
+            ShareAccess {
+                read: false,
+                write: true,
+                delete: true,
+            },
             DesiredAccess::default(),
         );
         table.check_and_add(fid(8), second).await.unwrap();
         // New open: shares all, wants only read. (a): new wants read,
         // open 2 doesn't share read → conflict.
         let new_entry = entry_da(
-            3, 300,
+            3,
+            300,
             ShareAccess::all(),
-            DesiredAccess { read: true, ..Default::default() },
+            DesiredAccess {
+                read: true,
+                ..Default::default()
+            },
         );
         let err = table
             .check_and_add(fid(8), new_entry)
             .await
             .expect_err("should conflict with open 2");
         match err {
-            OpenConflict::ReadNotShared { existing_open_id, .. } => {
+            OpenConflict::ReadNotShared {
+                existing_open_id, ..
+            } => {
                 assert_eq!(existing_open_id, oid(2));
             }
             other => panic!("expected ReadNotShared, got {other:?}"),
@@ -946,9 +1045,13 @@ mod tests {
         // New open: shares all, wants only read. Existing shares all → (a) OK.
         // Existing wants R/W/D → new shares all → (b) OK.
         let new_entry = entry_da(
-            2, 200,
+            2,
+            200,
             ShareAccess::all(),
-            DesiredAccess { read: true, ..Default::default() },
+            DesiredAccess {
+                read: true,
+                ..Default::default()
+            },
         );
         table
             .check_and_add(fid(10), new_entry)
@@ -964,24 +1067,37 @@ mod tests {
         table.check_and_add(fid(11), first).await.unwrap();
         // Second open: shares read+delete but NOT write, wants nothing.
         let second = entry_da(
-            2, 200,
-            ShareAccess { read: true, write: false, delete: true },
+            2,
+            200,
+            ShareAccess {
+                read: true,
+                write: false,
+                delete: true,
+            },
             DesiredAccess::default(),
         );
         table.check_and_add(fid(11), second).await.unwrap();
         // New open: shares all, wants only write. (b) checks pass (new
         // shares all). (a): new wants write, open 2 doesn't share write.
         let new_entry = entry_da(
-            3, 300,
+            3,
+            300,
             ShareAccess::all(),
-            DesiredAccess { write: true, ..Default::default() },
+            DesiredAccess {
+                write: true,
+                ..Default::default()
+            },
         );
         let err = table
             .check_and_add(fid(11), new_entry)
             .await
             .expect_err("write should be blocked by open 2");
         match err {
-            OpenConflict::WriteNotShared { existing_open_id, existing_session_id, .. } => {
+            OpenConflict::WriteNotShared {
+                existing_open_id,
+                existing_session_id,
+                ..
+            } => {
                 assert_eq!(existing_open_id, oid(2));
                 assert_eq!(existing_session_id, 200);
             }
@@ -1077,7 +1193,10 @@ mod tests {
             session_id: 100,
             tree_id: 1,
             share_access: ShareAccess::all(),
-            desired_access: DesiredAccess { read: true, ..Default::default() },
+            desired_access: DesiredAccess {
+                read: true,
+                ..Default::default()
+            },
             delete_on_close: false,
         };
         table.check_and_add(fid(40), existing).await.unwrap();
@@ -1424,5 +1543,97 @@ mod tests {
             .check_range_lock(fid(1), oid(2), 0, 0)
             .await
             .expect("zero-length read never conflicts");
+    }
+
+    // ---- Property tests (Phase 6.4) ----
+
+    proptest! {
+        #[test]
+        fn prop_exclusive_locks_conflict_on_overlap(
+            offset1 in 0u64..=1024,
+            len1 in 1u64..=1024,
+            offset2 in 0u64..=1024,
+            len2 in 1u64..=1024,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let overlap_conflict: Option<()> = rt.block_on(async {
+                let table = OpenTable::new();
+                table
+                    .acquire_range_lock(fid(1), oid(1), 100, 1, offset1, len1, true)
+                    .await
+                    .unwrap();
+                let result = table
+                    .acquire_range_lock(fid(1), oid(2), 200, 1, offset2, len2, true)
+                    .await;
+                let overlap = offset1 < offset2.saturating_add(len2)
+                    && offset2 < offset1.saturating_add(len1);
+                if overlap && result.is_ok() {
+                    return Some(());
+                }
+                None
+            });
+            if let Some(()) = overlap_conflict {
+                prop_assert!(false, "overlapping exclusive locks should conflict");
+            }
+        }
+
+        #[test]
+        fn prop_shared_lock_no_read_conflict_same_owner(
+            offset in 0u64..=1024,
+            len in 0u64..=1024,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let conflict: Option<String> = rt.block_on(async {
+                let table = OpenTable::new();
+                table
+                    .acquire_range_lock(fid(1), oid(1), 100, 1, offset, len, false)
+                    .await
+                    .unwrap();
+                match table.check_range_lock(fid(1), oid(1), 0, len).await {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("same-owner read conflicted: {:?}", e)),
+                }
+            });
+            if let Some(msg) = conflict {
+                prop_assert!(false, "{}", msg);
+            }
+        }
+
+        #[test]
+        fn prop_zero_length_no_conflict(
+            offset1 in 0u64..=1024,
+            offset2 in 0u64..=1024,
+            len2 in 1u64..=1024,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let conflict: Option<String> = rt.block_on(async {
+                let table = OpenTable::new();
+                // Zero-length locks always return Err(ZeroLength) and are
+                // never stored — so a subsequent lock should never see them.
+                let _ = table
+                    .acquire_range_lock(fid(1), oid(1), 100, 1, offset1, 0, true)
+                    .await;
+                match table.acquire_range_lock(fid(1), oid(2), 200, 1, offset2, len2, true).await {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("zero-length lock blocked other: {:?}", e)),
+                }
+            });
+            if let Some(msg) = conflict {
+                prop_assert!(false, "{}", msg);
+            }
+        }
+
+        #[test]
+        fn prop_release_never_panics(
+            offset in 0u64..=1024,
+            len in 0u64..=1024,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let table = OpenTable::new();
+                table.release_range_lock(fid(1), oid(1), offset, len).await;
+                table.release_range_lock(fid(1), oid(1), offset, len).await;
+            });
+        }
     }
 }

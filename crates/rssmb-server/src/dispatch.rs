@@ -13,22 +13,22 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use rssmb_wire_adapter::{FramedMessage, FramedResponse, NtStatus};
 use rssmb_proto::header::{Command, Header, HeaderFlags};
 use rssmb_proto::negotiate::{
     Dialect as WireDialect, EncryptionCipher, GlobalCapabilities, NegotiateDialect,
     NegotiateResponse, NegotiateSecurityMode,
 };
 use rssmb_proto::plain::{PlainResponse, RequestContent, ResponseContent};
+use rssmb_wire_adapter::{FramedMessage, FramedResponse, NtStatus};
 
+use rssmb_proto::info::InfoType;
 use rssmb_proto::FileTime;
 use rssmb_proto::Guid;
-use rssmb_proto::info::InfoType;
 
-use crate::session::Session;
-use crate::ServerState;
 use crate::config::DialectConfig;
 use crate::opens;
+use crate::session::Session;
+use crate::ServerState;
 
 /// Negotiated MaxTransact/MaxRead/MaxWriteSize. Now 1 MiB: multi-credit
 /// accounting (CreditCharge = ceil(len/64K) validated against the MessageId
@@ -124,7 +124,8 @@ pub struct ConnState {
     /// Per-session preauth integrity hashes (3.1.1 only).
     /// Session.H starts as a fork of Conn.H; updated with each
     /// SESSION_SETUP request and each MORE_PROCESSING response.
-    pub preauth_sessions: std::sync::Arc<std::sync::Mutex<HashMap<u64, crate::crypto::PreauthHashValue>>>,
+    pub preauth_sessions:
+        std::sync::Arc<std::sync::Mutex<HashMap<u64, crate::crypto::PreauthHashValue>>>,
     /// Directive from a handler: "hash the next encoded response into the
     /// preauth hash" (set by NEGOTIATE and SESSION_SETUP MORE_PROCESSING).
     /// `Conn` → hash into preauth_conn; `Session(sid)` → hash into preauth_sessions[sid].
@@ -290,7 +291,7 @@ pub fn select_dialect(
         if dc < effective_min || dc > effective_max {
             continue; // Outside configured range.
         }
-        if best.map_or(true, |b| dc > b) {
+        if best.is_none_or(|b| dc > b) {
             best = Some(dc);
         }
     }
@@ -347,7 +348,9 @@ pub async fn handle_message(
     was_encrypted: Option<u64>,
 ) -> Option<FramedResponse> {
     match msg {
-        FramedMessage::Plain(req) => handle_plain(state, conn_state, req, raw_frame, was_encrypted).await,
+        FramedMessage::Plain(req) => {
+            handle_plain(state, conn_state, req, raw_frame, was_encrypted).await
+        }
         FramedMessage::Compound(requests) => {
             handle_compound(state, conn_state, requests, raw_frame, was_encrypted).await
         }
@@ -357,18 +360,27 @@ pub async fn handle_message(
             // with SMB2. Returning an SMB2 error response here would be
             // misinterpreted by some clients as a truncated SMB2 negotiate
             // response, causing a parse failure instead of a clean fallback.
-            debug!(conn_id = conn_state.conn_id, "SMB1 negotiate — dropping (SMB2-only server)");
+            debug!(
+                conn_id = conn_state.conn_id,
+                "SMB1 negotiate — dropping (SMB2-only server)"
+            );
             None
         }
         FramedMessage::Encrypted(_) => {
             // Encryption is handled in the connection read loop (decrypt
             // before parse). Reaching here means the frame was not decrypted
             // — disconnect.
-            debug!(conn_id = conn_state.conn_id, "encrypted frame reached dispatch — should not happen");
+            debug!(
+                conn_id = conn_state.conn_id,
+                "encrypted frame reached dispatch — should not happen"
+            );
             Some(FramedResponse::Disconnect)
         }
         FramedMessage::Compressed(_) => {
-            debug!(conn_id = conn_state.conn_id, "compressed frame — not supported yet");
+            debug!(
+                conn_id = conn_state.conn_id,
+                "compressed frame — not supported yet"
+            );
             Some(FramedResponse::Error {
                 command: Command::Negotiate,
                 status: NtStatus::NotSupported,
@@ -414,11 +426,11 @@ async fn handle_compound(
         // for 3.1.1 (Mashūra plan review §1): in a compound, the response
         // bytes of the first member are not available for hashing before the
         // second member is dispatched.
-        if req.header.command == Command::Negotiate
-            || req.header.command == Command::SessionSetup
-        {
-            if let Err(FramedResponse::Disconnect) = charge_credits(conn_state, &req.header) {
-                return Some(FramedResponse::Disconnect);
+        if req.header.command == Command::Negotiate || req.header.command == Command::SessionSetup {
+            if let Err(boxed) = charge_credits(conn_state, &req.header) {
+                if let FramedResponse::Disconnect = *boxed {
+                    return Some(FramedResponse::Disconnect);
+                }
             }
             return Some(FramedResponse::Plain(error_plain_response(
                 &req.header,
@@ -437,8 +449,10 @@ async fn handle_compound(
         // here, since `handle_plain` (which charges the rest) is skipped.
         let skips_handler = (is_related && i == 0) || (is_related && propagated_status.is_some());
         if skips_handler && req.header.command != Command::Cancel {
-            if let Err(FramedResponse::Disconnect) = charge_credits(conn_state, &saved_header) {
-                return Some(FramedResponse::Disconnect);
+            if let Err(boxed) = charge_credits(conn_state, &saved_header) {
+                if let FramedResponse::Disconnect = *boxed {
+                    return Some(FramedResponse::Disconnect);
+                }
             }
         }
 
@@ -446,7 +460,10 @@ async fn handle_compound(
             // MS-SMB2: first request in a chain MUST NOT have RELATED set.
             // Fail this one and propagate to all remaining members.
             propagated_status = Some(NtStatus::InvalidParameter.to_u32());
-            responses.push((false, error_plain_response(&saved_header, NtStatus::InvalidParameter.to_u32())));
+            responses.push((
+                false,
+                error_plain_response(&saved_header, NtStatus::InvalidParameter.to_u32()),
+            ));
             continue;
         }
 
@@ -456,8 +473,16 @@ async fn handle_compound(
         // We must carry these into error responses so the signing layer
         // can resolve the correct session key — using the saved_header's
         // SessionId would give the original (possibly placeholder) value.
-        let effective_session_id = if is_related { inherited_session_id } else { saved_header.session_id };
-        let effective_tree_id = if is_related { inherited_tree_id } else { saved_header.tree_id };
+        let effective_session_id = if is_related {
+            inherited_session_id
+        } else {
+            saved_header.session_id
+        };
+        let effective_tree_id = if is_related {
+            inherited_tree_id
+        } else {
+            saved_header.tree_id
+        };
 
         if is_related {
             // Inherit SessionId and TreeId from the previous request's response.
@@ -472,9 +497,15 @@ async fn handle_compound(
             // Failure propagation: if a previous related request failed with
             // an error-severity status, this one gets the same status.
             if let Some(status) = propagated_status {
-                responses.push((true, error_plain_response_with_ids(
-                    &saved_header, status, effective_session_id, effective_tree_id,
-                )));
+                responses.push((
+                    true,
+                    error_plain_response_with_ids(
+                        &saved_header,
+                        status,
+                        effective_session_id,
+                        effective_tree_id,
+                    ),
+                ));
                 continue;
             }
         } else {
@@ -525,18 +556,33 @@ async fn handle_compound(
                 inherited_tree_id = effective_tree_id;
                 // Error responses always have error severity.
                 propagated_status = Some(status.to_u32());
-                responses.push((is_related, error_plain_response_with_ids(
-                    &saved_header, status.to_u32(), effective_session_id, effective_tree_id,
-                )));
+                responses.push((
+                    is_related,
+                    error_plain_response_with_ids(
+                        &saved_header,
+                        status.to_u32(),
+                        effective_session_id,
+                        effective_tree_id,
+                    ),
+                ));
             }
             Some(_) => {
-                tracing::warn!(conn_id = conn_state.conn_id, "unexpected response type in compound");
+                tracing::warn!(
+                    conn_id = conn_state.conn_id,
+                    "unexpected response type in compound"
+                );
                 inherited_session_id = effective_session_id;
                 inherited_tree_id = effective_tree_id;
                 propagated_status = Some(NtStatus::InvalidParameter.to_u32());
-                responses.push((is_related, error_plain_response_with_ids(
-                    &saved_header, NtStatus::InvalidParameter.to_u32(), effective_session_id, effective_tree_id,
-                )));
+                responses.push((
+                    is_related,
+                    error_plain_response_with_ids(
+                        &saved_header,
+                        NtStatus::InvalidParameter.to_u32(),
+                        effective_session_id,
+                        effective_tree_id,
+                    ),
+                ));
             }
             None => {
                 // No response (e.g. ServerToClientNotification) — skip.
@@ -560,7 +606,9 @@ async fn handle_compound(
         .collect();
 
     if plain_responses.len() == 1 {
-        Some(FramedResponse::Plain(plain_responses.into_iter().next().unwrap()))
+        Some(FramedResponse::Plain(
+            plain_responses.into_iter().next().unwrap(),
+        ))
     } else {
         Some(FramedResponse::Compound(plain_responses))
     }
@@ -584,9 +632,7 @@ fn error_plain_response(req_header: &Header, status: u32) -> PlainResponse {
             session_id: req_header.session_id,
             signature: 0,
         },
-        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
-            error_data: vec![],
-        }),
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
     }
 }
 
@@ -616,14 +662,15 @@ fn error_plain_response_with_ids(
             session_id,
             signature: 0,
         },
-        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
-            error_data: vec![],
-        }),
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
     }
 }
 
 /// Replace FileId 0xFFFF...FFFF with the given FileId in a request's content.
-fn substitute_file_id(req: &mut rssmb_proto::plain::PlainRequest, fid: rssmb_proto::create::FileId) {
+fn substitute_file_id(
+    req: &mut rssmb_proto::plain::PlainRequest,
+    fid: rssmb_proto::create::FileId,
+) {
     let placeholder = rssmb_proto::create::FileId {
         persistent: u64::MAX,
         volatile: u64::MAX,
@@ -669,10 +716,8 @@ fn substitute_file_id(req: &mut rssmb_proto::plain::PlainRequest, fid: rssmb_pro
                 io.file_id = fid;
             }
         }
-        RequestContent::Lock(l) => {
-            if l.file_id == placeholder {
-                l.file_id = fid;
-            }
+        RequestContent::Lock(l) if l.file_id == placeholder => {
+            l.file_id = fid;
         }
         _ => {}
     }
@@ -690,18 +735,36 @@ fn substitute_file_id(req: &mut rssmb_proto::plain::PlainRequest, fid: rssmb_pro
 ///   (MS-SMB2 3.3.5.2.3) → `Err(Disconnect)`: terminate the connection.
 /// - Affordable but above our local cap (256, policy rather than a protocol
 ///   limit) → `Err(INVALID_PARAMETER reply)`; the credits are still spent.
-fn charge_credits(conn_state: &ConnState, header: &Header) -> Result<(), FramedResponse> {
+fn charge_credits(conn_state: &ConnState, header: &Header) -> Result<(), Box<FramedResponse>> {
     use rssmb_wire_adapter::credits::CreditError;
-    match conn_state.credits.check_and_deduct(header.message_id, header.credit_charge.max(1) as u32) {
+    match conn_state
+        .credits
+        .check_and_deduct(header.message_id, header.credit_charge.max(1) as u32)
+    {
         Ok(()) => Ok(()),
-        Err(CreditError::InsufficientCredits { available, requested }) => {
-            tracing::warn!(conn_id = conn_state.conn_id, available, requested,
-                message_id = header.message_id, "request outside credit window — terminating connection");
-            Err(FramedResponse::Disconnect)
+        Err(CreditError::InsufficientCredits {
+            available,
+            requested,
+        }) => {
+            tracing::warn!(
+                conn_id = conn_state.conn_id,
+                available,
+                requested,
+                message_id = header.message_id,
+                "request outside credit window — terminating connection"
+            );
+            Err(Box::new(FramedResponse::Disconnect))
         }
         Err(CreditError::ExcessiveCharge(charge)) => {
-            debug!(conn_id = conn_state.conn_id, charge, "credit charge above local cap — rejecting");
-            Err(error_response_for(header.command, NtStatus::InvalidParameter, header))
+            debug!(
+                conn_id = conn_state.conn_id,
+                charge, "credit charge above local cap — rejecting"
+            );
+            Err(Box::new(error_response_for(
+                header.command,
+                NtStatus::InvalidParameter,
+                header,
+            )))
         }
     }
 }
@@ -735,8 +798,10 @@ async fn handle_plain(
     if command == Command::Negotiate {
         let rec = conn_state.negotiate_record.lock().await;
         if rec.is_some() {
-            warn!(conn_id = conn_state.conn_id,
-                "repeat NEGOTIATE — terminating connection");
+            warn!(
+                conn_id = conn_state.conn_id,
+                "repeat NEGOTIATE — terminating connection"
+            );
             return Some(FramedResponse::Disconnect);
         }
     } else {
@@ -755,9 +820,7 @@ async fn handle_plain(
     // NEGOTIATE (no session) and SESSION_SETUP (establishing the session).
     // ECHO, LOGOFF, CANCEL — all checked, per Samba (enforces on every
     // command that names an existing session).
-    if was_encrypted.is_none()
-        && command != Command::Negotiate
-        && command != Command::SessionSetup
+    if was_encrypted.is_none() && command != Command::Negotiate && command != Command::SessionSetup
     {
         let sid = req.header.session_id;
         if sid != 0 {
@@ -769,7 +832,11 @@ async fn handle_plain(
                 // Session-level encrypt_data: reject.
                 debug!(conn_id = conn_state.conn_id, session_id = sid,
                     command = %command, "unencrypted request on encrypt_data session — denying");
-                return Some(error_response_for(command, NtStatus::AccessDenied, &req.header));
+                return Some(error_response_for(
+                    command,
+                    NtStatus::AccessDenied,
+                    &req.header,
+                ));
             }
             // Tree-level encrypt_data: check if the tree requires encryption.
             if let Some(tid) = req.header.tree_id {
@@ -781,7 +848,11 @@ async fn handle_plain(
                     debug!(conn_id = conn_state.conn_id, session_id = sid,
                         tree_id = tid, command = %command,
                         "unencrypted request on encrypt_data tree — denying");
-                    return Some(error_response_for(command, NtStatus::AccessDenied, &req.header));
+                    return Some(error_response_for(
+                        command,
+                        NtStatus::AccessDenied,
+                        &req.header,
+                    ));
                 }
             }
         }
@@ -794,16 +865,20 @@ async fn handle_plain(
     }
 
     if let Err(resp) = charge_credits(conn_state, &req.header) {
-        return Some(resp);
+        return Some(*resp);
     }
 
     match command {
         Command::Negotiate => Some(handle_negotiate(state, conn_state, req, raw_frame).await),
-        Command::SessionSetup => Some(handle_session_setup(state, conn_state, req, raw_frame).await),
+        Command::SessionSetup => {
+            Some(handle_session_setup(state, conn_state, req, raw_frame).await)
+        }
         Command::Echo => Some(handle_echo(&req.header)),
         Command::Logoff => Some(handle_logoff(state, conn_state, &req.header).await),
         Command::TreeConnect => Some(handle_tree_connect(state, conn_state, req).await),
-        Command::TreeDisconnect => Some(handle_tree_disconnect(state, conn_state, &req.header).await),
+        Command::TreeDisconnect => {
+            Some(handle_tree_disconnect(state, conn_state, &req.header).await)
+        }
         Command::Create => Some(handle_create(state, conn_state, req, raw_frame).await),
         Command::Close => Some(handle_close(state, conn_state, req).await),
         Command::Read => Some(handle_read(state, conn_state, req).await),
@@ -818,7 +893,11 @@ async fn handle_plain(
         Command::ServerToClientNotification => None,
         other => {
             debug!(conn_id = conn_state.conn_id, command = %other, "unsupported command");
-            Some(error_response_for(other, NtStatus::NotSupported, &req.header))
+            Some(error_response_for(
+                other,
+                NtStatus::NotSupported,
+                &req.header,
+            ))
         }
     }
 }
@@ -902,14 +981,15 @@ async fn handle_negotiate(
     // Always sent — real-user NTLM must work whether or not guests are on.
     let spnego_token = {
         vec![
-            0x60, 0x1c,                                    // APPLICATION 0, length 28
+            0x60, 0x1c, // APPLICATION 0, length 28
             0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, // OID SPNEGO (1.3.6.1.5.5.2)
-            0xa0, 0x12,                                    // [0] negTokenInit, length 18
-            0x30, 0x10,                                    // SEQUENCE, length 16
-            0xa0, 0x0e,                                    // [0] mechTypeList, length 14
-            0x30, 0x0c,                                    // SEQUENCE OF, length 12
-            0x06, 0x0a,                                    // OID, length 10
-            0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a, // NTLMSSP OID (1.3.6.1.4.1.311.2.2.10)
+            0xa0, 0x12, // [0] negTokenInit, length 18
+            0x30, 0x10, // SEQUENCE, length 16
+            0xa0, 0x0e, // [0] mechTypeList, length 14
+            0x30, 0x0c, // SEQUENCE OF, length 12
+            0x06, 0x0a, // OID, length 10
+            0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02,
+            0x0a, // NTLMSSP OID (1.3.6.1.4.1.311.2.2.10)
         ]
     };
 
@@ -964,7 +1044,13 @@ async fn handle_session_setup(
     // Extract the session setup request content
     let session_setup_req = match &req.content {
         RequestContent::SessionSetup(ss) => ss,
-        _ => return error_response_for(Command::SessionSetup, NtStatus::InvalidParameter, &req.header),
+        _ => {
+            return error_response_for(
+                Command::SessionSetup,
+                NtStatus::InvalidParameter,
+                &req.header,
+            )
+        }
     };
 
     // Auth throttle: if the source IP is in cooldown from too many recent
@@ -978,8 +1064,10 @@ async fn handle_session_setup(
                 // Count this as a per-connection failure too — a connection
                 // that keeps trying during cooldown should hit the per-conn
                 // cap and get disconnected, not spin forever.
-                let conn_fails = conn_state.auth_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let conn_fails = conn_state
+                    .auth_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 tracing::warn!(
                     conn_id = conn_state.conn_id,
                     ip = %conn_state.remote_addr,
@@ -987,8 +1075,11 @@ async fn handle_session_setup(
                     "SESSION_SETUP refused — auth cooldown active",
                 );
                 if state.auth_limiter.conn_failure_exceeds(conn_fails) {
-                    warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
-                        "per-connection auth failure cap exceeded — disconnecting");
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        conn_failures = conn_fails,
+                        "per-connection auth failure cap exceeded — disconnecting"
+                    );
                     return FramedResponse::Disconnect;
                 }
                 return error_response_for(
@@ -1003,7 +1094,7 @@ async fn handle_session_setup(
 
     // Get or create auth state
     let mut auth_guard = conn_state.auth_state.lock().await;
-    let auth_state = auth_guard.get_or_insert_with(|| rssmb_auth::AuthState::new());
+    let auth_state = auth_guard.get_or_insert_with(rssmb_auth::AuthState::new);
 
     // Create the NTLM auth provider with server-side credentials from
     // ServerState. The identity store is built once at startup with
@@ -1011,8 +1102,8 @@ async fn handle_session_setup(
     // SESSION_SETUP. Guest fallback is gated on config.guest_access.
     // Guest/anonymous sessions have no key and can never be signed, so
     // `signing = "required"` disables them (as Windows does).
-    let guest_allowed = state.config.guest_access
-        && state.config.signing != crate::config::SigningPolicy::Required;
+    let guest_allowed =
+        state.config.guest_access && state.config.signing != crate::config::SigningPolicy::Required;
     let provider: Box<dyn rssmb_auth::AuthProvider> =
         Box::new(rssmb_auth::NtlmAuthProvider::with_identity_store_and_flags(
             state.identities_snapshot(),
@@ -1039,33 +1130,70 @@ async fn handle_session_setup(
         // Clear stale preauth session entries from abandoned auth attempts.
         conn_state.preauth_sessions.lock().unwrap().clear();
         // SMB 3.1.1: fork the connection preauth hash into a per-session hash.
-        let is_311 = conn_state.negotiate_record.lock().await
-            .as_ref().map(|r| r.dialect == DialectConfig::Smb311).unwrap_or(false);
+        let is_311 = conn_state
+            .negotiate_record
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.dialect == DialectConfig::Smb311)
+            .unwrap_or(false);
         if is_311 {
-            let conn_hash = conn_state.preauth_conn.lock().unwrap().clone();
+            let conn_hash = *conn_state.preauth_conn.lock().unwrap();
             if let Some(ch) = conn_hash {
-                conn_state.preauth_sessions.lock().unwrap().insert(new_id, ch);
+                conn_state
+                    .preauth_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(new_id, ch);
             }
         }
         new_id
-    } else if conn_state.pending_sessions.read().await.contains(&req.header.session_id) {
+    } else if conn_state
+        .pending_sessions
+        .read()
+        .await
+        .contains(&req.header.session_id)
+    {
         req.header.session_id
     } else {
         // Re-authentication of an established session and multichannel
         // binding are not supported — refuse instead of pretending success.
-        let established = conn_state.sessions.read().await.iter().any(|s| s.id == req.header.session_id);
-        debug!(conn_id = conn_state.conn_id, session_id = req.header.session_id, established,
-            "session_setup: not a pending SessionId");
-        let status = if established { NtStatus::NotSupported } else { NtStatus::UserSessionDeleted };
+        let established = conn_state
+            .sessions
+            .read()
+            .await
+            .iter()
+            .any(|s| s.id == req.header.session_id);
+        debug!(
+            conn_id = conn_state.conn_id,
+            session_id = req.header.session_id,
+            established,
+            "session_setup: not a pending SessionId"
+        );
+        let status = if established {
+            NtStatus::NotSupported
+        } else {
+            NtStatus::UserSessionDeleted
+        };
         return error_response_for(Command::SessionSetup, status, &req.header);
     };
 
     // SMB 3.1.1: hash the SESSION_SETUP request into the session's preauth hash.
     {
-        let is_311 = conn_state.negotiate_record.lock().await
-            .as_ref().map(|r| r.dialect == DialectConfig::Smb311).unwrap_or(false);
+        let is_311 = conn_state
+            .negotiate_record
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.dialect == DialectConfig::Smb311)
+            .unwrap_or(false);
         if is_311 {
-            if let Some(h) = conn_state.preauth_sessions.lock().unwrap().get_mut(&session_id) {
+            if let Some(h) = conn_state
+                .preauth_sessions
+                .lock()
+                .unwrap()
+                .get_mut(&session_id)
+            {
                 *h = crate::crypto::preauth_update(h, raw_msg);
             }
         }
@@ -1090,15 +1218,25 @@ async fn handle_session_setup(
             // SMB 3.1.1: hash the MORE_PROCESSING response into the session's
             // preauth hash (done in the connection loop after encode+sign).
             {
-                let is_311 = conn_state.negotiate_record.lock().await
-                    .as_ref().map(|r| r.dialect == DialectConfig::Smb311).unwrap_or(false);
+                let is_311 = conn_state
+                    .negotiate_record
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|r| r.dialect == DialectConfig::Smb311)
+                    .unwrap_or(false);
                 if is_311 {
-                    *conn_state.preauth_hash_response.lock().unwrap() = Some(PreauthTarget::Session(session_id));
+                    *conn_state.preauth_hash_response.lock().unwrap() =
+                        Some(PreauthTarget::Session(session_id));
                 }
             }
             FramedResponse::Plain(response)
         }
-        Ok(rssmb_auth::AuthStep::Complete { output_token, session_key, identity }) => {
+        Ok(rssmb_auth::AuthStep::Complete {
+            output_token,
+            session_key,
+            identity,
+        }) => {
             // Authentication finished. Keep the per-connection auth state
             // alive: Samba/Windows SPNEGO clients send one more round after
             // accept-completed (their mechListMIC for us to verify), and
@@ -1122,11 +1260,18 @@ async fn handle_session_setup(
                 // SPNEGO mic-exchange round: the session was already created
                 // on the previous Complete. The client is sending its
                 // mechListMIC; just return success with an empty token.
-                tracing::debug!(conn_id = conn_state.conn_id, session_id,
-                    "session_setup: SPNEGO mic-exchange round — session already established");
+                tracing::debug!(
+                    conn_id = conn_state.conn_id,
+                    session_id,
+                    "session_setup: SPNEGO mic-exchange round — session already established"
+                );
                 // Clear auth state now — the conversation is truly over.
                 *auth_guard = None;
-                conn_state.pending_sessions.write().await.remove(&session_id);
+                conn_state
+                    .pending_sessions
+                    .write()
+                    .await
+                    .remove(&session_id);
 
                 let resp_token = if !output_token.is_empty() {
                     output_token
@@ -1163,8 +1308,10 @@ async fn handle_session_setup(
                     match &*rec {
                         Some(r) => r.dialect,
                         None => {
-                            warn!(conn_id = conn_state.conn_id,
-                                "SESSION_SETUP without negotiation — disconnecting");
+                            warn!(
+                                conn_id = conn_state.conn_id,
+                                "SESSION_SETUP without negotiation — disconnecting"
+                            );
                             return error_response_for(
                                 Command::SessionSetup,
                                 NtStatus::InvalidParameter,
@@ -1194,8 +1341,12 @@ async fn handle_session_setup(
                 // as the KDF context. For 3.0.x/2.x, use the legacy fixed
                 // context strings.
                 let preauth_hash = if dialect == DialectConfig::Smb311 {
-                    conn_state.preauth_sessions.lock().unwrap()
-                        .get(&session_id).copied()
+                    conn_state
+                        .preauth_sessions
+                        .lock()
+                        .unwrap()
+                        .get(&session_id)
+                        .copied()
                 } else {
                     None
                 };
@@ -1203,8 +1354,10 @@ async fn handle_session_setup(
                     Some(ref h) => (crate::crypto::KdfContext::Preauth(h), true),
                     None => {
                         if dialect == DialectConfig::Smb311 {
-                            warn!(conn_id = conn_state.conn_id,
-                                "3.1.1 session without preauth hash — aborting session");
+                            warn!(
+                                conn_id = conn_state.conn_id,
+                                "3.1.1 session without preauth hash — aborting session"
+                            );
                             // Missing preauth hash for 3.1.1 is a fatal error —
                             // don't install signing state with an empty/legacy key.
                             return error_response_for(
@@ -1221,9 +1374,15 @@ async fn handle_session_setup(
                 // Only signable (non-guest, keyed) sessions are eligible for
                 // encryption. Guest/anonymous sessions (empty session key) are
                 // never encrypted — Samba forces cipher = NONE for them.
-                let cipher: Option<crate::crypto::Cipher> = if signable && dialect >= DialectConfig::Smb30 {
-                    let neg_cipher = conn_state.negotiate_record.lock().await
-                        .as_ref().and_then(|r| r.neg311.as_ref())
+                let cipher: Option<crate::crypto::Cipher> = if signable
+                    && dialect >= DialectConfig::Smb30
+                {
+                    let neg_cipher = conn_state
+                        .negotiate_record
+                        .lock()
+                        .await
+                        .as_ref()
+                        .and_then(|r| r.neg311.as_ref())
                         .and_then(|n| n.cipher);
                     if dialect == DialectConfig::Smb311 {
                         neg_cipher.and_then(|c| match c {
@@ -1279,36 +1438,40 @@ async fn handle_session_setup(
 
                 // Derive encryption keys (only if a cipher was negotiated).
                 let enc_state_derived: Option<EncryptionState> = if let Some(cipher) = cipher {
-                    let enc_key = match crate::crypto::compute_encryption_key(&session_key, dialect, ctx) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            warn!(conn_id = conn_state.conn_id, error = %e,
+                    let enc_key =
+                        match crate::crypto::compute_encryption_key(&session_key, dialect, ctx) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                warn!(conn_id = conn_state.conn_id, error = %e,
                                 "encryption key derivation failed — aborting session");
-                            return error_response_for(
-                                Command::SessionSetup,
-                                NtStatus::LogonFailure,
-                                &req.header,
-                            );
-                        }
-                    };
-                    let dec_key = match crate::crypto::compute_decryption_key(&session_key, dialect, ctx) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            warn!(conn_id = conn_state.conn_id, error = %e,
+                                return error_response_for(
+                                    Command::SessionSetup,
+                                    NtStatus::LogonFailure,
+                                    &req.header,
+                                );
+                            }
+                        };
+                    let dec_key =
+                        match crate::crypto::compute_decryption_key(&session_key, dialect, ctx) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                warn!(conn_id = conn_state.conn_id, error = %e,
                                 "decryption key derivation failed — aborting session");
-                            return error_response_for(
-                                Command::SessionSetup,
-                                NtStatus::LogonFailure,
-                                &req.header,
-                            );
-                        }
-                    };
+                                return error_response_for(
+                                    Command::SessionSetup,
+                                    NtStatus::LogonFailure,
+                                    &req.header,
+                                );
+                            }
+                        };
                     let enc_key_arr: [u8; 16] = match enc_key.as_slice().try_into() {
                         Ok(k) => k,
                         Err(_) => {
-                            warn!(conn_id = conn_state.conn_id,
+                            warn!(
+                                conn_id = conn_state.conn_id,
                                 "encryption key not 16 bytes (got {}) — aborting session",
-                                enc_key.len());
+                                enc_key.len()
+                            );
                             return error_response_for(
                                 Command::SessionSetup,
                                 NtStatus::LogonFailure,
@@ -1319,9 +1482,11 @@ async fn handle_session_setup(
                     let dec_key_arr: [u8; 16] = match dec_key.as_slice().try_into() {
                         Ok(k) => k,
                         Err(_) => {
-                            warn!(conn_id = conn_state.conn_id,
+                            warn!(
+                                conn_id = conn_state.conn_id,
                                 "decryption key not 16 bytes (got {}) — aborting session",
-                                dec_key.len());
+                                dec_key.len()
+                            );
                             return error_response_for(
                                 Command::SessionSetup,
                                 NtStatus::LogonFailure,
@@ -1329,13 +1494,12 @@ async fn handle_session_setup(
                             );
                         }
                     };
-                    let encrypt_data = state.config.encryption == crate::config::EncryptionPolicy::Required;
+                    let encrypt_data =
+                        state.config.encryption == crate::config::EncryptionPolicy::Required;
                     Some(EncryptionState {
                         enc_key: enc_key_arr,
                         dec_key: dec_key_arr,
-                        nonce_source: std::sync::Arc::new(
-                            crate::crypto::NonceSource::new(cipher),
-                        ),
+                        nonce_source: std::sync::Arc::new(crate::crypto::NonceSource::new(cipher)),
                         cipher,
                         encrypt_data,
                         retiring: false,
@@ -1351,11 +1515,21 @@ async fn handle_session_setup(
                     // response is force-signed, not subsequent requests.
                     conn_state.signing.write().unwrap().insert(
                         session_id,
-                        SigningState { key, required, dialect, retiring: false, force_sign_once },
+                        SigningState {
+                            key,
+                            required,
+                            dialect,
+                            retiring: false,
+                            force_sign_once,
+                        },
                     );
                 }
                 if let Some(ref st) = enc_state_derived {
-                    conn_state.encryption.write().unwrap().insert(session_id, st.clone());
+                    conn_state
+                        .encryption
+                        .write()
+                        .unwrap()
+                        .insert(session_id, st.clone());
                     debug!(conn_id = conn_state.conn_id, session_id, cipher = ?st.cipher,
                         "encryption keys derived for session");
                 }
@@ -1374,14 +1548,23 @@ async fn handle_session_setup(
                     encrypted = enc_state_derived.is_some(),
                     "logon success",
                 );
-                state.metrics.auth_success_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .metrics
+                    .auth_success_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 conn_state.sessions.write().await.push(Arc::new(session));
                 // SMB 3.1.1: remove the preauth session entry (keys derived).
-                conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
+                conn_state
+                    .preauth_sessions
+                    .lock()
+                    .unwrap()
+                    .remove(&session_id);
                 // Stash the encrypt_data flag so the response builder can set
                 // SESSION_FLAG_ENCRYPT_DATA (the session is now in the list).
                 session_encrypt_data = enc_state_derived
-                    .as_ref().map(|st| st.encrypt_data).unwrap_or(false);
+                    .as_ref()
+                    .map(|st| st.encrypt_data)
+                    .unwrap_or(false);
             }
 
             // The auth provider builds the final SPNEGO response when it can
@@ -1430,8 +1613,16 @@ async fn handle_session_setup(
         Ok(rssmb_auth::AuthStep::Reject { reason }) => {
             debug!(conn_id = conn_state.conn_id, "auth rejected: {}", reason);
             *auth_guard = None; // Clear auth state
-            conn_state.pending_sessions.write().await.remove(&session_id);
-            conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
+            conn_state
+                .pending_sessions
+                .write()
+                .await
+                .remove(&session_id);
+            conn_state
+                .preauth_sessions
+                .lock()
+                .unwrap()
+                .remove(&session_id);
             // Throttle: record failure, apply delay, check per-connection cap.
             // The delay is applied after dropping auth_guard (the lock is no
             // longer needed). The failure is recorded BEFORE the delay so
@@ -1445,10 +1636,16 @@ async fn handle_session_setup(
                 reason = %reason,
                 "logon failure",
             );
-            state.metrics.auth_failures_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .auth_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(auth_guard);
             let delay = state.auth_limiter.record_failure(conn_state.remote_addr);
-            let conn_fails = conn_state.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let conn_fails = conn_state
+                .auth_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             tracing::warn!(
                 conn_id = conn_state.conn_id,
                 ip = %conn_state.remote_addr,
@@ -1458,8 +1655,11 @@ async fn handle_session_setup(
                 "auth failure",
             );
             if state.auth_limiter.conn_failure_exceeds(conn_fails) {
-                warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
-                    "per-connection auth failure cap exceeded — disconnecting");
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    conn_failures = conn_fails,
+                    "per-connection auth failure cap exceeded — disconnecting"
+                );
                 return FramedResponse::Disconnect;
             }
             if !delay.is_zero() {
@@ -1476,11 +1676,22 @@ async fn handle_session_setup(
         Err(e) => {
             debug!(conn_id = conn_state.conn_id, "auth error: {}", e);
             *auth_guard = None;
-            conn_state.pending_sessions.write().await.remove(&session_id);
-            conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
+            conn_state
+                .pending_sessions
+                .write()
+                .await
+                .remove(&session_id);
+            conn_state
+                .preauth_sessions
+                .lock()
+                .unwrap()
+                .remove(&session_id);
             drop(auth_guard);
             let delay = state.auth_limiter.record_failure(conn_state.remote_addr);
-            let conn_fails = conn_state.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let conn_fails = conn_state
+                .auth_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             tracing::warn!(
                 conn_id = conn_state.conn_id,
                 ip = %conn_state.remote_addr,
@@ -1490,8 +1701,11 @@ async fn handle_session_setup(
                 "auth error (throttled)",
             );
             if state.auth_limiter.conn_failure_exceeds(conn_fails) {
-                warn!(conn_id = conn_state.conn_id, conn_failures = conn_fails,
-                    "per-connection auth failure cap exceeded — disconnecting");
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    conn_failures = conn_fails,
+                    "per-connection auth failure cap exceeded — disconnecting"
+                );
                 return FramedResponse::Disconnect;
             }
             if !delay.is_zero() {
@@ -1509,7 +1723,11 @@ async fn handle_session_setup(
 }
 
 /// Handle LOGOFF — tear down the session, close its handles and trees.
-async fn handle_logoff(state: &ServerState, conn_state: &ConnState, req_header: &Header) -> FramedResponse {
+async fn handle_logoff(
+    state: &ServerState,
+    conn_state: &ConnState,
+    req_header: &Header,
+) -> FramedResponse {
     let session_id = req_header.session_id;
 
     // Remove all opens belonging to this session, closing them via VFS.
@@ -1537,11 +1755,17 @@ async fn handle_logoff(state: &ServerState, conn_state: &ConnState, req_header: 
         to_close.len()
     };
     if removed > 0 {
-        debug!(conn_id = conn_state.conn_id, session_id, removed, "logoff: closed handles");
+        debug!(
+            conn_id = conn_state.conn_id,
+            session_id, removed, "logoff: closed handles"
+        );
     }
 
     // Release all byte-range locks held by this session.
-    state.open_table.release_all_locks_for_session(session_id).await;
+    state
+        .open_table
+        .release_all_locks_for_session(session_id)
+        .await;
 
     // Remove all trees belonging to this session.
     {
@@ -1557,7 +1781,11 @@ async fn handle_logoff(state: &ServerState, conn_state: &ConnState, req_header: 
     }
 
     // Remove the session.
-    conn_state.sessions.write().await.retain(|s| s.id != session_id);
+    conn_state
+        .sessions
+        .write()
+        .await
+        .retain(|s| s.id != session_id);
     // The signing state is kept until the LOGOFF response has been signed;
     // the read loop removes it then (see `connection.rs`).
     if let Some(st) = conn_state.signing.write().unwrap().get_mut(&session_id) {
@@ -1582,7 +1810,10 @@ async fn handle_logoff(state: &ServerState, conn_state: &ConnState, req_header: 
         }
     }
 
-    let response = build_response(req_header, ResponseContent::Logoff(rssmb_proto::session_setup::LogoffResponse::default()));
+    let response = build_response(
+        req_header,
+        ResponseContent::Logoff(rssmb_proto::session_setup::LogoffResponse::default()),
+    );
     FramedResponse::Plain(response)
 }
 
@@ -1604,12 +1835,11 @@ fn next_session_id(conn_state: &ConnState) -> u64 {
         // Check against active sessions and pending sessions.
         let sessions = conn_state.sessions.try_read();
         let pending = conn_state.pending_sessions.try_read();
-        let in_sessions = sessions.as_ref()
+        let in_sessions = sessions
+            .as_ref()
             .map(|s| s.iter().any(|sess| sess.id == id))
             .unwrap_or(false);
-        let in_pending = pending.as_ref()
-            .map(|p| p.contains(&id))
-            .unwrap_or(false);
+        let in_pending = pending.as_ref().map(|p| p.contains(&id)).unwrap_or(false);
         if !in_sessions && !in_pending {
             return id;
         }
@@ -1618,17 +1848,23 @@ fn next_session_id(conn_state: &ConnState) -> u64 {
 
 /// Allocate a per-connection TreeId (starts at 1, never 0 or 0xFFFFFFFF).
 fn next_tree_id(conn_state: &ConnState) -> u32 {
-    conn_state.next_tree_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    conn_state
+        .next_tree_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Allocate a per-connection FileId: volatile from a counter, persistent random.
 fn next_file_id(conn_state: &ConnState) -> rssmb_proto::create::FileId {
-    let volatile = conn_state.next_volatile_id
+    let volatile = conn_state
+        .next_volatile_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Skip the sentinel value (0xFFFFFFFFFFFFFFFF) used by substitute_file_id.
     let volatile = if volatile == u64::MAX { 0 } else { volatile };
     let persistent = conn_state.persistent_base.wrapping_add(volatile);
-    rssmb_proto::create::FileId { persistent, volatile }
+    rssmb_proto::create::FileId {
+        persistent,
+        volatile,
+    }
 }
 
 /// TREE_CONNECT — look up a share and create a tree connection.
@@ -1639,7 +1875,13 @@ async fn handle_tree_connect(
 ) -> FramedResponse {
     let tc_req = match &req.content {
         RequestContent::TreeConnect(tc) => tc,
-        _ => return error_response_for(Command::TreeConnect, NtStatus::InvalidParameter, &req.header),
+        _ => {
+            return error_response_for(
+                Command::TreeConnect,
+                NtStatus::InvalidParameter,
+                &req.header,
+            )
+        }
     };
 
     // Look up the session to enforce share access policy.
@@ -1657,8 +1899,15 @@ async fn handle_tree_connect(
     let identity = match session_identity {
         Some(id) => id,
         None => {
-            debug!(conn_id = conn_state.conn_id, session_id, "tree_connect: no authenticated session");
-            return error_response_for(Command::TreeConnect, NtStatus::UserSessionDeleted, &req.header);
+            debug!(
+                conn_id = conn_state.conn_id,
+                session_id, "tree_connect: no authenticated session"
+            );
+            return error_response_for(
+                Command::TreeConnect,
+                NtStatus::UserSessionDeleted,
+                &req.header,
+            );
         }
     };
 
@@ -1703,7 +1952,11 @@ async fn handle_tree_connect(
         Some(c) => c.clone(),
         None => {
             debug!(conn_id = conn_state.conn_id, share = %share_name, "share not found");
-            return error_response_for(Command::TreeConnect, NtStatus::ObjectNameNotFound, &req.header);
+            return error_response_for(
+                Command::TreeConnect,
+                NtStatus::ObjectNameNotFound,
+                &req.header,
+            );
         }
     };
 
@@ -1770,11 +2023,19 @@ async fn handle_tree_connect(
     let vfs: Arc<dyn rssmb_vfs::Vfs> = if share_config.path.is_empty() {
         Arc::new(rssmb_vfs::memoryfs::MemoryFs::new())
     } else {
-        match rssmb_vfs::localfs::LocalFs::new(&share_config.path, share_config.follow_symlinks, share_config.case_sensitive) {
+        match rssmb_vfs::localfs::LocalFs::new(
+            &share_config.path,
+            share_config.follow_symlinks,
+            share_config.case_sensitive,
+        ) {
             Ok(fs) => Arc::new(fs),
             Err(e) => {
                 tracing::warn!(share = %share_name, path = %share_config.path, error = %e, "failed to create LocalFs");
-                return error_response_for(Command::TreeConnect, NtStatus::InvalidParameter, &req.header);
+                return error_response_for(
+                    Command::TreeConnect,
+                    NtStatus::InvalidParameter,
+                    &req.header,
+                );
             }
         }
     };
@@ -1784,15 +2045,18 @@ async fn handle_tree_connect(
 
     // Store tree in connection tree table with owning session and policy
     let tree_encrypt_data = share_config.encrypt_data;
-    conn_state.trees.write().await.insert(tree_id, TreeEntry {
-        share_name: share_name.clone(),
-        vfs: vfs.clone(),
-        session_id,
-        read_only: share_config.read_only,
-        write_access,
-        encrypt_data: tree_encrypt_data,
-        is_ipc: false,
-    });
+    conn_state.trees.write().await.insert(
+        tree_id,
+        TreeEntry {
+            share_name: share_name.clone(),
+            vfs: vfs.clone(),
+            session_id,
+            read_only: share_config.read_only,
+            write_access,
+            encrypt_data: tree_encrypt_data,
+            is_ipc: false,
+        },
+    );
 
     // Audit: tree connect.
     tracing::info!(
@@ -1816,7 +2080,10 @@ async fn handle_tree_connect(
         ..Default::default()
     };
 
-    let mut response = build_response(&req.header, ResponseContent::TreeConnect(tree_connect_response));
+    let mut response = build_response(
+        &req.header,
+        ResponseContent::TreeConnect(tree_connect_response),
+    );
     response.header.tree_id = Some(tree_id);
     FramedResponse::Plain(response)
 }
@@ -1833,7 +2100,10 @@ async fn handle_tree_disconnect(
     // Validate that the tree belongs to this session before removing.
     let tree_owned = {
         let trees = conn_state.trees.read().await;
-        trees.get(&tree_id).map(|e| e.session_id == session_id).unwrap_or(false)
+        trees
+            .get(&tree_id)
+            .map(|e| e.session_id == session_id)
+            .unwrap_or(false)
     };
     if !tree_owned {
         return error_response_for(Command::TreeDisconnect, NtStatus::AccessDenied, req_header);
@@ -1869,7 +2139,10 @@ async fn handle_tree_disconnect(
         to_close.len()
     };
     if removed > 0 {
-        debug!(conn_id = conn_state.conn_id, tree_id, removed, "tree_disconnect: closed handles");
+        debug!(
+            conn_id = conn_state.conn_id,
+            tree_id, removed, "tree_disconnect: closed handles"
+        );
     }
 
     // Remove the tree from the connection tree table.
@@ -1984,11 +2257,16 @@ fn parse_create_contexts(
         if pos + 16 > chain.len() {
             break;
         }
-        let next_offset = u32::from_le_bytes(chain[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
-        let name_offset = u16::from_le_bytes(chain[pos + 4..pos + 6].try_into().unwrap_or([0; 2])) as usize;
-        let name_length = u16::from_le_bytes(chain[pos + 6..pos + 8].try_into().unwrap_or([0; 2])) as usize;
-        let data_offset = u16::from_le_bytes(chain[pos + 10..pos + 12].try_into().unwrap_or([0; 2])) as usize;
-        let data_length = u32::from_le_bytes(chain[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as usize;
+        let next_offset =
+            u32::from_le_bytes(chain[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        let name_offset =
+            u16::from_le_bytes(chain[pos + 4..pos + 6].try_into().unwrap_or([0; 2])) as usize;
+        let name_length =
+            u16::from_le_bytes(chain[pos + 6..pos + 8].try_into().unwrap_or([0; 2])) as usize;
+        let data_offset =
+            u16::from_le_bytes(chain[pos + 10..pos + 12].try_into().unwrap_or([0; 2])) as usize;
+        let data_length =
+            u32::from_le_bytes(chain[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as usize;
 
         // Name and data offsets are relative to the start of THIS context
         // (i.e. relative to `pos` in the chain), not the start of the chain.
@@ -2001,16 +2279,18 @@ fn parse_create_contexts(
         {
             let name = &chain[ctx_start + name_offset..ctx_start + name_offset + 4];
             // Read the data.
-            if data_offset >= 16
-                && ctx_start + data_offset + data_length <= chain.len()
-            {
+            if data_offset >= 16 && ctx_start + data_offset + data_length <= chain.len() {
                 let data = &chain[ctx_start + data_offset..ctx_start + data_offset + data_length];
                 if name == DH2Q_NAME && data_length >= 32 {
                     let timeout = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                     let mut create_guid = [0u8; 16];
                     create_guid.copy_from_slice(&data[16..32]);
-                    dh2q = Some(Dh2qContext { timeout, _flags: flags, create_guid });
+                    dh2q = Some(Dh2qContext {
+                        timeout,
+                        _flags: flags,
+                        create_guid,
+                    });
                 } else if name == DH2C_NAME && data_length >= 36 {
                     let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
                     let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
@@ -2018,7 +2298,10 @@ fn parse_create_contexts(
                     create_guid.copy_from_slice(&data[16..32]);
                     let flags = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
                     dh2c = Some(Dh2cContext {
-                        file_id: rssmb_proto::create::FileId { persistent, volatile },
+                        file_id: rssmb_proto::create::FileId {
+                            persistent,
+                            volatile,
+                        },
                         create_guid,
                         _flags: flags,
                     });
@@ -2066,7 +2349,10 @@ async fn handle_create(
 
     // Validate that the tree belongs to this session.
     if tree_entry.session_id != session_id {
-        debug!(conn_id = conn_state.conn_id, tree_id, session_id, "create: tree does not belong to this session");
+        debug!(
+            conn_id = conn_state.conn_id,
+            tree_id, session_id, "create: tree does not belong to this session"
+        );
         return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
     }
     let vfs = tree_entry.vfs.clone();
@@ -2077,16 +2363,12 @@ async fn handle_create(
     // The SMB2 header is 64 bytes, so body starts at offset 64.
     let (dh2q, dh2c) = {
         let ctx_offset = if raw_frame.len() >= 64 + 52 + 4 {
-            u32::from_le_bytes(
-                raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]),
-            )
+            u32::from_le_bytes(raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]))
         } else {
             0
         };
         let ctx_length = if raw_frame.len() >= 64 + 56 {
-            u32::from_le_bytes(
-                raw_frame[64 + 52..64 + 56].try_into().unwrap_or([0; 4]),
-            )
+            u32::from_le_bytes(raw_frame[64 + 52..64 + 56].try_into().unwrap_or([0; 4]))
         } else {
             0
         };
@@ -2101,7 +2383,10 @@ async fn handle_create(
     if let Some(dh2c) = &dh2c {
         let durable_timeout = state.config.durable_timeout_secs;
         if durable_timeout == 0 {
-            debug!(conn_id = conn_state.conn_id, "DH2C: durable handles disabled");
+            debug!(
+                conn_id = conn_state.conn_id,
+                "DH2C: durable handles disabled"
+            );
             return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
             // STATUS_OBJECTID_NOT_FOUND = 0xC00000F4
         }
@@ -2124,10 +2409,7 @@ async fn handle_create(
         // Validate that the reconnecting session matches the original
         // session's user (MS-SMB2 3.3.5.15.11).
         let identity = lookup_session_identity(conn_state, session_id).await;
-        let reconnect_user = identity
-            .as_ref()
-            .map(|i| i.username.as_str())
-            .unwrap_or("");
+        let reconnect_user = identity.as_ref().map(|i| i.username.as_str()).unwrap_or("");
         if reconnect_user != peeked.username {
             debug!(
                 conn_id = conn_state.conn_id,
@@ -2135,11 +2417,7 @@ async fn handle_create(
                 reconnect_user,
                 "DH2C: session user mismatch — rejecting reconnect"
             );
-            return error_response_for(
-                Command::Create,
-                NtStatus::AccessDenied,
-                &req.header,
-            );
+            return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
 
         // Validate tree matches the original share.
@@ -2150,11 +2428,7 @@ async fn handle_create(
                 reconnect_share = %tree_entry.share_name,
                 "DH2C: share mismatch — rejecting reconnect"
             );
-            return error_response_for(
-                Command::Create,
-                NtStatus::Other(0xC000_00F4),
-                &req.header,
-            );
+            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
         }
 
         // Enforce write access: if the original open had write access,
@@ -2167,11 +2441,7 @@ async fn handle_create(
                 conn_id = conn_state.conn_id,
                 "DH2C: reconnect denied — tree has no write access for writable handle"
             );
-            return error_response_for(
-                Command::Create,
-                NtStatus::AccessDenied,
-                &req.header,
-            );
+            return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
 
         // All validations passed — take the entry from the durable table.
@@ -2220,7 +2490,10 @@ async fn handle_create(
                 delete_on_close: false,
             };
             if let Err(_conflict) = state.open_table.check_and_add(fid, ot_entry).await {
-                debug!(conn_id = conn_state.conn_id, "DH2C: share conflict on reconnect");
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "DH2C: share conflict on reconnect"
+                );
                 // Close the VFS handle we just re-attached.
                 let _ = durable_entry.vfs.close(durable_entry.open_id).await;
                 conn_state.opens.write().await.remove(&file_id.volatile);
@@ -2233,8 +2506,12 @@ async fn handle_create(
         }
 
         // Query file info for the response.
-        let info = durable_entry.vfs
-            .query_info(durable_entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
+        let info = durable_entry
+            .vfs
+            .query_info(
+                durable_entry.open_id,
+                rssmb_vfs::InfoClass::FileStandardInfo,
+            )
             .await
             .unwrap_or(rssmb_vfs::FileInfo {
                 file_id: rssmb_vfs::FileId(0),
@@ -2262,7 +2539,10 @@ async fn handle_create(
             file_id,
         };
         let response = build_response(&req.header, ResponseContent::Create(create_response));
-        debug!(conn_id = conn_state.conn_id, "DH2C: durable handle re-attached");
+        debug!(
+            conn_id = conn_state.conn_id,
+            "DH2C: durable handle re-attached"
+        );
         return FramedResponse::Plain(response);
     }
 
@@ -2318,27 +2598,43 @@ async fn handle_create(
     // create, overwrite or supersede.
     if tree_entry.read_only || !tree_entry.write_access {
         let a = &create_req.desired_access;
-        let wants_write = a.file_write_data() || a.file_append_data() || a.file_write_ea()
-            || a.file_write_attributes() || a.file_delete_child() || a.delete()
-            || a.write_dacl() || a.write_owner() || a.generic_write() || a.generic_all();
+        let wants_write = a.file_write_data()
+            || a.file_append_data()
+            || a.file_write_ea()
+            || a.file_write_attributes()
+            || a.file_delete_child()
+            || a.delete()
+            || a.write_dacl()
+            || a.write_owner()
+            || a.generic_write()
+            || a.generic_all();
         let mutating_disposition = !matches!(
             create_req.create_disposition,
             rssmb_proto::create::CreateDisposition::Open
         );
         if wants_write || mutating_disposition || create_req.create_options.delete_on_close() {
-            debug!(conn_id = conn_state.conn_id, tree_id, "create denied: read-only share or no write access");
+            debug!(
+                conn_id = conn_state.conn_id,
+                tree_id, "create denied: read-only share or no write access"
+            );
             return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
     }
 
     // Map SMB create disposition to VFS
     let disposition = match create_req.create_disposition {
-        rssmb_proto::create::CreateDisposition::Superseded => rssmb_vfs::CreateDisposition::Supersede,
+        rssmb_proto::create::CreateDisposition::Superseded => {
+            rssmb_vfs::CreateDisposition::Supersede
+        }
         rssmb_proto::create::CreateDisposition::Open => rssmb_vfs::CreateDisposition::Open,
         rssmb_proto::create::CreateDisposition::Create => rssmb_vfs::CreateDisposition::Create,
         rssmb_proto::create::CreateDisposition::OpenIf => rssmb_vfs::CreateDisposition::OpenIf,
-        rssmb_proto::create::CreateDisposition::Overwrite => rssmb_vfs::CreateDisposition::Overwrite,
-        rssmb_proto::create::CreateDisposition::OverwriteIf => rssmb_vfs::CreateDisposition::OverwriteIf,
+        rssmb_proto::create::CreateDisposition::Overwrite => {
+            rssmb_vfs::CreateDisposition::Overwrite
+        }
+        rssmb_proto::create::CreateDisposition::OverwriteIf => {
+            rssmb_vfs::CreateDisposition::OverwriteIf
+        }
     };
 
     // Map the client's ShareAccess flags from the request.
@@ -2401,8 +2697,7 @@ async fn handle_create(
                     Err(_conflict) => {
                         debug!(
                             conn_id = conn_state.conn_id,
-                            tree_id,
-                            "create: sharing violation — closing VFS handle"
+                            tree_id, "create: sharing violation — closing VFS handle"
                         );
                         // Undo the VFS open.
                         let _ = vfs.close(open_id).await;
@@ -2464,13 +2759,21 @@ async fn handle_create(
                         path: file_path.clone(),
                         deadline: crate::durable::deadline_from_timeout(durable_timeout),
                     };
-                    state.durable_table.insert(dh2q.create_guid, durable_entry).await;
-                    debug!(conn_id = conn_state.conn_id, "DH2Q: durable handle recorded");
+                    state
+                        .durable_table
+                        .insert(dh2q.create_guid, durable_entry)
+                        .await;
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        "DH2Q: durable handle recorded"
+                    );
                 }
             }
 
             // Query file info for the response
-            let info = vfs.query_info(open_id, rssmb_vfs::InfoClass::FileStandardInfo).await
+            let info = vfs
+                .query_info(open_id, rssmb_vfs::InfoClass::FileStandardInfo)
+                .await
                 .unwrap_or(rssmb_vfs::FileInfo {
                     file_id: rssmb_vfs::FileId(0),
                     attributes: rssmb_vfs::FileAttributes::default(),
@@ -2537,8 +2840,16 @@ async fn handle_close(
         match opens.get(&file_id_volatile) {
             Some(entry) => {
                 if entry.session_id != session_id || entry.tree_id != tree_id {
-                    debug!(conn_id = conn_state.conn_id, file_id = file_id_volatile, "close: handle does not belong to this session/tree");
-                    return error_response_for(Command::Close, NtStatus::InvalidHandle, &req.header);
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        file_id = file_id_volatile,
+                        "close: handle does not belong to this session/tree"
+                    );
+                    return error_response_for(
+                        Command::Close,
+                        NtStatus::InvalidHandle,
+                        &req.header,
+                    );
                 }
                 opens.remove(&file_id_volatile)
             }
@@ -2551,9 +2862,17 @@ async fn handle_close(
             // metadata before closing so we can return it in the response.
             let postquery = close_req.flags.postquery_attrib();
 
-            let (creation_time, last_access_time, last_write_time, change_time,
-                 allocation_size, endof_file, file_attributes) = if postquery {
-                let info = entry.vfs
+            let (
+                creation_time,
+                last_access_time,
+                last_write_time,
+                change_time,
+                allocation_size,
+                endof_file,
+                file_attributes,
+            ) = if postquery {
+                let info = entry
+                    .vfs
                     .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
                     .await
                     .unwrap_or(rssmb_vfs::FileInfo {
@@ -2578,8 +2897,13 @@ async fn handle_close(
                 )
             } else {
                 (
-                    FileTime::ZERO, FileTime::ZERO, FileTime::ZERO, FileTime::ZERO,
-                    0, 0, Default::default(),
+                    FileTime::ZERO,
+                    FileTime::ZERO,
+                    FileTime::ZERO,
+                    FileTime::ZERO,
+                    0,
+                    0,
+                    Default::default(),
                 )
             };
 
@@ -2611,7 +2935,10 @@ async fn handle_close(
                         // unlink correctly.
                     }
                     // Release all byte-range locks held by this open.
-                    state.open_table.release_all_locks_for_open(entry.open_id).await;
+                    state
+                        .open_table
+                        .release_all_locks_for_open(entry.open_id)
+                        .await;
                 }
 
                 // If this was a durable open, remove it from the durable
@@ -2667,7 +2994,11 @@ async fn handle_close(
             FramedResponse::Plain(response)
         }
         None => {
-            debug!(conn_id = conn_state.conn_id, file_id = file_id_volatile, "close: handle not found");
+            debug!(
+                conn_id = conn_state.conn_id,
+                file_id = file_id_volatile,
+                "close: handle not found"
+            );
             error_response_for(Command::Close, NtStatus::InvalidHandle, &req.header)
         }
     }
@@ -2689,17 +3020,25 @@ async fn handle_read(
     let tree_id = req.header.tree_id.unwrap_or(0);
 
     // Look up the open, validating session ownership.
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => {
-            debug!(conn_id = conn_state.conn_id, file_id = file_id_volatile, "read: handle not found or wrong session");
-            return error_response_for(Command::Read, status, &req.header);
-        }
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => {
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    file_id = file_id_volatile,
+                    "read: handle not found or wrong session"
+                );
+                return error_response_for(Command::Read, status, &req.header);
+            }
+        };
 
     // Pipe opens: drain the RPC output queue.
     if entry.is_pipe {
-        let ps = entry.pipe_state.as_ref().expect("pipe open without pipe_state");
+        let ps = entry
+            .pipe_state
+            .as_ref()
+            .expect("pipe open without pipe_state");
         let mut state = ps.lock().unwrap();
         let (data, read_status) = state.read(read_req.length as usize);
         let max_read = read_req.length as usize;
@@ -2708,10 +3047,7 @@ async fn handle_read(
             return error_response_for(Command::Read, NtStatus::Other(0xC000_0050), &req.header);
             // STATUS_PIPE_EMPTY = 0xC0000050
         }
-        let read_response = rssmb_proto::file::ReadResponse {
-            buffer: data,
-            ..Default::default()
-        };
+        let read_response = rssmb_proto::file::ReadResponse { buffer: data };
         let mut response = build_response(&req.header, ResponseContent::Read(read_response));
         if read_status == rssmb_rpc_server::ReadStatus::Overflow {
             response.header.status = NtStatus::BufferOverflow.to_u32();
@@ -2742,14 +3078,17 @@ async fn handle_read(
     }
 
     // Read from VFS
-    match entry.vfs.read_at(entry.open_id, read_req.offset, read_req.length).await {
+    match entry
+        .vfs
+        .read_at(entry.open_id, read_req.offset, read_req.length)
+        .await
+    {
         Ok(data) => {
             if data.is_empty() {
                 return error_response_for(Command::Read, NtStatus::EndOfFile, &req.header);
             }
             let read_response = rssmb_proto::file::ReadResponse {
                 buffer: data.to_vec(),
-                ..Default::default()
             };
             let response = build_response(&req.header, ResponseContent::Read(read_response));
             FramedResponse::Plain(response)
@@ -2785,13 +3124,18 @@ async fn handle_write(
     let tree_id = req.header.tree_id.unwrap_or(0);
 
     // Look up the open, validating session ownership.
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => {
-            debug!(conn_id = conn_state.conn_id, file_id = file_id_volatile, "write: handle not found or wrong session");
-            return error_response_for(Command::Write, status, &req.header);
-        }
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => {
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    file_id = file_id_volatile,
+                    "write: handle not found or wrong session"
+                );
+                return error_response_for(Command::Write, status, &req.header);
+            }
+        };
 
     // Pipe opens: feed RPC input bytes to the pipe state machine.
     if entry.is_pipe {
@@ -2799,7 +3143,9 @@ async fn handle_write(
         const MAX_WRITE_SIZE: u32 = MAX_IO_SIZE;
         let write_data_offset: usize = match raw_frame.get(66..68) {
             Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
-            None => return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header),
+            None => {
+                return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header)
+            }
         };
         if write_data_offset < 64 + 48 {
             return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header);
@@ -2816,7 +3162,10 @@ async fn handle_write(
             return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header);
         };
 
-        let ps = entry.pipe_state.as_ref().expect("pipe open without pipe_state");
+        let ps = entry
+            .pipe_state
+            .as_ref()
+            .expect("pipe open without pipe_state");
         let identity = lookup_session_identity(conn_state, session_id).await;
         let shares = visible_shares_for_ctx(&state.shares_snapshot(), identity.as_ref());
         let server_name = if !state.config.server_name.is_empty() {
@@ -2834,7 +3183,6 @@ async fn handle_write(
         let _consumed = pipe_state.process(&data, &rpc_ctx);
         let write_response = rssmb_proto::file::WriteResponse {
             count: data.len() as u32,
-            ..Default::default()
         };
         let response = build_response(&req.header, ResponseContent::Write(write_response));
         return FramedResponse::Plain(response);
@@ -2897,7 +3245,12 @@ async fn handle_write(
     if let Some(fid) = entry.file_id {
         if let Err(_conflict) = state
             .open_table
-            .check_range_lock_for_write(fid, entry.open_id, write_req.offset, write_req.length as u64)
+            .check_range_lock_for_write(
+                fid,
+                entry.open_id,
+                write_req.offset,
+                write_req.length as u64,
+            )
             .await
         {
             return error_response_for(
@@ -2908,12 +3261,13 @@ async fn handle_write(
         }
     }
 
-    match entry.vfs.write_at(entry.open_id, write_req.offset, &data).await {
+    match entry
+        .vfs
+        .write_at(entry.open_id, write_req.offset, &data)
+        .await
+    {
         Ok(count) => {
-            let write_response = rssmb_proto::file::WriteResponse {
-                count,
-                ..Default::default()
-            };
+            let write_response = rssmb_proto::file::WriteResponse { count };
             let response = build_response(&req.header, ResponseContent::Write(write_response));
             FramedResponse::Plain(response)
         }
@@ -2951,13 +3305,13 @@ async fn handle_flush(
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
 
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => {
-            return error_response_for(Command::Flush, status, &req.header);
-        }
-    }
-    ;
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => {
+                return error_response_for(Command::Flush, status, &req.header);
+            }
+        };
     // Pipe opens don't support FLUSH.
     if entry.is_pipe {
         return error_response_for(Command::Flush, NtStatus::Other(0xC000_0010), &req.header);
@@ -2986,16 +3340,19 @@ async fn handle_query_info(
 ) -> FramedResponse {
     let qi_req = match &req.content {
         RequestContent::QueryInfo(q) => q,
-        _ => return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header),
+        _ => {
+            return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header)
+        }
     };
 
     let file_id_volatile = qi_req.file_id.volatile;
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => return error_response_for(Command::QueryInfo, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => return error_response_for(Command::QueryInfo, status, &req.header),
+        };
 
     // Pipe opens: return minimal info for FileStandardInformation, reject rest.
     if entry.is_pipe {
@@ -3005,8 +3362,16 @@ async fn handle_query_info(
             0x01 => match info_class_byte {
                 5 => vec![0u8; 24], // FileStandardInformation: zeros for a pipe.
                 _ => {
-                    debug!(conn_id = conn_state.conn_id, class = info_class_byte, "unsupported pipe info class");
-                    return error_response_for(Command::QueryInfo, NtStatus::NotSupported, &req.header);
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        class = info_class_byte,
+                        "unsupported pipe info class"
+                    );
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::NotSupported,
+                        &req.header,
+                    );
                 }
             },
             _ => {
@@ -3029,33 +3394,46 @@ async fn handle_query_info(
         // InfoType::File (0x01)
         0x01 => {
             // Query the VFS for file info
-            let info = match entry.vfs
+            let info = match entry
+                .vfs
                 .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
                 .await
             {
                 Ok(info) => info,
                 Err(e) => {
                     debug!(conn_id = conn_state.conn_id, error = %e, "query_info VFS failed");
-                    return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header);
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
                 }
             };
             match info_class_byte {
-                4 => crate::fsinfo::file_basic_info(&info),      // FileBasicInformation
-                5 => crate::fsinfo::file_standard_info(&info),    // FileStandardInformation
-                6 => crate::fsinfo::file_internal_info(&info),    // FileInternalInformation
-                7 => crate::fsinfo::file_ea_info(),               // FileEaInformation
+                4 => crate::fsinfo::file_basic_info(&info), // FileBasicInformation
+                5 => crate::fsinfo::file_standard_info(&info), // FileStandardInformation
+                6 => crate::fsinfo::file_internal_info(&info), // FileInternalInformation
+                7 => crate::fsinfo::file_ea_info(),         // FileEaInformation
                 18 => {
                     // FileAllInformation — what Linux cifs.ko uses to stat.
                     let ro = tree_read_only(conn_state, entry.tree_id).await;
                     let access = if ro { 0x0012_00a9 } else { 0x001f_01ff };
                     crate::fsinfo::file_all_info(&info, &entry.path, access)
                 }
-                22 => crate::fsinfo::file_stream_info(&info),    // FileStreamInformation
+                22 => crate::fsinfo::file_stream_info(&info), // FileStreamInformation
                 34 => crate::fsinfo::file_network_open_info(&info), // FileNetworkOpenInformation
                 35 => crate::fsinfo::file_attribute_tag_info(&info), // FileAttributeTagInformation
                 _ => {
-                    debug!(conn_id = conn_state.conn_id, class = info_class_byte, "unsupported file info class");
-                    return error_response_for(Command::QueryInfo, NtStatus::InvalidInfoClass, &req.header);
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        class = info_class_byte,
+                        "unsupported file info class"
+                    );
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::InvalidInfoClass,
+                        &req.header,
+                    );
                 }
             }
         }
@@ -3065,23 +3443,38 @@ async fn handle_query_info(
                 Ok(s) => s,
                 Err(e) => {
                     debug!(conn_id = conn_state.conn_id, error = %e, "fs_stats VFS failed");
-                    return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header);
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
                 }
             };
             let share_name = {
                 let trees = conn_state.trees.read().await;
-                trees.get(&tree_id).map(|t| t.share_name.clone()).unwrap_or_default()
+                trees
+                    .get(&tree_id)
+                    .map(|t| t.share_name.clone())
+                    .unwrap_or_default()
             };
             match info_class_byte {
-                1 => crate::fsinfo::fs_volume_info(&share_name),   // FileFsVolumeInformation
-                3 => crate::fsinfo::fs_size_info(&stats),         // FileFsSizeInformation
-                4 => crate::fsinfo::fs_device_info(),              // FileFsDeviceInformation
-                5 => crate::fsinfo::fs_attribute_info(),           // FileFsAttributeInformation
-                7 => crate::fsinfo::fs_full_size_info(&stats),     // FileFsFullSizeInformation
-                11 => crate::fsinfo::fs_sector_size_info(&stats),  // FileFsSectorSizeInformation
+                1 => crate::fsinfo::fs_volume_info(&share_name), // FileFsVolumeInformation
+                3 => crate::fsinfo::fs_size_info(&stats),        // FileFsSizeInformation
+                4 => crate::fsinfo::fs_device_info(),            // FileFsDeviceInformation
+                5 => crate::fsinfo::fs_attribute_info(),         // FileFsAttributeInformation
+                7 => crate::fsinfo::fs_full_size_info(&stats),   // FileFsFullSizeInformation
+                11 => crate::fsinfo::fs_sector_size_info(&stats), // FileFsSectorSizeInformation
                 _ => {
-                    debug!(conn_id = conn_state.conn_id, class = info_class_byte, "unsupported filesystem info class");
-                    return error_response_for(Command::QueryInfo, NtStatus::InvalidInfoClass, &req.header);
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        class = info_class_byte,
+                        "unsupported filesystem info class"
+                    );
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::InvalidInfoClass,
+                        &req.header,
+                    );
                 }
             }
         }
@@ -3090,19 +3483,24 @@ async fn handle_query_info(
             // Only DACL/OWNER/GROUP are supported. SACL requests require
             // ACCESS_SYSTEM_SECURITY which we don't grant.
             let additional_info = u32::from_le_bytes(qi_req.additional_info.into_bytes());
-            let sec_info = match entry.vfs
-                .query_security(entry.open_id)
-                .await
-            {
+            let sec_info = match entry.vfs.query_security(entry.open_id).await {
                 Ok(s) => s,
                 Err(e) => {
                     debug!(conn_id = conn_state.conn_id, error = %e, "query_security VFS failed");
-                    return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header);
+                    return error_response_for(
+                        Command::QueryInfo,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
                 }
             };
             let sd = crate::fsinfo::synthesize_security_descriptor(&sec_info, additional_info);
             if sd.is_empty() {
-                return error_response_for(Command::QueryInfo, NtStatus::Other(0xC000_0001), &req.header);
+                return error_response_for(
+                    Command::QueryInfo,
+                    NtStatus::Other(0xC000_0001),
+                    &req.header,
+                );
             }
             sd
         }
@@ -3128,20 +3526,31 @@ async fn handle_query_directory(
 ) -> FramedResponse {
     let qd_req = match &req.content {
         RequestContent::QueryDirectory(q) => q,
-        _ => return error_response_for(Command::QueryDirectory, NtStatus::InvalidParameter, &req.header),
+        _ => {
+            return error_response_for(
+                Command::QueryDirectory,
+                NtStatus::InvalidParameter,
+                &req.header,
+            )
+        }
     };
 
     let file_id_volatile = qd_req.file_id.volatile;
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => return error_response_for(Command::QueryDirectory, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => return error_response_for(Command::QueryDirectory, status, &req.header),
+        };
 
     // Pipe opens don't support QUERY_DIRECTORY.
     if entry.is_pipe {
-        return error_response_for(Command::QueryDirectory, NtStatus::Other(0xC000_0010), &req.header);
+        return error_response_for(
+            Command::QueryDirectory,
+            NtStatus::Other(0xC000_0010),
+            &req.header,
+        );
     }
 
     let pattern = qd_req.file_name.to_string();
@@ -3163,17 +3572,25 @@ async fn handle_query_directory(
         if pattern == "*" || pattern.is_empty() {
             all.extend(crate::fsinfo::synthesize_dot_entries());
         }
-        match entry.vfs.query_dir(
-            entry.open_id,
-            &pattern,
-            rssmb_vfs::DirInfoClass::IdBothDirectoryInfo,
-            true,
-            0,
-        ).await {
+        match entry
+            .vfs
+            .query_dir(
+                entry.open_id,
+                &pattern,
+                rssmb_vfs::DirInfoClass::IdBothDirectoryInfo,
+                true,
+                0,
+            )
+            .await
+        {
             Ok(vfs_entries) => all.extend(vfs_entries),
             Err(e) => {
                 debug!(conn_id = conn_state.conn_id, error = %e, "query_dir VFS failed");
-                return error_response_for(Command::QueryDirectory, NtStatus::NoSuchFile, &req.header);
+                return error_response_for(
+                    Command::QueryDirectory,
+                    NtStatus::NoSuchFile,
+                    &req.header,
+                );
             }
         }
         cursor.entries = Some(all);
@@ -3184,7 +3601,11 @@ async fn handle_query_directory(
     if cursor.next >= all.len() {
         // MS-SMB2 3.3.5.18: no match on the first query → NO_SUCH_FILE,
         // exhausted cursor → NO_MORE_FILES.
-        let status = if first_call { NtStatus::NoSuchFile } else { NtStatus::NoMoreFiles };
+        let status = if first_call {
+            NtStatus::NoSuchFile
+        } else {
+            NtStatus::NoMoreFiles
+        };
         return error_response_for(Command::QueryDirectory, status, &req.header);
     }
 
@@ -3201,13 +3622,25 @@ async fn handle_query_directory(
             }
             Some(_) => break,
             None => {
-                debug!(conn_id = conn_state.conn_id, class = class_id, "unsupported directory info class");
-                return error_response_for(Command::QueryDirectory, NtStatus::InvalidInfoClass, &req.header);
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    class = class_id,
+                    "unsupported directory info class"
+                );
+                return error_response_for(
+                    Command::QueryDirectory,
+                    NtStatus::InvalidInfoClass,
+                    &req.header,
+                );
             }
         }
     }
     if take == 0 {
-        return error_response_for(Command::QueryDirectory, NtStatus::BufferOverflow, &req.header);
+        return error_response_for(
+            Command::QueryDirectory,
+            NtStatus::BufferOverflow,
+            &req.header,
+        );
     }
     cursor.next += take;
     drop(cursor);
@@ -3216,15 +3649,23 @@ async fn handle_query_directory(
         Some(buffer) => {
             let response = build_response(
                 &req.header,
-                ResponseContent::QueryDirectory(
-                    rssmb_proto::query_dir::QueryDirectoryResponse { output_buffer: buffer },
-                ),
+                ResponseContent::QueryDirectory(rssmb_proto::query_dir::QueryDirectoryResponse {
+                    output_buffer: buffer,
+                }),
             );
             FramedResponse::Plain(response)
         }
         None => {
-            debug!(conn_id = conn_state.conn_id, class = class_id, "unsupported directory info class");
-            error_response_for(Command::QueryDirectory, NtStatus::InvalidInfoClass, &req.header)
+            debug!(
+                conn_id = conn_state.conn_id,
+                class = class_id,
+                "unsupported directory info class"
+            );
+            error_response_for(
+                Command::QueryDirectory,
+                NtStatus::InvalidInfoClass,
+                &req.header,
+            )
         }
     }
 }
@@ -3249,10 +3690,11 @@ async fn handle_set_info(
     let file_id_volatile = si_req.file_id.volatile;
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => return error_response_for(Command::SetInfo, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => return error_response_for(Command::SetInfo, status, &req.header),
+        };
 
     // Pipe opens don't support SET_INFO.
     if entry.is_pipe {
@@ -3273,10 +3715,14 @@ async fn handle_set_info(
         // This is a documented compatibility behavior — the SD is not
         // mapped back to POSIX mode bits. A strict mode would return
         // ACCESS_DENIED here.
-        debug!(conn_id = conn_state.conn_id, "set_info security: accepted (not persisted)");
-        return FramedResponse::Plain(build_response(&req.header, ResponseContent::SetInfo(
-            rssmb_proto::info::SetInfoResponse::default(),
-        )));
+        debug!(
+            conn_id = conn_state.conn_id,
+            "set_info security: accepted (not persisted)"
+        );
+        return FramedResponse::Plain(build_response(
+            &req.header,
+            ResponseContent::SetInfo(rssmb_proto::info::SetInfoResponse::default()),
+        ));
     }
 
     // Get the info class and raw data.
@@ -3300,14 +3746,19 @@ async fn handle_set_info(
             match rssmb_proto::fscc::FileBasicInformation::read_le(&mut cursor) {
                 Ok(basic) => {
                     // Query current info, apply changes, call set_info.
-                    let mut info = match entry.vfs
+                    let mut info = match entry
+                        .vfs
                         .query_info(entry.open_id, rssmb_vfs::InfoClass::FileBasicInfo)
                         .await
                     {
                         Ok(i) => i,
                         Err(e) => {
                             debug!(conn_id = conn_state.conn_id, error = %e, "set_info: query failed");
-                            return error_response_for(Command::SetInfo, NtStatus::InvalidParameter, &req.header);
+                            return error_response_for(
+                                Command::SetInfo,
+                                NtStatus::InvalidParameter,
+                                &req.header,
+                            );
                         }
                     };
                     // Apply timestamps (0 means "don't change" in MS-FSCC).
@@ -3332,16 +3783,27 @@ async fn handle_set_info(
                     info.attributes.hidden = basic.file_attributes.hidden();
                     info.attributes.system = basic.file_attributes.system();
                     info.attributes.archive = basic.file_attributes.archive();
-                    match entry.vfs.set_info(entry.open_id, rssmb_vfs::InfoClass::FileBasicInfo, &info).await {
+                    match entry
+                        .vfs
+                        .set_info(entry.open_id, rssmb_vfs::InfoClass::FileBasicInfo, &info)
+                        .await
+                    {
                         Ok(()) => {
-                            let response = build_response(&req.header, ResponseContent::SetInfo(
-                                rssmb_proto::info::SetInfoResponse::default(),
-                            ));
+                            let response = build_response(
+                                &req.header,
+                                ResponseContent::SetInfo(
+                                    rssmb_proto::info::SetInfoResponse::default(),
+                                ),
+                            );
                             FramedResponse::Plain(response)
                         }
                         Err(e) => {
                             debug!(conn_id = conn_state.conn_id, error = %e, "set_info basic failed");
-                            error_response_for(Command::SetInfo, NtStatus::InvalidParameter, &req.header)
+                            error_response_for(
+                                Command::SetInfo,
+                                NtStatus::InvalidParameter,
+                                &req.header,
+                            )
                         }
                     }
                 }
@@ -3356,24 +3818,46 @@ async fn handle_set_info(
             let mut cursor = std::io::Cursor::new(&raw_data[..]);
             match rssmb_proto::fscc::FileEndOfFileInformation::read_le(&mut cursor) {
                 Ok(eof) => {
-                    let mut info = match entry.vfs
+                    let mut info = match entry
+                        .vfs
                         .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
                         .await
                     {
                         Ok(i) => i,
-                        Err(_) => return error_response_for(Command::SetInfo, NtStatus::InvalidParameter, &req.header),
+                        Err(_) => {
+                            return error_response_for(
+                                Command::SetInfo,
+                                NtStatus::InvalidParameter,
+                                &req.header,
+                            )
+                        }
                     };
                     info.size = eof.end_of_file;
-                    match entry.vfs.set_info(entry.open_id, rssmb_vfs::InfoClass::FileEndOfFileInfo, &info).await {
+                    match entry
+                        .vfs
+                        .set_info(
+                            entry.open_id,
+                            rssmb_vfs::InfoClass::FileEndOfFileInfo,
+                            &info,
+                        )
+                        .await
+                    {
                         Ok(()) => {
-                            let response = build_response(&req.header, ResponseContent::SetInfo(
-                                rssmb_proto::info::SetInfoResponse::default(),
-                            ));
+                            let response = build_response(
+                                &req.header,
+                                ResponseContent::SetInfo(
+                                    rssmb_proto::info::SetInfoResponse::default(),
+                                ),
+                            );
                             FramedResponse::Plain(response)
                         }
                         Err(e) => {
                             debug!(conn_id = conn_state.conn_id, error = %e, "set_info eof failed");
-                            error_response_for(Command::SetInfo, NtStatus::InvalidParameter, &req.header)
+                            error_response_for(
+                                Command::SetInfo,
+                                NtStatus::InvalidParameter,
+                                &req.header,
+                            )
                         }
                     }
                 }
@@ -3389,30 +3873,51 @@ async fn handle_set_info(
             match rssmb_proto::fscc::FileDispositionInformation::read_le(&mut cursor) {
                 Ok(disp) => {
                     let delete_pending = bool::from(disp.delete_pending);
-                    debug!(conn_id = conn_state.conn_id, delete_pending, "set_info disposition");
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        delete_pending, "set_info disposition"
+                    );
                     if delete_pending && tree_read_only(conn_state, tree_id).await {
-                        return error_response_for(Command::SetInfo, NtStatus::AccessDenied, &req.header);
+                        return error_response_for(
+                            Command::SetInfo,
+                            NtStatus::AccessDenied,
+                            &req.header,
+                        );
                     }
-                    match entry.vfs.set_delete_on_close(entry.open_id, delete_pending).await {
+                    match entry
+                        .vfs
+                        .set_delete_on_close(entry.open_id, delete_pending)
+                        .await
+                    {
                         Ok(()) => {
                             // Update the global open table's delete_on_close
                             // flag for this open so that the last-close logic
                             // in handle_close knows whether to unlink.
                             if let Some(fid) = entry.file_id {
-                                state.open_table
+                                state
+                                    .open_table
                                     .update_delete_on_close(fid, entry.open_id, delete_pending)
                                     .await;
                             }
-                            FramedResponse::Plain(build_response(&req.header, ResponseContent::SetInfo(
-                                rssmb_proto::info::SetInfoResponse::default(),
-                            )))
+                            FramedResponse::Plain(build_response(
+                                &req.header,
+                                ResponseContent::SetInfo(
+                                    rssmb_proto::info::SetInfoResponse::default(),
+                                ),
+                            ))
                         }
-                        Err(rssmb_vfs::VfsError::DirectoryNotEmpty) => {
-                            error_response_for(Command::SetInfo, NtStatus::Other(0xC000_0101), &req.header)
-                        }
+                        Err(rssmb_vfs::VfsError::DirectoryNotEmpty) => error_response_for(
+                            Command::SetInfo,
+                            NtStatus::Other(0xC000_0101),
+                            &req.header,
+                        ),
                         Err(e) => {
                             debug!(conn_id = conn_state.conn_id, error = %e, "set_delete_on_close failed");
-                            error_response_for(Command::SetInfo, NtStatus::NotSupported, &req.header)
+                            error_response_for(
+                                Command::SetInfo,
+                                NtStatus::NotSupported,
+                                &req.header,
+                            )
                         }
                     }
                 }
@@ -3429,11 +3934,18 @@ async fn handle_set_info(
                 Ok(rename) => {
                     let new_name = rename.file_name.to_string();
                     debug!(conn_id = conn_state.conn_id, new_name = %new_name, "set_info rename");
-                    match entry.vfs.rename(entry.open_id, &new_name, rename.replace_if_exists.into()).await {
+                    match entry
+                        .vfs
+                        .rename(entry.open_id, &new_name, rename.replace_if_exists.into())
+                        .await
+                    {
                         Ok(()) => {
-                            let response = build_response(&req.header, ResponseContent::SetInfo(
-                                rssmb_proto::info::SetInfoResponse::default(),
-                            ));
+                            let response = build_response(
+                                &req.header,
+                                ResponseContent::SetInfo(
+                                    rssmb_proto::info::SetInfoResponse::default(),
+                                ),
+                            );
                             FramedResponse::Plain(response)
                         }
                         Err(e) => {
@@ -3454,7 +3966,11 @@ async fn handle_set_info(
             }
         }
         _ => {
-            debug!(conn_id = conn_state.conn_id, class = class_byte, "unsupported set_info class");
+            debug!(
+                conn_id = conn_state.conn_id,
+                class = class_byte,
+                "unsupported set_info class"
+            );
             error_response_for(Command::SetInfo, NtStatus::NotSupported, &req.header)
         }
     }
@@ -3475,7 +3991,13 @@ async fn handle_change_notify(
 ) -> FramedResponse {
     let cn_req = match &req.content {
         RequestContent::ChangeNotify(cn) => cn,
-        _ => return error_response_for(Command::ChangeNotify, NtStatus::InvalidParameter, &req.header),
+        _ => {
+            return error_response_for(
+                Command::ChangeNotify,
+                NtStatus::InvalidParameter,
+                &req.header,
+            )
+        }
     };
 
     let file_id_volatile = cn_req.file_id.volatile;
@@ -3483,14 +4005,16 @@ async fn handle_change_notify(
     let tree_id = req.header.tree_id.unwrap_or(0);
 
     // Validate the handle belongs to this session.
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(e) => e,
-        Err(status) => return error_response_for(Command::ChangeNotify, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => return error_response_for(Command::ChangeNotify, status, &req.header),
+        };
 
     // CHANGE_NOTIFY requires a directory handle.
     if !entry.is_pipe {
-        let info = entry.vfs
+        let info = entry
+            .vfs
             .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
             .await
             .unwrap_or(rssmb_vfs::FileInfo {
@@ -3505,8 +4029,15 @@ async fn handle_change_notify(
                 file_name: String::new(),
             });
         if !info.attributes.directory {
-            debug!(conn_id = conn_state.conn_id, "change_notify: handle is not a directory");
-            return error_response_for(Command::ChangeNotify, NtStatus::InvalidParameter, &req.header);
+            debug!(
+                conn_id = conn_state.conn_id,
+                "change_notify: handle is not a directory"
+            );
+            return error_response_for(
+                Command::ChangeNotify,
+                NtStatus::InvalidParameter,
+                &req.header,
+            );
         }
     }
 
@@ -3538,27 +4069,40 @@ async fn handle_change_notify(
     // the share config path + the entry's relative path.
     let dir_path = {
         let trees = conn_state.trees.read().await;
-        let share_name = trees.get(&tree_id).map(|t| t.share_name.clone()).unwrap_or_default();
+        let share_name = trees
+            .get(&tree_id)
+            .map(|t| t.share_name.clone())
+            .unwrap_or_default();
         // Look up the share path from config.
-        let share_path = state.shares_snapshot()
+        let share_path = state
+            .shares_snapshot()
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(&share_name))
             .map(|(_, v)| v.path.clone())
             .unwrap_or_default();
         if share_path.is_empty() {
-            debug!(conn_id = conn_state.conn_id, "change_notify: no share path — using stub");
+            debug!(
+                conn_id = conn_state.conn_id,
+                "change_notify: no share path — using stub"
+            );
             // No real path — fall back to the stub (no real watching).
             let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            conn_state.pending_async.lock().await.insert(message_id, AsyncOp {
-                command: Command::ChangeNotify,
-                session_id,
-                tree_id,
-                cancel: cancel_tx,
-                notify_handle: None,
-            });
-            let mut response = build_response(&req.header, ResponseContent::ChangeNotify(
-                rssmb_proto::notify::ChangeNotifyResponse { buffer: Default::default() },
-            ));
+            conn_state.pending_async.lock().await.insert(
+                message_id,
+                AsyncOp {
+                    command: Command::ChangeNotify,
+                    session_id,
+                    tree_id,
+                    cancel: cancel_tx,
+                    notify_handle: None,
+                },
+            );
+            let mut response = build_response(
+                &req.header,
+                ResponseContent::ChangeNotify(rssmb_proto::notify::ChangeNotifyResponse {
+                    buffer: Default::default(),
+                }),
+            );
             response.header.status = NtStatus::Pending.to_u32();
             response.header.to_async(message_id);
             return FramedResponse::Plain(response);
@@ -3575,31 +4119,29 @@ async fn handle_change_notify(
 
     // Start the real watch.
     let notify_handle = crate::notify::start_watch(
-        conn_state,
-        message_id,
-        session_id,
-        tree_id,
-        dir_path,
-        watch_tree,
-        filter,
+        conn_state, message_id, session_id, tree_id, dir_path, watch_tree, filter,
     );
 
     // Register the async op with the notify handle for cleanup.
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    conn_state.pending_async.lock().await.insert(message_id, AsyncOp {
-        command: Command::ChangeNotify,
-        session_id,
-        tree_id,
-        cancel: cancel_tx,
-        notify_handle: Some(notify_handle),
-    });
+    conn_state.pending_async.lock().await.insert(
+        message_id,
+        AsyncOp {
+            command: Command::ChangeNotify,
+            session_id,
+            tree_id,
+            cancel: cancel_tx,
+            notify_handle: Some(notify_handle),
+        },
+    );
 
     // Build a PENDING response with async header.
-    let mut response = build_response(&req.header, ResponseContent::ChangeNotify(
-        rssmb_proto::notify::ChangeNotifyResponse {
+    let mut response = build_response(
+        &req.header,
+        ResponseContent::ChangeNotify(rssmb_proto::notify::ChangeNotifyResponse {
             buffer: Default::default(),
-        },
-    ));
+        }),
+    );
     response.header.status = NtStatus::Pending.to_u32();
     response.header.to_async(message_id);
     FramedResponse::Plain(response)
@@ -3630,7 +4172,11 @@ async fn handle_ioctl(
     const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
     const STATUS_NOT_FOUND: u32 = 0xC000_0225;
     const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
-    debug!(conn_id = conn_state.conn_id, ctl_code = format!("{:#010x}", io.ctl_code), "ioctl");
+    debug!(
+        conn_id = conn_state.conn_id,
+        ctl_code = format!("{:#010x}", io.ctl_code),
+        "ioctl"
+    );
 
     // FSCTL_PIPE_TRANSCEIVE: write input to the pipe, read output back.
     // Only valid on pipe opens (named pipes on IPC$).
@@ -3638,14 +4184,23 @@ async fn handle_ioctl(
         let file_id_volatile = io.file_id.volatile;
         let session_id = req.header.session_id;
         let tree_id = req.header.tree_id.unwrap_or(0);
-        let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+        let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile)
+            .await
+        {
             Ok(e) => e,
             Err(status) => return error_response_for(Command::Ioctl, status, &req.header),
         };
         if !entry.is_pipe {
-            return error_response_for(Command::Ioctl, NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST), &req.header);
+            return error_response_for(
+                Command::Ioctl,
+                NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
+                &req.header,
+            );
         }
-        let ps = entry.pipe_state.as_ref().expect("pipe open without pipe_state");
+        let ps = entry
+            .pipe_state
+            .as_ref()
+            .expect("pipe open without pipe_state");
         let identity = lookup_session_identity(conn_state, session_id).await;
         let shares = visible_shares_for_ctx(&state.shares_snapshot(), identity.as_ref());
         let server_name = if !state.config.server_name.is_empty() {
@@ -3705,7 +4260,8 @@ async fn handle_ioctl(
             }
             match &io.buffer {
                 rssmb_proto::ioctl::IoctlReqData::FsctlValidateNegotiateInfo(vni) => {
-                    if vni.capabilities != u32::from_le_bytes(rec.client_capabilities.into_bytes()) {
+                    if vni.capabilities != u32::from_le_bytes(rec.client_capabilities.into_bytes())
+                    {
                         warn!(conn_id = conn_state.conn_id, "VNI capabilities mismatch");
                         return FramedResponse::Disconnect;
                     }
@@ -3717,19 +4273,28 @@ async fn handle_ioctl(
                         warn!(conn_id = conn_state.conn_id, "VNI security mode mismatch");
                         return FramedResponse::Disconnect;
                     }
-                    let vni_dialects: Vec<WireDialect> = vni.dialects.iter().map(|d| {
-                        match d.dialect {
+                    let vni_dialects: Vec<WireDialect> = vni
+                        .dialects
+                        .iter()
+                        .map(|d| match d.dialect {
                             0x0202 => WireDialect::Smb0202,
                             0x0210 => WireDialect::Smb021,
                             0x0300 => WireDialect::Smb030,
                             0x0302 => WireDialect::Smb0302,
                             0x0311 => WireDialect::Smb0311,
                             _ => WireDialect::Smb0202,
-                        }
-                    }).collect();
-                    let reselected = select_dialect(&vni_dialects, state.config.min_dialect, state.config.max_dialect);
+                        })
+                        .collect();
+                    let reselected = select_dialect(
+                        &vni_dialects,
+                        state.config.min_dialect,
+                        state.config.max_dialect,
+                    );
                     if reselected != Some(rec.dialect) {
-                        warn!(conn_id = conn_state.conn_id, "VNI dialect re-selection mismatch");
+                        warn!(
+                            conn_id = conn_state.conn_id,
+                            "VNI dialect re-selection mismatch"
+                        );
                         return FramedResponse::Disconnect;
                     }
                     let out = rssmb_proto::ioctl::ValidateNegotiateInfoResponse {
@@ -3741,7 +4306,11 @@ async fn handle_ioctl(
                     use binrw::BinWrite;
                     let mut buf = std::io::Cursor::new(Vec::new());
                     if out.write_le(&mut buf).is_err() {
-                        return error_response_for(Command::Ioctl, NtStatus::InvalidParameter, &req.header);
+                        return error_response_for(
+                            Command::Ioctl,
+                            NtStatus::InvalidParameter,
+                            &req.header,
+                        );
                     }
                     let resp = rssmb_proto::ioctl::IoctlResponse {
                         ctl_code: io.ctl_code,
@@ -3749,10 +4318,17 @@ async fn handle_ioctl(
                         in_buffer: vec![],
                         out_buffer: buf.into_inner(),
                     };
-                    return FramedResponse::Plain(build_response(&req.header, ResponseContent::Ioctl(resp)));
+                    return FramedResponse::Plain(build_response(
+                        &req.header,
+                        ResponseContent::Ioctl(resp),
+                    ));
                 }
                 _ => {
-                    return error_response_for(Command::Ioctl, NtStatus::InvalidParameter, &req.header);
+                    return error_response_for(
+                        Command::Ioctl,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
                 }
             }
         }
@@ -3788,12 +4364,11 @@ async fn handle_lock(
 
     // Look up the open handle, validating session/tree ownership.
     let file_id_volatile = lock_req.file_id.volatile;
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile)
-        .await
-    {
-        Ok(e) => e,
-        Err(status) => return error_response_for(Command::Lock, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(status) => return error_response_for(Command::Lock, status, &req.header),
+        };
 
     // Pipe opens don't support byte-range locks.
     if entry.is_pipe {
@@ -3840,11 +4415,7 @@ async fn handle_lock(
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
             }
-            return error_response_for(
-                Command::Lock,
-                NtStatus::InvalidParameter,
-                &req.header,
-            );
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
         }
 
         // Zero-length ranges are invalid for locking.
@@ -3855,11 +4426,7 @@ async fn handle_lock(
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
             }
-            return error_response_for(
-                Command::Lock,
-                NtStatus::InvalidParameter,
-                &req.header,
-            );
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
         }
 
         // Attempt to acquire the lock.
@@ -3909,10 +4476,7 @@ async fn handle_lock(
 ///
 /// CANCEL itself never gets a response. The cancelled operation is completed
 /// with STATUS_CANCELLED, sent on the write channel as an async response.
-async fn handle_cancel(
-    conn_state: &ConnState,
-    req_header: &Header,
-) -> Option<FramedResponse> {
+async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<FramedResponse> {
     // Async CANCEL carries the AsyncId; sync CANCEL carries the MessageId of
     // the original request. We use MessageId as AsyncId, so both map here.
     let target = req_header.async_id.unwrap_or(req_header.message_id);
@@ -3926,7 +4490,10 @@ async fn handle_cancel(
         }
     };
     let Some(op) = removed else {
-        debug!(conn_id = conn_state.conn_id, target, "cancel: no matching pending op");
+        debug!(
+            conn_id = conn_state.conn_id,
+            target, "cancel: no matching pending op"
+        );
         return None;
     };
     let _ = op.cancel.send(());
@@ -3968,10 +4535,17 @@ async fn handle_cancel(
 /// plaintext once encryption is selected — if the encryption state is
 /// missing after the decision, the response is dropped (not sent
 /// unencrypted).
-pub(crate) async fn send_unsolicited(conn_state: &ConnState, resp: &FramedResponse, client_signed: bool) {
+pub(crate) async fn send_unsolicited(
+    conn_state: &ConnState,
+    resp: &FramedResponse,
+    client_signed: bool,
+) {
     let mut bytes = rssmb_wire_adapter::encode_response(resp).to_vec();
     if bytes.is_empty() {
-        tracing::warn!(conn_id = conn_state.conn_id, "send_unsolicited: nothing to send");
+        tracing::warn!(
+            conn_id = conn_state.conn_id,
+            "send_unsolicited: nothing to send"
+        );
         return;
     }
 
@@ -3980,9 +4554,16 @@ pub(crate) async fn send_unsolicited(conn_state: &ConnState, resp: &FramedRespon
     let enc_state_snap: Option<EncryptionState> = match resp {
         FramedResponse::Plain(p) => {
             let sid = p.header.session_id;
-            if sid == 0 { None } else {
-                conn_state.encryption.read().unwrap()
-                    .get(&sid).filter(|st| st.encrypt_data).cloned()
+            if sid == 0 {
+                None
+            } else {
+                conn_state
+                    .encryption
+                    .read()
+                    .unwrap()
+                    .get(&sid)
+                    .filter(|st| st.encrypt_data)
+                    .cloned()
             }
         }
         _ => None,
@@ -4028,9 +4609,7 @@ pub(crate) async fn send_unsolicited(conn_state: &ConnState, resp: &FramedRespon
             }
         };
         let orig_len = plaintext.len() as u32;
-        match crate::crypto::encrypt_message(
-            &st.enc_key, &nonce, orig_len, sid, &mut plaintext,
-        ) {
+        match crate::crypto::encrypt_message(&st.enc_key, &nonce, orig_len, sid, &mut plaintext) {
             Ok((hdr, tag)) => {
                 let mut wire = Vec::with_capacity(4 + 52 + plaintext.len());
                 let nb_len = (52 + plaintext.len()) as u32;
@@ -4128,15 +4707,21 @@ fn visible_shares_for_ctx(
             if is_guest && !sc.guest_ok {
                 return false;
             }
-            if !sc.valid_users.is_empty() {
-                if !sc.valid_users.iter().any(|u| u.eq_ignore_ascii_case(username)) {
-                    return false;
-                }
+            if !sc.valid_users.is_empty()
+                && !sc
+                    .valid_users
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(username))
+            {
+                return false;
             }
-            if !sc.read_users.is_empty() {
-                if !sc.read_users.iter().any(|u| u.eq_ignore_ascii_case(username)) {
-                    return false;
-                }
+            if !sc.read_users.is_empty()
+                && !sc
+                    .read_users
+                    .iter()
+                    .any(|u| u.eq_ignore_ascii_case(username))
+            {
+                return false;
             }
             true
         })
@@ -4168,7 +4753,9 @@ async fn lookup_open_for_session(
     file_id_volatile: u64,
 ) -> Result<OpenEntry, NtStatus> {
     let opens = conn_state.opens.read().await;
-    let entry = opens.get(&file_id_volatile).ok_or(NtStatus::InvalidHandle)?;
+    let entry = opens
+        .get(&file_id_volatile)
+        .ok_or(NtStatus::InvalidHandle)?;
     // Validate that the handle belongs to this session.
     if entry.session_id != session_id {
         return Err(NtStatus::InvalidHandle);
@@ -4299,17 +4886,19 @@ mod tests {
         }
     }
 
-    fn make_negotiate_request_with_dialects(dialects: Vec<WireDialect>) -> rssmb_proto::plain::PlainRequest {
-        use rssmb_proto::negotiate::{NegotiateRequest, PreauthIntegrityCapabilities, HashAlgorithm};
+    fn make_negotiate_request_with_dialects(
+        dialects: Vec<WireDialect>,
+    ) -> rssmb_proto::plain::PlainRequest {
+        use rssmb_proto::negotiate::{
+            HashAlgorithm, NegotiateRequest, PreauthIntegrityCapabilities,
+        };
         // If 3.1.1 is in the offer, include preauth context (required for 3.1.1).
         let negotiate_context_list = if dialects.contains(&WireDialect::Smb0311) {
-            Some(vec![
-                PreauthIntegrityCapabilities {
-                    hash_algorithms: vec![HashAlgorithm::Sha512],
-                    salt: vec![0xab; 32],
-                }
-                .into(),
-            ])
+            Some(vec![PreauthIntegrityCapabilities {
+                hash_algorithms: vec![HashAlgorithm::Sha512],
+                salt: vec![0xab; 32],
+            }
+            .into()])
         } else {
             None
         };
@@ -4364,7 +4953,10 @@ mod tests {
         }
     }
 
-    fn make_request_with_command(command: Command, message_id: u64) -> rssmb_proto::plain::PlainRequest {
+    fn make_request_with_command(
+        command: Command,
+        message_id: u64,
+    ) -> rssmb_proto::plain::PlainRequest {
         use rssmb_proto::echo::EchoRequest;
         let content = RequestContent::Echo(EchoRequest::default());
         rssmb_proto::plain::PlainRequest {
@@ -4446,7 +5038,10 @@ mod tests {
             _ => panic!(),
         };
 
-        assert_eq!(guid1, guid2, "server GUID must be stable across negotiate responses");
+        assert_eq!(
+            guid1, guid2,
+            "server GUID must be stable across negotiate responses"
+        );
     }
 
     #[tokio::test]
@@ -4475,7 +5070,10 @@ mod tests {
         let conn = make_conn_state();
         let framed = FramedMessage::Smb1Negotiate(vec![0xff, 0x53, 0x4d, 0x42, 0x00]);
         let resp = handle_message(&state, &conn, framed, &[], None).await;
-        assert!(resp.is_none(), "SMB1 negotiate should produce no response (SMB2-only server)");
+        assert!(
+            resp.is_none(),
+            "SMB1 negotiate should produce no response (SMB2-only server)"
+        );
     }
 
     #[tokio::test]
@@ -4510,7 +5108,10 @@ mod tests {
         let req = make_request_with_command(Command::ServerToClientNotification, 4);
         let framed = FramedMessage::Plain(req);
         let resp = handle_message(&state, &conn, framed, &[], None).await;
-        assert!(resp.is_none(), "ServerToClientNotification should not produce a response");
+        assert!(
+            resp.is_none(),
+            "ServerToClientNotification should not produce a response"
+        );
     }
 
     #[tokio::test]
@@ -4555,7 +5156,9 @@ mod tests {
         match resp {
             // No handle → InvalidHandle is correct; the important thing is
             // that we got here at all (the request parsed).
-            FramedResponse::Error { command, status, .. } => {
+            FramedResponse::Error {
+                command, status, ..
+            } => {
                 assert_eq!(command, Command::Close);
                 assert_eq!(status, NtStatus::InvalidHandle);
             }
@@ -4563,7 +5166,11 @@ mod tests {
         }
     }
 
-    fn close_req(message_id: u64, session_id: u64, related: bool) -> rssmb_proto::plain::PlainRequest {
+    fn close_req(
+        message_id: u64,
+        session_id: u64,
+        related: bool,
+    ) -> rssmb_proto::plain::PlainRequest {
         rssmb_proto::plain::PlainRequest {
             header: Header {
                 credit_charge: 1,
@@ -4580,7 +5187,10 @@ mod tests {
             },
             content: RequestContent::Close(rssmb_proto::create::CloseRequest {
                 flags: rssmb_proto::create::CloseFlags::new(),
-                file_id: rssmb_proto::create::FileId { persistent: u64::MAX, volatile: u64::MAX },
+                file_id: rssmb_proto::create::FileId {
+                    persistent: u64::MAX,
+                    volatile: u64::MAX,
+                },
             }),
         }
     }
@@ -4597,7 +5207,10 @@ mod tests {
             FramedResponse::Compound(ps) => {
                 assert_eq!(ps.len(), 2);
                 assert_eq!(ps[0].header.session_id, 42);
-                assert_eq!(ps[1].header.session_id, 42, "propagated error lost the effective session");
+                assert_eq!(
+                    ps[1].header.session_id, 42,
+                    "propagated error lost the effective session"
+                );
                 assert_eq!(ps[1].header.tree_id, Some(7));
                 assert_eq!(ps[1].header.status, NtStatus::InvalidHandle.to_u32());
             }
@@ -4614,15 +5227,43 @@ mod tests {
         // leaving 16 credits. Window is [1..17).
         // Drain all but 1 credit by sending 15 echoes with unique MessageIds.
         for i in 0..15 {
-            let r = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(i + 1)), &[], None).await;
+            let r = handle_message(
+                &state,
+                &conn,
+                FramedMessage::Plain(make_echo_request_with_id(i + 1)),
+                &[],
+                None,
+            )
+            .await;
             assert!(r.is_some(), "echo should produce a response");
         }
         // Now exactly 1 credit remains (message_id 16). The next echo uses it.
-        let r1 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(16)), &[], None).await;
-        assert!(matches!(r1, Some(FramedResponse::Plain(_))), "echo should succeed with the last credit");
+        let r1 = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_echo_request_with_id(16)),
+            &[],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(r1, Some(FramedResponse::Plain(_))),
+            "echo should succeed with the last credit"
+        );
         // Now 0 credits — next request must disconnect.
-        let r2 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(17)), &[], None).await;
-        assert!(matches!(r2, Some(FramedResponse::Disconnect)), "expected disconnect, got {:?}", r2);
+        let r2 = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_echo_request_with_id(17)),
+            &[],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(r2, Some(FramedResponse::Disconnect)),
+            "expected disconnect, got {:?}",
+            r2
+        );
     }
 
     #[tokio::test]
@@ -4631,8 +5272,8 @@ mod tests {
         // violation must end the connection, not become a propagated error.
         let state = make_test_state();
         let conn = make_conn_state(); // 1 initial credit
-        // Manually set negotiate record so the gate passes, without
-        // consuming the initial credit.
+                                      // Manually set negotiate record so the gate passes, without
+                                      // consuming the initial credit.
         *conn.negotiate_record.lock().await = Some(NegotiateRecord {
             dialect: DialectConfig::Smb21,
             client_guid: Guid::generate(),
@@ -4644,7 +5285,11 @@ mod tests {
         });
         let reqs = vec![close_req(0, 42, false), close_req(1, 42, false)];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
-        assert!(matches!(resp, Some(FramedResponse::Disconnect)), "expected disconnect, got {:?}", resp);
+        assert!(
+            matches!(resp, Some(FramedResponse::Disconnect)),
+            "expected disconnect, got {:?}",
+            resp
+        );
     }
 
     #[tokio::test]
@@ -4661,9 +5306,17 @@ mod tests {
             neg311: None,
         });
         conn.credits.grant(2); // 1 + 2 = 3 total
-        let reqs = vec![close_req(0, 42, false), close_req(1, u64::MAX, true), close_req(2, u64::MAX, true)];
+        let reqs = vec![
+            close_req(0, 42, false),
+            close_req(1, u64::MAX, true),
+            close_req(2, u64::MAX, true),
+        ];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
-        assert!(matches!(resp, Some(FramedResponse::Compound(ref ps)) if ps.len() == 3), "got {:?}", resp);
+        assert!(
+            matches!(resp, Some(FramedResponse::Compound(ref ps)) if ps.len() == 3),
+            "got {:?}",
+            resp
+        );
         assert_eq!(conn.credits.available_credits(), 0);
     }
 
@@ -4674,9 +5327,17 @@ mod tests {
         let state = make_test_state();
         let conn = make_conn_state();
         conn.credits.grant(1);
-        let reqs = vec![close_req(0, 42, false), close_req(1, u64::MAX, true), close_req(2, u64::MAX, true)];
+        let reqs = vec![
+            close_req(0, 42, false),
+            close_req(1, u64::MAX, true),
+            close_req(2, u64::MAX, true),
+        ];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
-        assert!(matches!(resp, Some(FramedResponse::Disconnect)), "got {:?}", resp);
+        assert!(
+            matches!(resp, Some(FramedResponse::Disconnect)),
+            "got {:?}",
+            resp
+        );
     }
 
     #[tokio::test]
@@ -4688,7 +5349,9 @@ mod tests {
         let mut req = make_echo_request();
         req.header.credit_charge = 300; // > max_charge (256)
         match handle_message(&state, &conn, FramedMessage::Plain(req), &[], None).await {
-            Some(FramedResponse::Error { status, .. }) => assert_eq!(status, NtStatus::InvalidParameter),
+            Some(FramedResponse::Error { status, .. }) => {
+                assert_eq!(status, NtStatus::InvalidParameter)
+            }
             other => panic!("expected InvalidParameter, got {:?}", other),
         }
     }
@@ -4697,7 +5360,12 @@ mod tests {
 
     #[test]
     fn select_highest_common_dialect() {
-        let client = vec![WireDialect::Smb0202, WireDialect::Smb021, WireDialect::Smb030, WireDialect::Smb0302];
+        let client = vec![
+            WireDialect::Smb0202,
+            WireDialect::Smb021,
+            WireDialect::Smb030,
+            WireDialect::Smb0302,
+        ];
         assert_eq!(
             select_dialect(&client, DialectConfig::Smb21, DialectConfig::Smb311),
             Some(DialectConfig::Smb302)
@@ -4734,7 +5402,11 @@ mod tests {
     fn select_311_when_offered_and_configured() {
         // Now that 3.1.1 is implemented, it is selected when offered and
         // within the configured range.
-        let client = vec![WireDialect::Smb030, WireDialect::Smb0302, WireDialect::Smb0311];
+        let client = vec![
+            WireDialect::Smb030,
+            WireDialect::Smb0302,
+            WireDialect::Smb0311,
+        ];
         assert_eq!(
             select_dialect(&client, DialectConfig::Smb21, DialectConfig::Smb311),
             Some(DialectConfig::Smb311),
@@ -4753,7 +5425,11 @@ mod tests {
 
     #[test]
     fn select_respects_config_range() {
-        let client = vec![WireDialect::Smb021, WireDialect::Smb030, WireDialect::Smb0302];
+        let client = vec![
+            WireDialect::Smb021,
+            WireDialect::Smb030,
+            WireDialect::Smb0302,
+        ];
         // max_dialect = Smb21 → can't negotiate above 2.1
         assert_eq!(
             select_dialect(&client, DialectConfig::Smb21, DialectConfig::Smb21),
@@ -4769,7 +5445,12 @@ mod tests {
     #[test]
     fn select_unordered_offer_picks_highest() {
         // Client sends dialects out of order.
-        let client = vec![WireDialect::Smb0302, WireDialect::Smb0202, WireDialect::Smb030, WireDialect::Smb021];
+        let client = vec![
+            WireDialect::Smb0302,
+            WireDialect::Smb0202,
+            WireDialect::Smb030,
+            WireDialect::Smb021,
+        ];
         assert_eq!(
             select_dialect(&client, DialectConfig::Smb21, DialectConfig::Smb311),
             Some(DialectConfig::Smb302),
@@ -4799,8 +5480,11 @@ mod tests {
         // Second NEGOTIATE should disconnect.
         let req2 = make_negotiate_request();
         let resp2 = handle_message(&state, &conn, FramedMessage::Plain(req2), &[], None).await;
-        assert!(matches!(resp2, Some(FramedResponse::Disconnect)),
-            "repeat NEGOTIATE should disconnect, got {:?}", resp2);
+        assert!(
+            matches!(resp2, Some(FramedResponse::Disconnect)),
+            "repeat NEGOTIATE should disconnect, got {:?}",
+            resp2
+        );
     }
 
     #[tokio::test]
@@ -4810,8 +5494,11 @@ mod tests {
         // ECHO before NEGOTIATE should disconnect.
         let req = make_echo_request();
         let resp = handle_message(&state, &conn, FramedMessage::Plain(req), &[], None).await;
-        assert!(matches!(resp, Some(FramedResponse::Disconnect)),
-            "command before NEGOTIATE should disconnect, got {:?}", resp);
+        assert!(
+            matches!(resp, Some(FramedResponse::Disconnect)),
+            "command before NEGOTIATE should disconnect, got {:?}",
+            resp
+        );
     }
 
     #[tokio::test]
@@ -4820,8 +5507,11 @@ mod tests {
         let conn = make_conn_state();
         // Client offers all dialects including 3.1.1.
         let req = make_negotiate_request_with_dialects(vec![
-            WireDialect::Smb0202, WireDialect::Smb021,
-            WireDialect::Smb030, WireDialect::Smb0302, WireDialect::Smb0311,
+            WireDialect::Smb0202,
+            WireDialect::Smb021,
+            WireDialect::Smb030,
+            WireDialect::Smb0302,
+            WireDialect::Smb0311,
         ]);
         let resp = handle_message(&state, &conn, FramedMessage::Plain(req), &[], None).await;
         assert!(resp.is_some());
@@ -4851,7 +5541,9 @@ mod tests {
         let req = make_negotiate_request_with_dialects(vec![WireDialect::Smb0311]);
         let resp = handle_message(&state, &conn, FramedMessage::Plain(req), &[], None).await;
         match resp {
-            Some(FramedResponse::Error { status, .. }) => assert_eq!(status, NtStatus::NotSupported),
+            Some(FramedResponse::Error { status, .. }) => {
+                assert_eq!(status, NtStatus::NotSupported)
+            }
             other => panic!("expected NotSupported, got {:?}", other),
         }
     }
@@ -4876,11 +5568,20 @@ mod tests {
     async fn file_ids_volatile_never_hits_sentinel() {
         let conn = make_conn_state();
         // Set the counter close to u64::MAX to test the skip.
-        conn.next_volatile_id.store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
+        conn.next_volatile_id
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
         let fid1 = next_file_id(&conn);
         let fid2 = next_file_id(&conn);
-        assert_ne!(fid1.volatile, u64::MAX, "volatile must never be 0xFFFF...FFFF");
-        assert_ne!(fid2.volatile, u64::MAX, "volatile must never be 0xFFFF...FFFF");
+        assert_ne!(
+            fid1.volatile,
+            u64::MAX,
+            "volatile must never be 0xFFFF...FFFF"
+        );
+        assert_ne!(
+            fid2.volatile,
+            u64::MAX,
+            "volatile must never be 0xFFFF...FFFF"
+        );
     }
 
     #[tokio::test]
@@ -4889,7 +5590,10 @@ mod tests {
         conn.persistent_base = 0x1234_5678_9ABC_DEF0;
         let fid = next_file_id(&conn);
         // persistent = base + volatile; with base != 0 they should differ.
-        assert_ne!(fid.persistent, fid.volatile, "persistent should differ from volatile when base != 0");
+        assert_ne!(
+            fid.persistent, fid.volatile,
+            "persistent should differ from volatile when base != 0"
+        );
     }
 
     #[tokio::test]
@@ -4900,7 +5604,10 @@ mod tests {
         assert_ne!(0, id1, "SessionId must be non-zero");
         assert_ne!(0, id2, "SessionId must be non-zero");
         // Random — extremely unlikely to collide.
-        assert_ne!(id1, id2, "SessionId should be random (collision is astronomically unlikely)");
+        assert_ne!(
+            id1, id2,
+            "SessionId should be random (collision is astronomically unlikely)"
+        );
     }
 
     // --- Phase 4 Option C: per-share read_users/write_users tests ---
@@ -4913,7 +5620,12 @@ mod tests {
         Arc::new(ServerState::new(config))
     }
 
-    fn make_share_config(name: &str, read_only: bool, read_users: Vec<String>, write_users: Vec<String>) -> ShareConfig {
+    fn make_share_config(
+        name: &str,
+        read_only: bool,
+        read_users: Vec<String>,
+        write_users: Vec<String>,
+    ) -> ShareConfig {
         ShareConfig {
             name: name.to_string(),
             path: String::new(), // MemoryFs
@@ -4935,14 +5647,24 @@ mod tests {
     fn test_visible_shares_filters_by_read_users() {
         let config = {
             let mut c = crate::config::ServerConfig::for_testing();
-            c.shares.insert("alpha".to_string(), make_share_config("alpha", false, vec!["alice".to_string()], vec![]));
-            c.shares.insert("beta".to_string(), make_share_config("beta", false, vec!["bob".to_string()], vec![]));
+            c.shares.insert(
+                "alpha".to_string(),
+                make_share_config("alpha", false, vec!["alice".to_string()], vec![]),
+            );
+            c.shares.insert(
+                "beta".to_string(),
+                make_share_config("beta", false, vec!["bob".to_string()], vec![]),
+            );
             c.shares.remove("test");
             c
         };
 
         // Alice can see alpha but not beta.
-        let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
+        let alice = rssmb_auth::Identity {
+            username: "alice".to_string(),
+            domain: String::new(),
+            is_guest: false,
+        };
         let visible = visible_shares_for_ctx(&config.shares, Some(&alice));
         let names: Vec<&str> = visible.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"alpha"), "alice should see alpha");
@@ -4953,26 +5675,46 @@ mod tests {
     fn test_visible_shares_empty_read_users_means_all() {
         let config = {
             let mut c = crate::config::ServerConfig::for_testing();
-            c.shares.insert("open".to_string(), make_share_config("open", false, vec![], vec![]));
+            c.shares.insert(
+                "open".to_string(),
+                make_share_config("open", false, vec![], vec![]),
+            );
             c.shares.remove("test");
             c
         };
-        let bob = rssmb_auth::Identity { username: "bob".to_string(), domain: String::new(), is_guest: false };
+        let bob = rssmb_auth::Identity {
+            username: "bob".to_string(),
+            domain: String::new(),
+            is_guest: false,
+        };
         let visible = visible_shares_for_ctx(&config.shares, Some(&bob));
-        assert!(visible.iter().any(|s| s.name == "open"), "bob should see open share (empty read_users)");
+        assert!(
+            visible.iter().any(|s| s.name == "open"),
+            "bob should see open share (empty read_users)"
+        );
     }
 
     #[test]
     fn test_visible_shares_read_users_case_insensitive() {
         let config = {
             let mut c = crate::config::ServerConfig::for_testing();
-            c.shares.insert("alpha".to_string(), make_share_config("alpha", false, vec!["Alice".to_string()], vec![]));
+            c.shares.insert(
+                "alpha".to_string(),
+                make_share_config("alpha", false, vec!["Alice".to_string()], vec![]),
+            );
             c.shares.remove("test");
             c
         };
-        let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
+        let alice = rssmb_auth::Identity {
+            username: "alice".to_string(),
+            domain: String::new(),
+            is_guest: false,
+        };
         let visible = visible_shares_for_ctx(&config.shares, Some(&alice));
-        assert!(visible.iter().any(|s| s.name == "alpha"), "case-insensitive read_users match should work");
+        assert!(
+            visible.iter().any(|s| s.name == "alpha"),
+            "case-insensitive read_users match should work"
+        );
     }
 }
 

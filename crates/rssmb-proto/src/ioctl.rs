@@ -120,7 +120,9 @@ impl From<Vec<u8>> for IoctlBuffer {
 
 impl From<&[u8]> for IoctlBuffer {
     fn from(buffer: &[u8]) -> Self {
-        Self { buffer: buffer.to_vec() }
+        Self {
+            buffer: buffer.to_vec(),
+        }
     }
 }
 

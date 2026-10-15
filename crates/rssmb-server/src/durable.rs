@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
+use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 
 /// A durable open entry — kept alive after disconnect for reconnect.
 ///
@@ -240,6 +240,11 @@ impl DurableTable {
         self.entries.read().await.len()
     }
 
+    /// Returns `true` if the table contains no entries.
+    pub async fn is_empty(&self) -> bool {
+        self.entries.read().await.is_empty()
+    }
+
     /// Close all durable VFS handles and clear the table. Called during
     /// graceful shutdown to ensure durable handles are properly cleaned up.
     pub async fn close_all(&self) -> usize {
@@ -283,9 +288,8 @@ pub fn deadline_from_timeout(timeout_secs: u64) -> Instant {
 mod tests {
     use super::*;
     use rssmb_vfs::{
-        CreateArgs, DirEntry, DirInfoClass, FileInfo, FileId, FsCtlCode, FsStats,
-        InfoClass, LockRange, OpenId, SecurityInfo, ShareAccess, DesiredAccess,
-        Vfs, VfsError,
+        CreateArgs, DesiredAccess, DirEntry, DirInfoClass, FileId, FileInfo, FsCtlCode, FsStats,
+        InfoClass, LockRange, OpenId, SecurityInfo, ShareAccess, Vfs, VfsError,
     };
 
     /// A no-op VFS stub for durable table tests.
@@ -302,10 +306,18 @@ mod tests {
         async fn write_at(&self, _: OpenId, _: u64, _: &[u8]) -> Result<u32, VfsError> {
             Err(VfsError::NotSupported)
         }
-        async fn close(&self, _: OpenId) -> Result<(), VfsError> { Ok(()) }
-        async fn flush(&self, _: OpenId) -> Result<(), VfsError> { Ok(()) }
-        async fn lock(&self, _: OpenId, _: LockRange, _: bool) -> Result<(), VfsError> { Ok(()) }
-        async fn unlock(&self, _: OpenId, _: LockRange) -> Result<(), VfsError> { Ok(()) }
+        async fn close(&self, _: OpenId) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn flush(&self, _: OpenId) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn lock(&self, _: OpenId, _: LockRange, _: bool) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn unlock(&self, _: OpenId, _: LockRange) -> Result<(), VfsError> {
+            Ok(())
+        }
         async fn query_info(&self, _: OpenId, _: InfoClass) -> Result<FileInfo, VfsError> {
             Err(VfsError::NotSupported)
         }
@@ -325,7 +337,9 @@ mod tests {
         async fn file_id(&self, _: OpenId) -> Result<FileId, VfsError> {
             Err(VfsError::NotSupported)
         }
-        async fn delete(&self, _: OpenId) -> Result<(), VfsError> { Ok(()) }
+        async fn delete(&self, _: OpenId) -> Result<(), VfsError> {
+            Ok(())
+        }
         async fn rename(&self, _: OpenId, _: &str, _: bool) -> Result<(), VfsError> {
             Err(VfsError::NotSupported)
         }

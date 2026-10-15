@@ -7,8 +7,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rssmb_proto::negotiate::{
     EncryptionCapabilities, EncryptionCipher, HashAlgorithm, NegotiateContext,
-    NegotiateContextType, NegotiateRequest,
-    PreauthIntegrityCapabilities, SigningAlgorithmId,
+    NegotiateContextType, NegotiateRequest, PreauthIntegrityCapabilities, SigningAlgorithmId,
 };
 use rssmb_wire_adapter::error::NtStatus;
 
@@ -73,7 +72,8 @@ pub fn process_request_contexts(
     }
 
     // Extract the preauth context.
-    let preauth = req.get_ctx_preauth_integrity_capabilities()
+    let preauth = req
+        .get_ctx_preauth_integrity_capabilities()
         .ok_or(NtStatus::InvalidParameter)?;
 
     if preauth.hash_algorithms.is_empty() {
@@ -81,8 +81,13 @@ pub fn process_request_contexts(
     }
 
     // Must offer SHA-512.
-    let sha512 = preauth.hash_algorithms.iter().find(|a| **a == HashAlgorithm::Sha512);
-    let preauth_hash_alg = sha512.copied().ok_or(NtStatus::SmbNoPreauthIntegrityHashOverlap)?;
+    let sha512 = preauth
+        .hash_algorithms
+        .iter()
+        .find(|a| **a == HashAlgorithm::Sha512);
+    let preauth_hash_alg = sha512
+        .copied()
+        .ok_or(NtStatus::SmbNoPreauthIntegrityHashOverlap)?;
 
     // --- ENCRYPTION_CAPABILITIES (optional, at most one) ---
     if encryption_count > 1 {
@@ -101,18 +106,20 @@ pub fn process_request_contexts(
 
     // Select a cipher if encryption is enabled and the client offered one
     // that we support. Server preference: AES-128-GCM.
-    let selected_cipher = if encryption_policy != EncryptionPolicy::Disabled && encryption_count == 1 {
-        if let Some(enc_ctx) = req.get_ctx_encryption_capabilities() {
-            // Pick the first server-preferred cipher that the client offers.
-            SERVER_CIPHERS.iter().find(|sc| {
-                enc_ctx.ciphers.iter().any(|cc| *cc == **sc)
-            }).copied()
+    let selected_cipher =
+        if encryption_policy != EncryptionPolicy::Disabled && encryption_count == 1 {
+            if let Some(enc_ctx) = req.get_ctx_encryption_capabilities() {
+                // Pick the first server-preferred cipher that the client offers.
+                SERVER_CIPHERS
+                    .iter()
+                    .find(|sc| enc_ctx.ciphers.iter().any(|cc| *cc == **sc))
+                    .copied()
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     // --- SIGNING_CAPABILITIES (optional, at most one) ---
     if signing_count > 1 {
@@ -126,9 +133,9 @@ pub fn process_request_contexts(
     // overlaps with ours (CMAC). If no overlap, reject.
     if signing_count == 1 {
         if let Some(signing_ctx) = req.get_ctx_signing_capabilities() {
-            let has_overlap = signing_ctx.signing_algorithms.iter().any(|a| {
-                *a == SigningAlgorithmId::AesCmac
-            });
+            let has_overlap = signing_ctx
+                .signing_algorithms
+                .contains(&SigningAlgorithmId::AesCmac);
             if !has_overlap {
                 return Err(NtStatus::InvalidParameter);
             }
@@ -156,13 +163,11 @@ pub fn process_request_contexts(
     // Send: PREAUTH_INTEGRITY_CAPABILITIES (with our salt).
     // Send: ENCRYPTION_CAPABILITIES if we selected a cipher.
     // Don't send: SIGNING, COMPRESSION.
-    let mut response_contexts = vec![
-        PreauthIntegrityCapabilities {
-            hash_algorithms: vec![preauth_hash_alg],
-            salt: negotiated.salt.clone(),
-        }
-        .into(),
-    ];
+    let mut response_contexts = vec![PreauthIntegrityCapabilities {
+        hash_algorithms: vec![preauth_hash_alg],
+        salt: negotiated.salt.clone(),
+    }
+    .into()];
 
     if let Some(cipher) = selected_cipher {
         response_contexts.push(
@@ -180,8 +185,8 @@ pub fn process_request_contexts(
 mod tests {
     use super::*;
     use crate::config::EncryptionPolicy;
-    use rssmb_proto::Guid;
     use rssmb_proto::negotiate::*;
+    use rssmb_proto::Guid;
 
     fn make_negotiate(contexts: Vec<NegotiateContext>) -> NegotiateRequest {
         NegotiateRequest {
@@ -225,20 +230,24 @@ mod tests {
         assert_eq!(neg.signing_alg, SigningAlgorithmId::AesCmac);
         // Response: only preauth context.
         assert_eq!(ctxs.len(), 1);
-        assert_eq!(ctxs[0].context_type, NegotiateContextType::PreauthIntegrityCapabilities);
+        assert_eq!(
+            ctxs[0].context_type,
+            NegotiateContextType::PreauthIntegrityCapabilities
+        );
     }
 
     #[test]
     fn test_no_sha512_overlap_rejected() {
-        let req = make_negotiate(vec![
-            PreauthIntegrityCapabilities {
-                hash_algorithms: vec![HashAlgorithm::Unknown(0x02)],
-                salt: vec![0xab; 32],
-            }
-            .into(),
-        ]);
+        let req = make_negotiate(vec![PreauthIntegrityCapabilities {
+            hash_algorithms: vec![HashAlgorithm::Unknown(0x02)],
+            salt: vec![0xab; 32],
+        }
+        .into()]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
-        assert!(matches!(result, Err(NtStatus::SmbNoPreauthIntegrityHashOverlap)));
+        assert!(matches!(
+            result,
+            Err(NtStatus::SmbNoPreauthIntegrityHashOverlap)
+        ));
     }
 
     #[test]
@@ -252,8 +261,14 @@ mod tests {
     fn test_duplicate_encryption_rejected() {
         let req = make_negotiate(vec![
             make_preauth(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Gcm] }.into(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Ccm] }.into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Gcm],
+            }
+            .into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Ccm],
+            }
+            .into(),
         ]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
         assert!(matches!(result, Err(NtStatus::InvalidParameter)));
@@ -263,8 +278,14 @@ mod tests {
     fn test_duplicate_signing_rejected() {
         let req = make_negotiate(vec![
             make_preauth(),
-            SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesCmac] }.into(),
-            SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesGmac] }.into(),
+            SigningCapabilities {
+                signing_algorithms: vec![SigningAlgorithmId::AesCmac],
+            }
+            .into(),
+            SigningCapabilities {
+                signing_algorithms: vec![SigningAlgorithmId::AesGmac],
+            }
+            .into(),
         ]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
         assert!(matches!(result, Err(NtStatus::InvalidParameter)));
@@ -277,11 +298,13 @@ mod tests {
             CompressionCapabilities {
                 flags: CompressionCapsFlags::new(),
                 compression_algorithms: vec![CompressionAlgorithm::LZ4],
-            }.into(),
+            }
+            .into(),
             CompressionCapabilities {
                 flags: CompressionCapsFlags::new(),
                 compression_algorithms: vec![CompressionAlgorithm::LZ77],
-            }.into(),
+            }
+            .into(),
         ]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
         assert!(matches!(result, Err(NtStatus::InvalidParameter)));
@@ -291,7 +314,10 @@ mod tests {
     fn test_signing_no_overlap_rejected() {
         let req = make_negotiate(vec![
             make_preauth(),
-            SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesGmac] }.into(),
+            SigningCapabilities {
+                signing_algorithms: vec![SigningAlgorithmId::AesGmac],
+            }
+            .into(),
         ]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
         assert!(matches!(result, Err(NtStatus::InvalidParameter)));
@@ -301,7 +327,10 @@ mod tests {
     fn test_signing_with_cmac_succeeds() {
         let req = make_negotiate(vec![
             make_preauth(),
-            SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesCmac] }.into(),
+            SigningCapabilities {
+                signing_algorithms: vec![SigningAlgorithmId::AesCmac],
+            }
+            .into(),
         ]);
         let (neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         assert_eq!(neg.signing_alg, SigningAlgorithmId::AesCmac);
@@ -320,23 +349,27 @@ mod tests {
                     data: vec![0x93; 16],
                 },
             },
-            SigningCapabilities { signing_algorithms: vec![SigningAlgorithmId::AesCmac] }.into(),
+            SigningCapabilities {
+                signing_algorithms: vec![SigningAlgorithmId::AesCmac],
+            }
+            .into(),
         ]);
         let (_neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         // Unknown context ignored, not echoed.
         assert_eq!(ctxs.len(), 1);
-        assert_eq!(ctxs[0].context_type, NegotiateContextType::PreauthIntegrityCapabilities);
+        assert_eq!(
+            ctxs[0].context_type,
+            NegotiateContextType::PreauthIntegrityCapabilities
+        );
     }
 
     #[test]
     fn test_empty_hash_algorithms_rejected() {
-        let req = make_negotiate(vec![
-            PreauthIntegrityCapabilities {
-                hash_algorithms: vec![],
-                salt: vec![0xab; 32],
-            }
-            .into(),
-        ]);
+        let req = make_negotiate(vec![PreauthIntegrityCapabilities {
+            hash_algorithms: vec![],
+            salt: vec![0xab; 32],
+        }
+        .into()]);
         let result = process_request_contexts(&req, EncryptionPolicy::Desired);
         assert!(matches!(result, Err(NtStatus::InvalidParameter)));
     }
@@ -344,13 +377,11 @@ mod tests {
     #[test]
     fn test_sha512_among_multiple_algorithms_succeeds() {
         // Client offers SHA-512 and an unknown algorithm.
-        let req = make_negotiate(vec![
-            PreauthIntegrityCapabilities {
-                hash_algorithms: vec![HashAlgorithm::Unknown(0x02), HashAlgorithm::Sha512],
-                salt: vec![0xab; 32],
-            }
-            .into(),
-        ]);
+        let req = make_negotiate(vec![PreauthIntegrityCapabilities {
+            hash_algorithms: vec![HashAlgorithm::Unknown(0x02), HashAlgorithm::Sha512],
+            salt: vec![0xab; 32],
+        }
+        .into()]);
         let (neg, _) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         assert_eq!(neg.preauth_hash_alg, HashAlgorithm::Sha512);
     }
@@ -359,20 +390,29 @@ mod tests {
     fn test_cipher_selected_when_gcm_offered() {
         let req = make_negotiate(vec![
             make_preauth(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Gcm] }.into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Gcm],
+            }
+            .into(),
         ]);
         let (neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         assert_eq!(neg.cipher, Some(EncryptionCipher::Aes128Gcm));
         // Response has preauth + encryption contexts.
         assert_eq!(ctxs.len(), 2);
-        assert_eq!(ctxs[1].context_type, NegotiateContextType::EncryptionCapabilities);
+        assert_eq!(
+            ctxs[1].context_type,
+            NegotiateContextType::EncryptionCapabilities
+        );
     }
 
     #[test]
     fn test_cipher_none_when_disabled() {
         let req = make_negotiate(vec![
             make_preauth(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Gcm] }.into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Gcm],
+            }
+            .into(),
         ]);
         let (neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Disabled).unwrap();
         assert!(neg.cipher.is_none());
@@ -385,7 +425,10 @@ mod tests {
         // Client offers only AES-128-CCM (which we don't implement yet).
         let req = make_negotiate(vec![
             make_preauth(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Ccm] }.into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Ccm],
+            }
+            .into(),
         ]);
         let (neg, ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         assert!(neg.cipher.is_none());
@@ -409,7 +452,10 @@ mod tests {
         // The `required` policy denies SESSION_SETUP later.
         let req = make_negotiate(vec![
             make_preauth(),
-            EncryptionCapabilities { ciphers: vec![EncryptionCipher::Aes128Ccm] }.into(),
+            EncryptionCapabilities {
+                ciphers: vec![EncryptionCipher::Aes128Ccm],
+            }
+            .into(),
         ]);
         let (neg, _ctxs) = process_request_contexts(&req, EncryptionPolicy::Required).unwrap();
         assert!(neg.cipher.is_none());
@@ -422,7 +468,8 @@ mod tests {
             make_preauth(),
             EncryptionCapabilities {
                 ciphers: vec![EncryptionCipher::Aes128Ccm, EncryptionCipher::Aes128Gcm],
-            }.into(),
+            }
+            .into(),
         ]);
         let (neg, _ctxs) = process_request_contexts(&req, EncryptionPolicy::Desired).unwrap();
         assert_eq!(neg.cipher, Some(EncryptionCipher::Aes128Gcm));

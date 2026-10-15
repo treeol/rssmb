@@ -8,7 +8,7 @@ use binrw::io::TakeSeekExt;
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString};
+use crate::dtyp::{FileTime, Guid, PosMarker, SizedWideString};
 
 // ── NegotiateRequest (MS-SMB2 2.2.3) ───────────────────────────────
 
@@ -272,14 +272,30 @@ impl NegotiateContextValue {
     /// Gets the matching negotiate context type for this value.
     pub fn get_matching_type(&self) -> NegotiateContextType {
         match self {
-            NegotiateContextValue::PreauthIntegrityCapabilities(_) => NegotiateContextType::PreauthIntegrityCapabilities,
-            NegotiateContextValue::EncryptionCapabilities(_) => NegotiateContextType::EncryptionCapabilities,
-            NegotiateContextValue::CompressionCapabilities(_) => NegotiateContextType::CompressionCapabilities,
-            NegotiateContextValue::NetnameNegotiateContextId(_) => NegotiateContextType::NetnameNegotiateContextId,
-            NegotiateContextValue::TransportCapabilities(_) => NegotiateContextType::TransportCapabilities,
-            NegotiateContextValue::RdmaTransformCapabilities(_) => NegotiateContextType::RdmaTransformCapabilities,
-            NegotiateContextValue::SigningCapabilities(_) => NegotiateContextType::SigningCapabilities,
-            NegotiateContextValue::Unknown { type_id, .. } => NegotiateContextType::Unknown(*type_id),
+            NegotiateContextValue::PreauthIntegrityCapabilities(_) => {
+                NegotiateContextType::PreauthIntegrityCapabilities
+            }
+            NegotiateContextValue::EncryptionCapabilities(_) => {
+                NegotiateContextType::EncryptionCapabilities
+            }
+            NegotiateContextValue::CompressionCapabilities(_) => {
+                NegotiateContextType::CompressionCapabilities
+            }
+            NegotiateContextValue::NetnameNegotiateContextId(_) => {
+                NegotiateContextType::NetnameNegotiateContextId
+            }
+            NegotiateContextValue::TransportCapabilities(_) => {
+                NegotiateContextType::TransportCapabilities
+            }
+            NegotiateContextValue::RdmaTransformCapabilities(_) => {
+                NegotiateContextType::RdmaTransformCapabilities
+            }
+            NegotiateContextValue::SigningCapabilities(_) => {
+                NegotiateContextType::SigningCapabilities
+            }
+            NegotiateContextValue::Unknown { type_id, .. } => {
+                NegotiateContextType::Unknown(*type_id)
+            }
         }
     }
 }
@@ -486,7 +502,10 @@ fn parse_netname<R: binrw::io::Read + binrw::io::Seek>(
     let mut data = Vec::new();
     let mut byte = [0u8; 2];
     while match reader.read(&mut byte) {
-        Ok(2) => { data.push(u16::from_le_bytes(byte)); true }
+        Ok(2) => {
+            data.push(u16::from_le_bytes(byte));
+            true
+        }
         Ok(_) => false,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
         Err(e) => return Err(e.into()),

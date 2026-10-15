@@ -4,34 +4,27 @@
 
 use binrw::prelude::*;
 
-use crate::header::{Header, Command};
-use crate::negotiate::{NegotiateRequest, NegotiateResponse};
-use crate::session_setup::{
-    SessionSetupRequest, SessionSetupResponse,
-    LogoffRequest, LogoffResponse,
-};
-use crate::tree_connect::{
-    TreeConnectRequest, TreeConnectResponse,
-    TreeDisconnectRequest, TreeDisconnectResponse,
-};
-use crate::create::{
-    CreateRequest, CreateResponse, CloseRequest, CloseResponse,
-};
-use crate::file::{
-    FlushRequest, FlushResponse,
-    ReadRequest, ReadResponse,
-    WriteRequest, WriteResponse,
-};
-use crate::echo::{EchoRequest, EchoResponse};
 use crate::cancel::CancelRequest;
+use crate::create::{CloseRequest, CloseResponse, CreateRequest, CreateResponse};
+use crate::echo::{EchoRequest, EchoResponse};
 use crate::error::ErrorResponse;
+use crate::file::{
+    FlushRequest, FlushResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
+};
+use crate::header::{Command, Header};
 use crate::info::{QueryInfoRequest, QueryInfoResponse, SetInfoRequest, SetInfoResponse};
-use crate::query_dir::{QueryDirectoryRequest, QueryDirectoryResponse};
+use crate::negotiate::{NegotiateRequest, NegotiateResponse};
 use crate::notify::{ChangeNotifyRequest, ChangeNotifyResponse, ServerToClientNotification};
 use crate::oplock::{
-    OplockBreakAck, LeaseBreakAck,
-    OplockBreakNotify, LeaseBreakNotify,
-    OplockBreakResponse, LeaseBreakResponse,
+    LeaseBreakAck, LeaseBreakNotify, LeaseBreakResponse, OplockBreakAck, OplockBreakNotify,
+    OplockBreakResponse,
+};
+use crate::query_dir::{QueryDirectoryRequest, QueryDirectoryResponse};
+use crate::session_setup::{
+    LogoffRequest, LogoffResponse, SessionSetupRequest, SessionSetupResponse,
+};
+use crate::tree_connect::{
+    TreeConnectRequest, TreeConnectResponse, TreeDisconnectRequest, TreeDisconnectResponse,
 };
 
 /// Contains all the variants for a plain SMB2 request message.
@@ -102,7 +95,9 @@ impl RequestContent {
             RequestContent::Ioctl(_) => Command::Ioctl,
             RequestContent::Lock(_) => Command::Lock,
             RequestContent::Cancel(_) => Command::Cancel,
-            RequestContent::OplockBreakAck(_) | RequestContent::LeaseBreakAck(_) => Command::OplockBreak,
+            RequestContent::OplockBreakAck(_) | RequestContent::LeaseBreakAck(_) => {
+                Command::OplockBreak
+            }
         }
     }
 }
@@ -191,51 +186,195 @@ impl ResponseContent {
 }
 
 // From impls for common request types.
-impl From<NegotiateRequest> for RequestContent { fn from(v: NegotiateRequest) -> Self { RequestContent::Negotiate(v) } }
-impl From<SessionSetupRequest> for RequestContent { fn from(v: SessionSetupRequest) -> Self { RequestContent::SessionSetup(v) } }
-impl From<LogoffRequest> for RequestContent { fn from(v: LogoffRequest) -> Self { RequestContent::Logoff(v) } }
-impl From<TreeConnectRequest> for RequestContent { fn from(v: TreeConnectRequest) -> Self { RequestContent::TreeConnect(v) } }
-impl From<TreeDisconnectRequest> for RequestContent { fn from(v: TreeDisconnectRequest) -> Self { RequestContent::TreeDisconnect(v) } }
-impl From<CreateRequest> for RequestContent { fn from(v: CreateRequest) -> Self { RequestContent::Create(v) } }
-impl From<CloseRequest> for RequestContent { fn from(v: CloseRequest) -> Self { RequestContent::Close(v) } }
-impl From<FlushRequest> for RequestContent { fn from(v: FlushRequest) -> Self { RequestContent::Flush(v) } }
-impl From<ReadRequest> for RequestContent { fn from(v: ReadRequest) -> Self { RequestContent::Read(v) } }
-impl From<WriteRequest> for RequestContent { fn from(v: WriteRequest) -> Self { RequestContent::Write(v) } }
-impl From<EchoRequest> for RequestContent { fn from(v: EchoRequest) -> Self { RequestContent::Echo(v) } }
-impl From<QueryDirectoryRequest> for RequestContent { fn from(v: QueryDirectoryRequest) -> Self { RequestContent::QueryDirectory(v) } }
-impl From<ChangeNotifyRequest> for RequestContent { fn from(v: ChangeNotifyRequest) -> Self { RequestContent::ChangeNotify(v) } }
-impl From<QueryInfoRequest> for RequestContent { fn from(v: QueryInfoRequest) -> Self { RequestContent::QueryInfo(v) } }
-impl From<SetInfoRequest> for RequestContent { fn from(v: SetInfoRequest) -> Self { RequestContent::SetInfo(v) } }
-impl From<crate::ioctl::IoctlRequest> for RequestContent { fn from(v: crate::ioctl::IoctlRequest) -> Self { RequestContent::Ioctl(v) } }
-impl From<crate::lock::LockRequest> for RequestContent { fn from(v: crate::lock::LockRequest) -> Self { RequestContent::Lock(v) } }
-impl From<CancelRequest> for RequestContent { fn from(v: CancelRequest) -> Self { RequestContent::Cancel(v) } }
+impl From<NegotiateRequest> for RequestContent {
+    fn from(v: NegotiateRequest) -> Self {
+        RequestContent::Negotiate(v)
+    }
+}
+impl From<SessionSetupRequest> for RequestContent {
+    fn from(v: SessionSetupRequest) -> Self {
+        RequestContent::SessionSetup(v)
+    }
+}
+impl From<LogoffRequest> for RequestContent {
+    fn from(v: LogoffRequest) -> Self {
+        RequestContent::Logoff(v)
+    }
+}
+impl From<TreeConnectRequest> for RequestContent {
+    fn from(v: TreeConnectRequest) -> Self {
+        RequestContent::TreeConnect(v)
+    }
+}
+impl From<TreeDisconnectRequest> for RequestContent {
+    fn from(v: TreeDisconnectRequest) -> Self {
+        RequestContent::TreeDisconnect(v)
+    }
+}
+impl From<CreateRequest> for RequestContent {
+    fn from(v: CreateRequest) -> Self {
+        RequestContent::Create(v)
+    }
+}
+impl From<CloseRequest> for RequestContent {
+    fn from(v: CloseRequest) -> Self {
+        RequestContent::Close(v)
+    }
+}
+impl From<FlushRequest> for RequestContent {
+    fn from(v: FlushRequest) -> Self {
+        RequestContent::Flush(v)
+    }
+}
+impl From<ReadRequest> for RequestContent {
+    fn from(v: ReadRequest) -> Self {
+        RequestContent::Read(v)
+    }
+}
+impl From<WriteRequest> for RequestContent {
+    fn from(v: WriteRequest) -> Self {
+        RequestContent::Write(v)
+    }
+}
+impl From<EchoRequest> for RequestContent {
+    fn from(v: EchoRequest) -> Self {
+        RequestContent::Echo(v)
+    }
+}
+impl From<QueryDirectoryRequest> for RequestContent {
+    fn from(v: QueryDirectoryRequest) -> Self {
+        RequestContent::QueryDirectory(v)
+    }
+}
+impl From<ChangeNotifyRequest> for RequestContent {
+    fn from(v: ChangeNotifyRequest) -> Self {
+        RequestContent::ChangeNotify(v)
+    }
+}
+impl From<QueryInfoRequest> for RequestContent {
+    fn from(v: QueryInfoRequest) -> Self {
+        RequestContent::QueryInfo(v)
+    }
+}
+impl From<SetInfoRequest> for RequestContent {
+    fn from(v: SetInfoRequest) -> Self {
+        RequestContent::SetInfo(v)
+    }
+}
+impl From<crate::ioctl::IoctlRequest> for RequestContent {
+    fn from(v: crate::ioctl::IoctlRequest) -> Self {
+        RequestContent::Ioctl(v)
+    }
+}
+impl From<crate::lock::LockRequest> for RequestContent {
+    fn from(v: crate::lock::LockRequest) -> Self {
+        RequestContent::Lock(v)
+    }
+}
+impl From<CancelRequest> for RequestContent {
+    fn from(v: CancelRequest) -> Self {
+        RequestContent::Cancel(v)
+    }
+}
 
 // From impls for common response types.
-impl From<NegotiateResponse> for ResponseContent { fn from(v: NegotiateResponse) -> Self { ResponseContent::Negotiate(v) } }
-impl From<SessionSetupResponse> for ResponseContent { fn from(v: SessionSetupResponse) -> Self { ResponseContent::SessionSetup(v) } }
-impl From<LogoffResponse> for ResponseContent { fn from(v: LogoffResponse) -> Self { ResponseContent::Logoff(v) } }
-impl From<TreeConnectResponse> for ResponseContent { fn from(v: TreeConnectResponse) -> Self { ResponseContent::TreeConnect(v) } }
-impl From<TreeDisconnectResponse> for ResponseContent { fn from(v: TreeDisconnectResponse) -> Self { ResponseContent::TreeDisconnect(v) } }
-impl From<CreateResponse> for ResponseContent { fn from(v: CreateResponse) -> Self { ResponseContent::Create(v) } }
-impl From<CloseResponse> for ResponseContent { fn from(v: CloseResponse) -> Self { ResponseContent::Close(v) } }
-impl From<FlushResponse> for ResponseContent { fn from(v: FlushResponse) -> Self { ResponseContent::Flush(v) } }
-impl From<ReadResponse> for ResponseContent { fn from(v: ReadResponse) -> Self { ResponseContent::Read(v) } }
-impl From<WriteResponse> for ResponseContent { fn from(v: WriteResponse) -> Self { ResponseContent::Write(v) } }
-impl From<EchoResponse> for ResponseContent { fn from(v: EchoResponse) -> Self { ResponseContent::Echo(v) } }
-impl From<QueryDirectoryResponse> for ResponseContent { fn from(v: QueryDirectoryResponse) -> Self { ResponseContent::QueryDirectory(v) } }
-impl From<ChangeNotifyResponse> for ResponseContent { fn from(v: ChangeNotifyResponse) -> Self { ResponseContent::ChangeNotify(v) } }
-impl From<QueryInfoResponse> for ResponseContent { fn from(v: QueryInfoResponse) -> Self { ResponseContent::QueryInfo(v) } }
-impl From<SetInfoResponse> for ResponseContent { fn from(v: SetInfoResponse) -> Self { ResponseContent::SetInfo(v) } }
-impl From<crate::ioctl::IoctlResponse> for ResponseContent { fn from(v: crate::ioctl::IoctlResponse) -> Self { ResponseContent::Ioctl(v) } }
-impl From<crate::lock::LockResponse> for ResponseContent { fn from(v: crate::lock::LockResponse) -> Self { ResponseContent::Lock(v) } }
-impl From<ErrorResponse> for ResponseContent { fn from(v: ErrorResponse) -> Self { ResponseContent::Error(v) } }
+impl From<NegotiateResponse> for ResponseContent {
+    fn from(v: NegotiateResponse) -> Self {
+        ResponseContent::Negotiate(v)
+    }
+}
+impl From<SessionSetupResponse> for ResponseContent {
+    fn from(v: SessionSetupResponse) -> Self {
+        ResponseContent::SessionSetup(v)
+    }
+}
+impl From<LogoffResponse> for ResponseContent {
+    fn from(v: LogoffResponse) -> Self {
+        ResponseContent::Logoff(v)
+    }
+}
+impl From<TreeConnectResponse> for ResponseContent {
+    fn from(v: TreeConnectResponse) -> Self {
+        ResponseContent::TreeConnect(v)
+    }
+}
+impl From<TreeDisconnectResponse> for ResponseContent {
+    fn from(v: TreeDisconnectResponse) -> Self {
+        ResponseContent::TreeDisconnect(v)
+    }
+}
+impl From<CreateResponse> for ResponseContent {
+    fn from(v: CreateResponse) -> Self {
+        ResponseContent::Create(v)
+    }
+}
+impl From<CloseResponse> for ResponseContent {
+    fn from(v: CloseResponse) -> Self {
+        ResponseContent::Close(v)
+    }
+}
+impl From<FlushResponse> for ResponseContent {
+    fn from(v: FlushResponse) -> Self {
+        ResponseContent::Flush(v)
+    }
+}
+impl From<ReadResponse> for ResponseContent {
+    fn from(v: ReadResponse) -> Self {
+        ResponseContent::Read(v)
+    }
+}
+impl From<WriteResponse> for ResponseContent {
+    fn from(v: WriteResponse) -> Self {
+        ResponseContent::Write(v)
+    }
+}
+impl From<EchoResponse> for ResponseContent {
+    fn from(v: EchoResponse) -> Self {
+        ResponseContent::Echo(v)
+    }
+}
+impl From<QueryDirectoryResponse> for ResponseContent {
+    fn from(v: QueryDirectoryResponse) -> Self {
+        ResponseContent::QueryDirectory(v)
+    }
+}
+impl From<ChangeNotifyResponse> for ResponseContent {
+    fn from(v: ChangeNotifyResponse) -> Self {
+        ResponseContent::ChangeNotify(v)
+    }
+}
+impl From<QueryInfoResponse> for ResponseContent {
+    fn from(v: QueryInfoResponse) -> Self {
+        ResponseContent::QueryInfo(v)
+    }
+}
+impl From<SetInfoResponse> for ResponseContent {
+    fn from(v: SetInfoResponse) -> Self {
+        ResponseContent::SetInfo(v)
+    }
+}
+impl From<crate::ioctl::IoctlResponse> for ResponseContent {
+    fn from(v: crate::ioctl::IoctlResponse) -> Self {
+        ResponseContent::Ioctl(v)
+    }
+}
+impl From<crate::lock::LockResponse> for ResponseContent {
+    fn from(v: crate::lock::LockResponse) -> Self {
+        ResponseContent::Lock(v)
+    }
+}
+impl From<ErrorResponse> for ResponseContent {
+    fn from(v: ErrorResponse) -> Self {
+        ResponseContent::Error(v)
+    }
+}
 
 /// A plain, single SMB2 request message.
 #[binrw::binrw]
 #[derive(Debug)]
 #[brw(little)]
 pub struct PlainRequest {
-    #[brw(assert(header.flags.server_to_redir() == false))]
+    #[brw(assert(!header.flags.server_to_redir()))]
     pub header: Header,
     #[brw(args(&header.command))]
     pub content: RequestContent,
@@ -246,7 +385,7 @@ pub struct PlainRequest {
 #[derive(Debug)]
 #[brw(little)]
 pub struct PlainResponse {
-    #[brw(assert(header.flags.server_to_redir() == true))]
+    #[brw(assert(header.flags.server_to_redir()))]
     pub header: Header,
     #[brw(args(&header.command))]
     pub content: ResponseContent,

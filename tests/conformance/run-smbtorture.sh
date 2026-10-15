@@ -15,7 +15,7 @@ cd "$(dirname "$0")/../.."
 SMBTORTURE=${SMBTORTURE:-smbtorture}
 HOST=${RSSMB_HOST:-127.0.0.1}
 PORT=${RSSMB_PORT:-4450}
-SUITES=${*:-"smb2.connect smb2.read smb2.dir smb2.compound smb2.create smb2.setinfo smb2.getinfo smb2.session smb2.credits smb2.ioctl rpc.srvsvc"}
+SUITES=${*:-"smb2.connect smb2.read smb2.dir smb2.compound smb2.create smb2.setinfo smb2.getinfo smb2.session smb2.credits smb2.ioctl smb2.lock smb2.lease smb2.durable-v2-open smb2.notify smb2.rename smb2.delete-on-close-perms smb2.sharemode rpc.srvsvc"}
 
 # Setup share tree — must match tests/live/rssmb-live.toml paths.
 rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private

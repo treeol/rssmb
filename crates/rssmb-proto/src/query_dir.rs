@@ -9,7 +9,7 @@ use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
 use crate::create::FileId;
-use crate::dtyp::{PosMarker, SizedWideString, SizedStringSize};
+use crate::dtyp::{PosMarker, SizedStringSize, SizedWideString};
 
 /// SMB2 QUERY_DIRECTORY Request.
 ///
@@ -104,7 +104,6 @@ mod tests {
     fn test_query_directory_response_roundtrip() {
         let resp = QueryDirectoryResponse {
             output_buffer: vec![0x01, 0x02, 0x03],
-            ..Default::default()
         };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();

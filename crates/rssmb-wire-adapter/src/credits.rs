@@ -220,6 +220,7 @@ pub enum CreditError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_credit_grant_and_deduct() {
@@ -237,7 +238,10 @@ mod tests {
 
         // Try to deduct more than available
         let result = mgr.check_and_deduct(200, 200);
-        assert!(matches!(result, Err(CreditError::InsufficientCredits { .. })));
+        assert!(matches!(
+            result,
+            Err(CreditError::InsufficientCredits { .. })
+        ));
     }
 
     #[test]
@@ -260,7 +264,11 @@ mod tests {
         mgr.grant(1023);
         let result = mgr.check_and_deduct(0, 1000);
         assert!(matches!(result, Err(CreditError::ExcessiveCharge(_))));
-        assert_eq!(mgr.available_credits(), 24, "an affordable over-cap charge is still spent");
+        assert_eq!(
+            mgr.available_credits(),
+            24,
+            "an affordable over-cap charge is still spent"
+        );
     }
 
     #[test]
@@ -268,7 +276,10 @@ mod tests {
         // Over the cap AND over the balance: the window violation wins.
         let mgr = CreditManager::new(1024);
         let result = mgr.check_and_deduct(0, 1000);
-        assert!(matches!(result, Err(CreditError::InsufficientCredits { .. })));
+        assert!(matches!(
+            result,
+            Err(CreditError::InsufficientCredits { .. })
+        ));
     }
 
     // --- Sequence window tests (Phase 1.5) ---
@@ -277,7 +288,7 @@ mod tests {
     fn test_sequential_message_ids() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 1 + 99 = 100 available, window [0..100)
-        // Send messages 0, 1, 2 — all should succeed
+                       // Send messages 0, 1, 2 — all should succeed
         mgr.check_and_deduct(0, 1).unwrap();
         mgr.check_and_deduct(1, 1).unwrap();
         mgr.check_and_deduct(2, 1).unwrap();
@@ -288,7 +299,7 @@ mod tests {
     fn test_out_of_order_message_ids() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
-        // Send messages out of order: 5, then 3, then 4
+                       // Send messages out of order: 5, then 3, then 4
         mgr.check_and_deduct(5, 1).unwrap();
         mgr.check_and_deduct(3, 1).unwrap();
         mgr.check_and_deduct(4, 1).unwrap();
@@ -306,7 +317,7 @@ mod tests {
     fn test_multi_credit_charge() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total
-        // Charge 5 for message_id 0: consumes 0,1,2,3,4
+                       // Charge 5 for message_id 0: consumes 0,1,2,3,4
         mgr.check_and_deduct(0, 5).unwrap();
         assert_eq!(mgr.available_credits(), 95);
         // MessageId 5 is the next valid one
@@ -333,14 +344,14 @@ mod tests {
     fn test_message_id_beyond_high_rejected() {
         let mgr = CreditManager::new(1024);
         mgr.grant(9); // 10 total
-        // First request initializes window [0..10)
+                      // First request initializes window [0..10)
         mgr.check_and_deduct(0, 1).unwrap();
         // MessageId 10 is at the edge — should fail (m+c > high)
         let r = mgr.check_and_deduct(10, 1);
         assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
         // Grant more credits to extend the window
         mgr.grant(1); // high becomes 11
-        // Now message_id 10 should work
+                      // Now message_id 10 should work
         mgr.check_and_deduct(10, 1).unwrap();
     }
 
@@ -359,7 +370,7 @@ mod tests {
     fn test_grant_extends_window_high() {
         let mgr = CreditManager::new(1024);
         mgr.grant(9); // 10 total, window [0..10)
-        // Consume 0..9
+                      // Consume 0..9
         for m in 0..10 {
             mgr.check_and_deduct(m, 1).unwrap();
         }
@@ -377,7 +388,7 @@ mod tests {
     fn test_low_advances_past_contiguous_used() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
-        // Consume 0, 1, 2 — low should advance to 3
+                       // Consume 0, 1, 2 — low should advance to 3
         mgr.check_and_deduct(0, 1).unwrap();
         mgr.check_and_deduct(1, 1).unwrap();
         mgr.check_and_deduct(2, 1).unwrap();
@@ -394,7 +405,7 @@ mod tests {
     fn test_credit_charge_zero_counts_as_one() {
         let mgr = CreditManager::new(1024);
         mgr.grant(9); // 10 total
-        // credit_charge 0 → treated as 1
+                      // credit_charge 0 → treated as 1
         mgr.check_and_deduct(0, 0).unwrap();
         assert_eq!(mgr.available_credits(), 9);
     }
@@ -403,7 +414,7 @@ mod tests {
     fn test_large_charge_spanning_window() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total
-        // Charge 50 starting at message_id 0
+                       // Charge 50 starting at message_id 0
         mgr.check_and_deduct(0, 50).unwrap();
         assert_eq!(mgr.available_credits(), 50);
         // low should have advanced to 50
@@ -431,7 +442,7 @@ mod tests {
     fn test_overflow_protection() {
         let mgr = CreditManager::new(1024);
         mgr.grant(1023); // 1024 total
-        // MessageId near u64::MAX with charge 1 — end overflows
+                         // MessageId near u64::MAX with charge 1 — end overflows
         let r = mgr.check_and_deduct(u64::MAX, 1);
         assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
     }
@@ -488,7 +499,7 @@ mod tests {
     fn test_exact_high_boundary() {
         let mgr = CreditManager::new(1024);
         mgr.grant(9); // window [0..10)
-        // MessageId 9 with charge 1: 9 + 1 = 10 = high. Should succeed.
+                      // MessageId 9 with charge 1: 9 + 1 = 10 = high. Should succeed.
         mgr.check_and_deduct(9, 1).unwrap();
         assert_eq!(mgr.available_credits(), 9);
     }
@@ -497,12 +508,115 @@ mod tests {
     fn test_partial_overlap_rejected() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // window [0..100)
-        // Consume 5..10 (charge 5)
+                       // Consume 5..10 (charge 5)
         mgr.check_and_deduct(5, 5).unwrap();
         // 3..8 overlaps at 5,6,7 — should fail
         let r = mgr.check_and_deduct(3, 5);
         assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
         // State unchanged: 5..10 still used, available = 95
         assert_eq!(mgr.available_credits(), 95);
+    }
+
+    // ---- Property tests ----
+
+    proptest! {
+        /// Deducting a valid MessageId should never panic, and after a
+        /// successful deduction, available credits should decrease by the
+        /// charge (clamped to 1 minimum).
+        #[test]
+        fn prop_deduct_decreases_available(
+            max_grant in 1u32..=1024,
+            grant_amount in 1u32..=1024,
+            msg_id in 0u64..=2048,
+            charge in 1u32..=256,
+        ) {
+            let mgr = CreditManager::new(max_grant);
+            mgr.grant(grant_amount);
+            let before = mgr.available_credits();
+            let result = mgr.check_and_deduct(msg_id, charge);
+            if result.is_ok() {
+                let effective_charge = charge.max(1);
+                let after = mgr.available_credits();
+                prop_assert!(after <= before);
+                // available may decrease by more than charge if low advances
+                // past contiguous used entries — but never by less.
+                let decrease = before - after;
+                prop_assert!(decrease >= effective_charge,
+                    "decrease {} < effective_charge {}", decrease, effective_charge);
+            }
+        }
+
+        /// A failed deduction must not change available credits.
+        #[test]
+        fn prop_failed_deduct_preserves_state(
+            max_grant in 1u32..=1024,
+            grant_amount in 1u32..=1024,
+            msg_id in 2049u64..=4096, // outside window
+            charge in 1u32..=256,
+        ) {
+            let mgr = CreditManager::new(max_grant);
+            mgr.grant(grant_amount);
+            let before = mgr.available_credits();
+            let result = mgr.check_and_deduct(msg_id, charge);
+            if result.is_err() {
+                prop_assert_eq!(mgr.available_credits(), before,
+                    "state changed on failed deduction");
+            }
+        }
+
+        /// Granting credits should not panic and should not decrease
+        /// available credits.
+        #[test]
+        fn prop_grant_never_decreases(
+            max_grant in 1u32..=1024,
+            grant_amount in 1u32..=1024,
+        ) {
+            let mgr = CreditManager::new(max_grant);
+            let before = mgr.available_credits();
+            mgr.grant(grant_amount);
+            let after = mgr.available_credits();
+            prop_assert!(after >= before,
+                "grant decreased available: {} -> {}", before, after);
+            // Grant is capped by max_grant
+            prop_assert!(after <= max_grant,
+                "available {} exceeds max_grant {}", after, max_grant);
+        }
+
+        /// Deducting the same MessageId twice should fail the second time
+        /// (idempotency of used set).
+        #[test]
+        fn prop_double_deduct_fails(
+            max_grant in 1u32..=1024,
+            grant_amount in 1u32..=1024,
+            msg_id in 0u64..=1024,
+            charge in 1u32..=16,
+        ) {
+            let mgr = CreditManager::new(max_grant);
+            mgr.grant(grant_amount);
+            let first = mgr.check_and_deduct(msg_id, charge);
+            if first.is_ok() {
+                let second = mgr.check_and_deduct(msg_id, charge);
+                prop_assert!(second.is_err(),
+                    "double-deduct of {} succeeded", msg_id);
+            }
+        }
+
+        /// Available credits should never exceed max_grant.
+        #[test]
+        fn prop_available_bounded(
+            max_grant in 1u32..=1024,
+            ops in proptest::collection::vec(
+                (0u64..=2048, 1u32..=64), 0..20
+            ),
+        ) {
+            let mgr = CreditManager::new(max_grant);
+            mgr.grant(max_grant);
+            for (msg_id, charge) in ops {
+                let _ = mgr.check_and_deduct(msg_id, charge);
+                prop_assert!(mgr.available_credits() <= max_grant,
+                    "available {} exceeds max_grant {}",
+                    mgr.available_credits(), max_grant);
+            }
+        }
     }
 }

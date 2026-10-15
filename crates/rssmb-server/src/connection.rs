@@ -14,9 +14,9 @@
 //!   `tokio::sync::Notify`); the read loop `select!`s against it so a shutdown
 //!   request aborts the connection promptly.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 
 use bytes::Bytes;
@@ -24,15 +24,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use binrw::BinRead;
+use rssmb_proto::header::Command;
+use rssmb_wire_adapter::build_error_response;
 use rssmb_wire_adapter::credits::CreditManager;
 use rssmb_wire_adapter::framing::parse_payload;
 use rssmb_wire_adapter::{encode_response, FramedMessage, FramedResponse, NtStatus};
-use rssmb_wire_adapter::build_error_response;
-use rssmb_proto::header::Command;
-use binrw::BinRead;
 
 use crate::config::ServerConfig;
-use crate::dispatch::{ConnState, handle_message};
+use crate::dispatch::{handle_message, ConnState};
 use crate::signing;
 use crate::ServerState;
 
@@ -256,13 +256,8 @@ impl Connection {
         };
 
         // Read loop.
-        let read_result = Self::read_loop(
-            &mut read_half,
-            &state,
-            &conn_state,
-            max_frame_size,
-        )
-        .await;
+        let read_result =
+            Self::read_loop(&mut read_half, &state, &conn_state, max_frame_size).await;
 
         match read_result {
             Ok(()) => debug!(conn_id, "read loop completed cleanly"),
@@ -288,13 +283,19 @@ impl Connection {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(conn_id, error = %e, "write task failed"),
             Err(_) => {
-                warn!(conn_id, "write task did not finish within 5 s — aborting it");
+                warn!(
+                    conn_id,
+                    "write task did not finish within 5 s — aborting it"
+                );
                 write_task.abort();
             }
         }
 
         // Decrement active connection count.
-        state.metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
+        state
+            .metrics
+            .connections_active
+            .fetch_sub(1, Ordering::Relaxed);
         info!(conn_id, %remote_addr, "connection closed");
     }
 
@@ -351,42 +352,48 @@ impl Connection {
             // is encrypted back under the same session.
             let was_encrypted: Option<u64>;
 
-            let payload = if payload.len() >= 4
-                && payload[..4] == *b"\xfdSMB"
-            {
+            let payload = if payload.len() >= 4 && payload[..4] == *b"\xfdSMB" {
                 // TRANSFORM_HEADER (MS-SMB2 2.2.41): 52-byte header + ciphertext.
                 if payload.len() < 52 {
-                    warn!(conn_id = conn_state.conn_id, "truncated transform header — disconnecting");
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        "truncated transform header — disconnecting"
+                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "truncated transform header",
                     ));
                 }
-                let transform_session_id =
-                    u64::from_le_bytes(payload[44..52].try_into().unwrap());
+                let transform_session_id = u64::from_le_bytes(payload[44..52].try_into().unwrap());
                 was_encrypted = Some(transform_session_id);
-                let enc_state = conn_state.encryption.read().unwrap()
-                    .get(&transform_session_id).cloned();
+                let enc_state = conn_state
+                    .encryption
+                    .read()
+                    .unwrap()
+                    .get(&transform_session_id)
+                    .cloned();
                 match enc_state {
                     Some(st) => {
                         match crate::crypto::decrypt_message(&st.dec_key, &payload) {
                             Ok(plaintext) => {
                                 // The plaintext must be a plain SMB2 message
                                 // (0xFE 'SMB'). No nested transform/compress.
-                                if plaintext.len() < 4
-                                    || plaintext[..4] != *b"\xfeSMB"
-                                {
-                                    warn!(conn_id = conn_state.conn_id,
-                                        "decrypted frame is not SMB2 — disconnecting");
+                                if plaintext.len() < 4 || plaintext[..4] != *b"\xfeSMB" {
+                                    warn!(
+                                        conn_id = conn_state.conn_id,
+                                        "decrypted frame is not SMB2 — disconnecting"
+                                    );
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
                                         "decrypted frame is not plain SMB2",
                                     ));
                                 }
-                                debug!(conn_id = conn_state.conn_id,
+                                debug!(
+                                    conn_id = conn_state.conn_id,
                                     session_id = transform_session_id,
                                     plaintext_len = plaintext.len(),
-                                    "decrypted transform frame");
+                                    "decrypted transform frame"
+                                );
                                 plaintext
                             }
                             Err(e) => {
@@ -404,9 +411,11 @@ impl Connection {
                     }
                     None => {
                         // Unknown SessionId — disconnect (3.3.5.2.1.1).
-                        warn!(conn_id = conn_state.conn_id,
+                        warn!(
+                            conn_id = conn_state.conn_id,
                             session_id = transform_session_id,
-                            "encrypted frame for unknown session — disconnecting");
+                            "encrypted frame for unknown session — disconnecting"
+                        );
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "encrypted frame for unknown session",
@@ -423,10 +432,16 @@ impl Connection {
             // malformed input before (unchecked offset arithmetic). A panic
             // there must not take down the connection task; treat it as a
             // decode error. Parsing is pure, so unwinding is safe.
-            let parsed = std::panic::catch_unwind(|| parse_payload(&payload)).unwrap_or_else(|_| {
-                warn!(conn_id = conn_state.conn_id, "decoder panicked — treating as malformed");
-                Err(rssmb_wire_adapter::WireError::DecodeError("decoder panic".into()))
-            });
+            let parsed =
+                std::panic::catch_unwind(|| parse_payload(&payload)).unwrap_or_else(|_| {
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        "decoder panicked — treating as malformed"
+                    );
+                    Err(rssmb_wire_adapter::WireError::DecodeError(
+                        "decoder panic".into(),
+                    ))
+                });
             let framed = match parsed {
                 Ok(msg) => msg,
                 Err(e) => {
@@ -451,19 +466,28 @@ impl Connection {
                                         ok = false;
                                         break;
                                     }
-                                    let st = conn_state.encryption.read().unwrap()
-                                        .get(&m.effective_sid).cloned();
+                                    let st = conn_state
+                                        .encryption
+                                        .read()
+                                        .unwrap()
+                                        .get(&m.effective_sid)
+                                        .cloned();
                                     match st {
                                         Some(st) if !st.retiring => {}
-                                        _ => { ok = false; break; }
+                                        _ => {
+                                            ok = false;
+                                            break;
+                                        }
                                     }
                                 }
                                 ok
                             }
-                            Err(()) => false,
+                            Err(_) => false,
                         };
                         if valid && payload.len() >= 64 {
-                            match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(&payload)) {
+                            match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(
+                                &payload,
+                            )) {
                                 Ok(hdr) => {
                                     if conn_state.credits.check_and_deduct(hdr.message_id, hdr.credit_charge.max(1) as u32)
                                         .is_err_and(|e| matches!(e, rssmb_wire_adapter::credits::CreditError::InsufficientCredits { .. }))
@@ -471,10 +495,15 @@ impl Connection {
                                         warn!(conn_id = conn_state.conn_id, "malformed decrypted request without credits — terminating");
                                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request outside the credit window"));
                                     }
-                                    let granted = conn_state.credits.grant(hdr.credit_request.max(1) as u32) as u16;
+                                    let granted =
+                                        conn_state.credits.grant(hdr.credit_request.max(1) as u32)
+                                            as u16;
                                     let mut body = build_error_response(
-                                        hdr.command, NtStatus::InvalidParameter,
-                                        hdr.message_id, hdr.session_id, hdr.tree_id,
+                                        hdr.command,
+                                        NtStatus::InvalidParameter,
+                                        hdr.message_id,
+                                        hdr.session_id,
+                                        hdr.tree_id,
                                     );
                                     if body.len() >= 16 {
                                         body[14..16].copy_from_slice(&granted.to_le_bytes());
@@ -484,8 +513,12 @@ impl Connection {
                                     // can't encrypt Raw responses (it can't
                                     // resolve the session from raw bytes), so
                                     // encrypt directly here.
-                                    let enc_st = conn_state.encryption.read().unwrap()
-                                        .get(&transform_sid).cloned();
+                                    let enc_st = conn_state
+                                        .encryption
+                                        .read()
+                                        .unwrap()
+                                        .get(&transform_sid)
+                                        .cloned();
                                     match enc_st {
                                         Some(st) => {
                                             let mut plaintext = body.clone();
@@ -501,12 +534,16 @@ impl Connection {
                                                 }
                                             };
                                             match crate::crypto::encrypt_message(
-                                                &st.enc_key, &nonce,
-                                                plaintext.len() as u32, transform_sid,
+                                                &st.enc_key,
+                                                &nonce,
+                                                plaintext.len() as u32,
+                                                transform_sid,
                                                 &mut plaintext,
                                             ) {
                                                 Ok((hdr, tag)) => {
-                                                    let mut wire = Vec::with_capacity(4 + 52 + plaintext.len());
+                                                    let mut wire = Vec::with_capacity(
+                                                        4 + 52 + plaintext.len(),
+                                                    );
                                                     let nb_len = (52 + plaintext.len()) as u32;
                                                     wire.push(0x00);
                                                     wire.push((nb_len >> 16) as u8);
@@ -516,7 +553,10 @@ impl Connection {
                                                     full_hdr[4..20].copy_from_slice(&tag);
                                                     wire.extend_from_slice(&full_hdr);
                                                     wire.extend_from_slice(&plaintext);
-                                                    let _ = conn_state.write_tx.send(Bytes::from(wire)).await;
+                                                    let _ = conn_state
+                                                        .write_tx
+                                                        .send(Bytes::from(wire))
+                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     warn!(conn_id = conn_state.conn_id,
@@ -560,7 +600,9 @@ impl Connection {
                             conn_state.signing.read().unwrap().get(&sid).cloned()
                         });
                         if payload.len() >= 64 && verdict == signing::Verdict::Ok {
-                            match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(&payload)) {
+                            match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(
+                                &payload,
+                            )) {
                                 Ok(hdr) => {
                                     if conn_state.credits.check_and_deduct(hdr.message_id, hdr.credit_charge.max(1) as u32)
                                         .is_err_and(|e| matches!(e, rssmb_wire_adapter::credits::CreditError::InsufficientCredits { .. }))
@@ -568,17 +610,27 @@ impl Connection {
                                         warn!(conn_id = conn_state.conn_id, "malformed request without credits — terminating connection");
                                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request outside the credit window"));
                                     }
-                                    let granted = conn_state.credits.grant(hdr.credit_request.max(1) as u32) as u16;
+                                    let granted =
+                                        conn_state.credits.grant(hdr.credit_request.max(1) as u32)
+                                            as u16;
                                     let status = NtStatus::InvalidParameter;
                                     let mut body = build_error_response(
-                                        hdr.command, status, hdr.message_id,
-                                        hdr.session_id, hdr.tree_id,
+                                        hdr.command,
+                                        status,
+                                        hdr.message_id,
+                                        hdr.session_id,
+                                        hdr.tree_id,
                                     );
                                     if body.len() >= 16 {
                                         body[14..16].copy_from_slice(&granted.to_le_bytes());
                                     }
                                     let signed = hdr.flags.signed();
-                                    crate::dispatch::send_unsolicited(conn_state, &FramedResponse::Raw(body), signed).await;
+                                    crate::dispatch::send_unsolicited(
+                                        conn_state,
+                                        &FramedResponse::Raw(body),
+                                        signed,
+                                    )
+                                    .await;
                                 }
                                 Err(e2) => {
                                     warn!(conn_id = conn_state.conn_id, error = %e2, "failed to parse even the header — dropping");
@@ -610,17 +662,19 @@ impl Connection {
             } else {
                 vec![false] // encrypted frames carry no SMB2 signature
             };
-            if was_encrypted.is_some() {
+            if let Some(&transform_sid) = was_encrypted.as_ref() {
                 // Decrypted frame: validate compound structure and that every
                 // member's effective SessionId matches the transform SessionId.
-                let transform_sid = was_encrypted.unwrap();
                 match signing::walk_compound(&payload) {
                     Ok(members) => {
                         for m in &members {
                             if m.effective_sid != transform_sid {
-                                warn!(conn_id = conn_state.conn_id,
-                                    transform_sid, effective_sid = m.effective_sid,
-                                    "decrypted frame session id mismatch — disconnecting");
+                                warn!(
+                                    conn_id = conn_state.conn_id,
+                                    transform_sid,
+                                    effective_sid = m.effective_sid,
+                                    "decrypted frame session id mismatch — disconnecting"
+                                );
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     "transform session id mismatch",
@@ -628,7 +682,12 @@ impl Connection {
                             }
                             // The session must have encryption state and not be
                             // retiring.
-                            let st = conn_state.encryption.read().unwrap().get(&m.effective_sid).cloned();
+                            let st = conn_state
+                                .encryption
+                                .read()
+                                .unwrap()
+                                .get(&m.effective_sid)
+                                .cloned();
                             match st {
                                 Some(st) if !st.retiring => {}
                                 _ => {
@@ -643,8 +702,11 @@ impl Connection {
                             }
                         }
                     }
-                    Err(()) => {
-                        warn!(conn_id = conn_state.conn_id, "malformed decrypted compound — disconnecting");
+                    Err(_) => {
+                        warn!(
+                            conn_id = conn_state.conn_id,
+                            "malformed decrypted compound — disconnecting"
+                        );
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "malformed decrypted compound",
@@ -656,7 +718,10 @@ impl Connection {
                     conn_state.signing.read().unwrap().get(&sid).cloned()
                 });
                 if verdict == signing::Verdict::Reject {
-                    warn!(conn_id = conn_state.conn_id, "signature check failed — discarding request");
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        "signature check failed — discarding request"
+                    );
                     continue;
                 }
             }
@@ -684,10 +749,16 @@ impl Connection {
                 // server disagree on the credit balance.
                 let requested = match &resp {
                     FramedResponse::Plain(p) => p.header.credit_request,
-                    FramedResponse::Compound(ps) => ps.last().map(|p| p.header.credit_request).unwrap_or(1),
+                    FramedResponse::Compound(ps) => {
+                        ps.last().map(|p| p.header.credit_request).unwrap_or(1)
+                    }
                     _ => 1,
                 };
-                let granted = if ledgered { conn_state.credits.grant(requested.max(1) as u32) } else { 0 };
+                let granted = if ledgered {
+                    conn_state.credits.grant(requested.max(1) as u32)
+                } else {
+                    0
+                };
 
                 // Write the granted amount into every response header.
                 match &mut resp {
@@ -712,8 +783,14 @@ impl Connection {
                     // Nothing can be sent, and the grant above would then
                     // exist only on our side. End the connection instead of
                     // letting the ledgers diverge.
-                    warn!(conn_id = conn_state.conn_id, "encode_response returned empty — terminating connection");
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "response encoding failed"));
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        "encode_response returned empty — terminating connection"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "response encoding failed",
+                    ));
                 }
                 // Error replies are pre-built with CreditResponse = 1. Write
                 // the amount actually granted into the last message of the
@@ -747,7 +824,9 @@ impl Connection {
                                 }
                             }
                             PreauthTarget::Session(sid) => {
-                                if let Some(h) = conn_state.preauth_sessions.lock().unwrap().get_mut(&sid) {
+                                if let Some(h) =
+                                    conn_state.preauth_sessions.lock().unwrap().get_mut(&sid)
+                                {
                                     *h = crate::crypto::preauth_update(h, msg_bytes);
                                 }
                             }
@@ -757,7 +836,11 @@ impl Connection {
                 // LOGOFF'd sessions keep their key only long enough to sign
                 // the LOGOFF response itself. But don't retire encryption
                 // state yet — it's needed to encrypt the response below.
-                conn_state.signing.write().unwrap().retain(|_, st| !st.retiring);
+                conn_state
+                    .signing
+                    .write()
+                    .unwrap()
+                    .retain(|_, st| !st.retiring);
 
                 // --- SMB 3.x encryption: encrypt the response if required ---
                 //
@@ -791,9 +874,15 @@ impl Connection {
                             }
                             _ => return None,
                         };
-                        if sid == 0 { return None; }
+                        if sid == 0 {
+                            return None;
+                        }
                         let enc_map = conn_state.encryption.read().unwrap();
-                        enc_map.get(&sid).map(|st| st.encrypt_data).unwrap_or(false).then_some(sid)
+                        enc_map
+                            .get(&sid)
+                            .map(|st| st.encrypt_data)
+                            .unwrap_or(false)
+                            .then_some(sid)
                     })
                 };
 
@@ -813,8 +902,7 @@ impl Connection {
                         msg[48..sig_end].fill(0);
                     }
 
-                    let enc_state = conn_state.encryption.read().unwrap()
-                        .get(&sid).cloned();
+                    let enc_state = conn_state.encryption.read().unwrap().get(&sid).cloned();
                     match enc_state {
                         Some(st) => {
                             // Strip the 4-byte NetBIOS header, encrypt the
@@ -855,10 +943,12 @@ impl Connection {
                                     wire.extend_from_slice(&full_hdr);
                                     // Ciphertext.
                                     wire.extend_from_slice(&plaintext);
-                                    debug!(conn_id = conn_state.conn_id,
+                                    debug!(
+                                        conn_id = conn_state.conn_id,
                                         session_id = sid,
                                         resp_len = wire.len(),
-                                        "encrypted response");
+                                        "encrypted response"
+                                    );
                                     Bytes::from(wire)
                                 }
                                 Err(e) => {
@@ -874,9 +964,11 @@ impl Connection {
                         None => {
                             // encrypt_data was set but the session has no
                             // encryption state — never downgrade to plaintext.
-                            warn!(conn_id = conn_state.conn_id,
+                            warn!(
+                                conn_id = conn_state.conn_id,
                                 session_id = sid,
-                                "encrypt_data set but no encryption state — disconnecting");
+                                "encrypt_data set but no encryption state — disconnecting"
+                            );
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 "missing encryption state for encrypt_data session",
@@ -889,13 +981,25 @@ impl Connection {
 
                 // Now retire encryption state (after the response has been
                 // encrypted or sent as plaintext).
-                conn_state.encryption.write().unwrap().retain(|_, st| !st.retiring);
+                conn_state
+                    .encryption
+                    .write()
+                    .unwrap()
+                    .retain(|_, st| !st.retiring);
 
-                debug!(conn_id = conn_state.conn_id, resp_len = encoded.len(), credits_granted = granted, "encoded response");
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    resp_len = encoded.len(),
+                    credits_granted = granted,
+                    "encoded response"
+                );
                 // If the write channel is closed (peer gone / write task
                 // exited), sending fails — log and end the loop.
                 if conn_state.write_tx.send(encoded).await.is_err() {
-                    warn!(conn_id = conn_state.conn_id, "write channel closed; ending read loop");
+                    warn!(
+                        conn_id = conn_state.conn_id,
+                        "write channel closed; ending read loop"
+                    );
                     return Ok(());
                 }
             }
@@ -915,10 +1019,8 @@ impl Connection {
         // to wait for a response.
         let removed_opens: Vec<(u64, crate::dispatch::OpenEntry)> = {
             let mut opens = conn_state.opens.write().await;
-            let entries: Vec<(u64, crate::dispatch::OpenEntry)> = opens
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
+            let entries: Vec<(u64, crate::dispatch::OpenEntry)> =
+                opens.iter().map(|(k, v)| (*k, v.clone())).collect();
             for (key, _) in &entries {
                 opens.remove(key);
             }
@@ -953,7 +1055,11 @@ impl Connection {
             });
         }
         if !removed_opens.is_empty() {
-            debug!(conn_id, open_count = removed_opens.len(), "cleanup: scheduled VFS closes");
+            debug!(
+                conn_id,
+                open_count = removed_opens.len(),
+                "cleanup: scheduled VFS closes"
+            );
         }
 
         // Cancel all pending async operations on this connection.
@@ -973,7 +1079,11 @@ impl Connection {
             cancelled
         };
         if !cancelled.is_empty() {
-            debug!(conn_id, async_count = cancelled.len(), "cleanup: cancelled async ops");
+            debug!(
+                conn_id,
+                async_count = cancelled.len(),
+                "cleanup: cancelled async ops"
+            );
         }
 
         // Remove all sessions owned by this connection from the shared state.
@@ -1067,15 +1177,24 @@ pub async fn listen_on(
             None => {
                 // Limit exceeded — drop the connection without a response.
                 debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
-                state.metrics.connections_rejected_limit_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .connections_rejected_limit_total
+                    .fetch_add(1, Ordering::Relaxed);
                 // The stream is dropped here, closing the TCP connection.
                 continue;
             }
         };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
-        state.metrics.connections_accepted_total.fetch_add(1, Ordering::Relaxed);
-        state.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .connections_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .connections_active
+            .fetch_add(1, Ordering::Relaxed);
 
         let state = state.clone();
         connections.spawn(async move {
@@ -1126,7 +1245,10 @@ async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace_sec
             Err(_) => {
                 // Grace period expired — abort remaining tasks.
                 let stuck = connections.len();
-                warn!(stuck, remaining, "grace period expired — aborting {} connection(s)", stuck);
+                warn!(
+                    stuck,
+                    remaining, "grace period expired — aborting {} connection(s)", stuck
+                );
                 connections.abort_all();
                 // Wait briefly for aborts to complete.
                 while connections.join_next().await.is_some() {}
@@ -1185,14 +1307,23 @@ where
             Some(g) => g,
             None => {
                 debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
-                state.metrics.connections_rejected_limit_total.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .connections_rejected_limit_total
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
-        state.metrics.connections_accepted_total.fetch_add(1, Ordering::Relaxed);
-        state.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .connections_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .connections_active
+            .fetch_add(1, Ordering::Relaxed);
 
         let state = state.clone();
         connections.spawn(async move {
@@ -1261,7 +1392,10 @@ mod tests {
 
         // Push a dummy frame through the channel.
         write_tx.send(Bytes::from_static(b"ping")).await.unwrap();
-        let received = write_rx.recv().await.expect("channel should yield the frame");
+        let received = write_rx
+            .recv()
+            .await
+            .expect("channel should yield the frame");
         assert_eq!(&received[..], b"ping");
 
         // The state's shutdown Notify is usable.
@@ -1377,40 +1511,52 @@ mod tests {
             create_options: Default::default(),
         };
         let open_id = vfs.create("", "f.txt", &args).await.expect("create");
-        conn_state.opens.write().await.insert(1, crate::dispatch::OpenEntry {
-            session_id: 5,
-            tree_id: 3,
-            open_id,
-            vfs: vfs.clone(),
-            file_id: None,
-            dir_cursor: Default::default(),
-            path: "f.txt".into(),
-            is_pipe: false,
-            pipe_state: None,
-            durable_guid: None,
-        });
+        conn_state.opens.write().await.insert(
+            1,
+            crate::dispatch::OpenEntry {
+                session_id: 5,
+                tree_id: 3,
+                open_id,
+                vfs: vfs.clone(),
+                file_id: None,
+                dir_cursor: Default::default(),
+                path: "f.txt".into(),
+                is_pipe: false,
+                pipe_state: None,
+                durable_guid: None,
+            },
+        );
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        conn_state.pending_async.lock().await.insert(9, crate::dispatch::AsyncOp {
-            command: rssmb_proto::header::Command::ChangeNotify,
-            session_id: 5,
-            tree_id: 3,
-            cancel: cancel_tx,
-            notify_handle: None,
-        });
+        conn_state.pending_async.lock().await.insert(
+            9,
+            crate::dispatch::AsyncOp {
+                command: rssmb_proto::header::Command::ChangeNotify,
+                session_id: 5,
+                tree_id: 3,
+                cancel: cancel_tx,
+                notify_handle: None,
+            },
+        );
 
         Connection::cleanup(&state, 77, &conn_state).await;
 
-        assert!(conn_state.opens.read().await.is_empty(), "opens not drained");
-        assert!(conn_state.pending_async.lock().await.is_empty(), "async ops not drained");
+        assert!(
+            conn_state.opens.read().await.is_empty(),
+            "opens not drained"
+        );
+        assert!(
+            conn_state.pending_async.lock().await.is_empty(),
+            "async ops not drained"
+        );
         assert!(cancel_rx.await.is_ok(), "async op was not signalled");
     }
 
     #[test]
     fn test_framed_kind_labels() {
-        use rssmb_wire_adapter::FramedMessage;
-        use rssmb_proto::header::{Header, Command};
-        use rssmb_proto::plain::{PlainRequest, RequestContent};
         use rssmb_proto::echo::EchoRequest;
+        use rssmb_proto::header::{Command, Header};
+        use rssmb_proto::plain::{PlainRequest, RequestContent};
+        use rssmb_wire_adapter::FramedMessage;
 
         let req = PlainRequest {
             header: Header {
@@ -1431,7 +1577,10 @@ mod tests {
 
         assert_eq!(framed_kind(&FramedMessage::Plain(req)), "plain");
         assert_eq!(framed_kind(&FramedMessage::Encrypted(vec![])), "encrypted");
-        assert_eq!(framed_kind(&FramedMessage::Compressed(vec![])), "compressed");
+        assert_eq!(
+            framed_kind(&FramedMessage::Compressed(vec![])),
+            "compressed"
+        );
         assert_eq!(
             framed_kind(&FramedMessage::Smb1Negotiate(vec![])),
             "smb1_negotiate"

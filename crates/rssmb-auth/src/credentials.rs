@@ -113,10 +113,7 @@ impl IdentityStore {
             };
             map.insert(
                 username.to_lowercase(),
-                StoredIdentity {
-                    username,
-                    nt_hash,
-                },
+                StoredIdentity { username, nt_hash },
             );
         }
         Self {
@@ -173,7 +170,10 @@ impl CredentialStore {
     }
 
     pub async fn add(&self, cred: StoredCredential) {
-        self.credentials.write().await.insert(cred.username.to_lowercase(), cred);
+        self.credentials
+            .write()
+            .await
+            .insert(cred.username.to_lowercase(), cred);
     }
 
     /// Synchronous add for use outside async contexts (e.g. ServerState::new).
@@ -199,7 +199,11 @@ impl CredentialStore {
     }
 
     pub async fn lookup(&self, username: &str) -> Option<StoredCredential> {
-        self.credentials.read().await.get(&username.to_lowercase()).cloned()
+        self.credentials
+            .read()
+            .await
+            .get(&username.to_lowercase())
+            .cloned()
     }
 
     pub async fn verify(&self, username: &str, _nt_proof: &[u8]) -> bool {
@@ -229,17 +233,20 @@ impl Default for CredentialStore {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn test_credential_lookup() {
         let store = CredentialStore::new();
-        store.add(StoredCredential {
-            username: "admin".to_string(),
-            nt_hash: [0u8; 16],
-            disabled: false,
-        }).await;
+        store
+            .add(StoredCredential {
+                username: "admin".to_string(),
+                nt_hash: [0u8; 16],
+                disabled: false,
+            })
+            .await;
 
         assert!(store.user_exists("admin").await);
         assert!(store.user_exists("ADMIN").await); // case-insensitive
@@ -249,11 +256,13 @@ mod tests {
     #[tokio::test]
     async fn test_disabled_account() {
         let store = CredentialStore::new();
-        store.add(StoredCredential {
-            username: "disabled".to_string(),
-            nt_hash: [0u8; 16],
-            disabled: true,
-        }).await;
+        store
+            .add(StoredCredential {
+                username: "disabled".to_string(),
+                nt_hash: [0u8; 16],
+                disabled: true,
+            })
+            .await;
 
         let cred = store.lookup("disabled").await.unwrap();
         assert!(cred.disabled);

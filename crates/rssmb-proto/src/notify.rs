@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_change_notify_response_pending() {
-        let resp = ChangeNotifyResponse { buffer: vec![], ..Default::default() };
+        let resp = ChangeNotifyResponse { buffer: vec![] };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();

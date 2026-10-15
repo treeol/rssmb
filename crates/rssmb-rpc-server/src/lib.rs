@@ -47,7 +47,10 @@ pub mod uuids {
 /// matches only `srvsvc` and requires a `\` separator after `PIPE`.
 pub fn is_rpc_pipe(name: &str) -> bool {
     matches!(
-        name.to_uppercase().trim_start_matches('\\').trim_start_matches("PIPE").trim_start_matches('\\'),
+        name.to_uppercase()
+            .trim_start_matches('\\')
+            .trim_start_matches("PIPE")
+            .trim_start_matches('\\'),
         "SRVSVC" | "SVCCTL" | "WINREG" | "LSARPC" | "SAMR" | "NETLOGON"
     )
 }
@@ -173,11 +176,22 @@ impl PipeState {
 
         // Reject auth trailers (auth_length != 0) — not supported.
         if header.auth_length != 0 {
-            warn!(auth_length = header.auth_length, "auth trailer in RPC PDU — not supported");
+            warn!(
+                auth_length = header.auth_length,
+                "auth trailer in RPC PDU — not supported"
+            );
             if header.ptype == PTYPE_BIND {
-                self.enqueue(build_bind_nak(header.call_id, pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED));
+                self.enqueue(build_bind_nak(
+                    header.call_id,
+                    pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED,
+                ));
             } else {
-                self.enqueue(build_fault(header.call_id, 0, FAULT_ACCESS_DENIED, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+                self.enqueue(build_fault(
+                    header.call_id,
+                    0,
+                    FAULT_ACCESS_DENIED,
+                    PFC_FIRST_FRAG | PFC_LAST_FRAG,
+                ));
             }
             return;
         }
@@ -186,9 +200,17 @@ impl PipeState {
         if header.drep[0] & 0xF0 != 0x10 {
             warn!(drep = ?header.drep, "non-ASCII/big-endian drep — not supported");
             if header.ptype == PTYPE_BIND {
-                self.enqueue(build_bind_nak(header.call_id, pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED));
+                self.enqueue(build_bind_nak(
+                    header.call_id,
+                    pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED,
+                ));
             } else {
-                self.enqueue(build_fault(header.call_id, 0, FAULT_NCA_S_PROTO_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+                self.enqueue(build_fault(
+                    header.call_id,
+                    0,
+                    FAULT_NCA_S_PROTO_ERROR,
+                    PFC_FIRST_FRAG | PFC_LAST_FRAG,
+                ));
             }
             return;
         }
@@ -198,19 +220,29 @@ impl PipeState {
             PTYPE_ALTER_CONTEXT => self.handle_alter_context(&header, body, ctx),
             PTYPE_REQUEST => self.handle_request(&header, body, ctx),
             other => {
-                debug!(ptype = other, "unexpected PDU type — sending protocol error fault");
-                self.enqueue(build_fault(header.call_id, 0, FAULT_NCA_S_PROTO_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+                debug!(
+                    ptype = other,
+                    "unexpected PDU type — sending protocol error fault"
+                );
+                self.enqueue(build_fault(
+                    header.call_id,
+                    0,
+                    FAULT_NCA_S_PROTO_ERROR,
+                    PFC_FIRST_FRAG | PFC_LAST_FRAG,
+                ));
             }
         }
     }
 
     /// Handle a BIND PDU — negotiate contexts and respond with BIND_ACK.
     fn handle_bind(&mut self, _header: &PduHeader, body: &[u8], _ctx: &RpcCtx) {
-        let Some((client_max_xmit, client_max_recv, assoc_group, ctx_items)) =
-            parse_bind(body)
+        let Some((client_max_xmit, client_max_recv, assoc_group, ctx_items)) = parse_bind(body)
         else {
             warn!("failed to parse BIND body");
-            self.enqueue(build_bind_nak(_header.call_id, pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED));
+            self.enqueue(build_bind_nak(
+                _header.call_id,
+                pdu::NAK_PROTOCOL_VERSION_NOT_SUPPORTED,
+            ));
             return;
         };
 
@@ -220,10 +252,8 @@ impl PipeState {
             .map(|ctx| {
                 let result = evaluate_bind_context(ctx);
                 if result.result == RESULT_ACCEPTANCE {
-                    self.bound.insert(
-                        ctx.context_id,
-                        ContextBinding { _accepted: true },
-                    );
+                    self.bound
+                        .insert(ctx.context_id, ContextBinding { _accepted: true });
                 }
                 result
             })
@@ -262,20 +292,35 @@ impl PipeState {
         // Check if bound.
         if self.bound.is_empty() {
             warn!("REQUEST before BIND — faulting unk_if");
-            self.enqueue(build_fault(header.call_id, 0, FAULT_NCA_S_UNK_IF, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+            self.enqueue(build_fault(
+                header.call_id,
+                0,
+                FAULT_NCA_S_UNK_IF,
+                PFC_FIRST_FRAG | PFC_LAST_FRAG,
+            ));
             return;
         }
 
         let Some((alloc_hint, p_cont_id, opnum, stub_data)) = parse_request(body) else {
             warn!("failed to parse REQUEST body");
-            self.enqueue(build_fault(header.call_id, 0, FAULT_NCA_S_PROTO_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+            self.enqueue(build_fault(
+                header.call_id,
+                0,
+                FAULT_NCA_S_PROTO_ERROR,
+                PFC_FIRST_FRAG | PFC_LAST_FRAG,
+            ));
             return;
         };
 
         // Validate the context was bound.
         if !self.bound.contains_key(&p_cont_id) {
             warn!(p_cont_id, "REQUEST on unbound context — faulting unk_if");
-            self.enqueue(build_fault(header.call_id, p_cont_id, FAULT_NCA_S_UNK_IF, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+            self.enqueue(build_fault(
+                header.call_id,
+                p_cont_id,
+                FAULT_NCA_S_UNK_IF,
+                PFC_FIRST_FRAG | PFC_LAST_FRAG,
+            ));
             return;
         }
 
@@ -290,7 +335,12 @@ impl PipeState {
         } else if self.in_call_id != Some(header.call_id) {
             // Continuation of a different call — reject.
             warn!("REQUEST fragment with mismatched call_id — faulting proto_error");
-            self.enqueue(build_fault(header.call_id, p_cont_id, FAULT_NCA_S_PROTO_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+            self.enqueue(build_fault(
+                header.call_id,
+                p_cont_id,
+                FAULT_NCA_S_PROTO_ERROR,
+                PFC_FIRST_FRAG | PFC_LAST_FRAG,
+            ));
             return;
         }
 
@@ -300,7 +350,12 @@ impl PipeState {
         // Check reassembly limit.
         if self.stub_buf_len() > MAX_REQUEST_SIZE {
             warn!("reassembled request exceeds limit — faulting");
-            self.enqueue(build_fault(header.call_id, p_cont_id, FAULT_NCA_S_PROTO_ERROR, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+            self.enqueue(build_fault(
+                header.call_id,
+                p_cont_id,
+                FAULT_NCA_S_PROTO_ERROR,
+                PFC_FIRST_FRAG | PFC_LAST_FRAG,
+            ));
             self.stub_buf_clear();
             self.in_call_id = None;
             return;
@@ -331,7 +386,12 @@ impl PipeState {
                 }
             }
             Err(fault_status) => {
-                self.enqueue(build_fault(call_id, p_cont_id, fault_status, PFC_FIRST_FRAG | PFC_LAST_FRAG));
+                self.enqueue(build_fault(
+                    call_id,
+                    p_cont_id,
+                    fault_status,
+                    PFC_FIRST_FRAG | PFC_LAST_FRAG,
+                ));
             }
         }
     }
@@ -441,13 +501,15 @@ fn dispatch_srvsvc(opnum: u16, stub: &[u8], ctx: &RpcCtx) -> Result<Vec<u8>, u32
 }
 
 fn hexdump(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    data.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// NetrShareEnum (opnum 15).
 fn dispatch_netr_share_enum(stub: &[u8], ctx: &RpcCtx) -> Result<Vec<u8>, u32> {
-    let (level, _pref_max_len) = ndr::parse_netr_share_enum_request(stub)
-        .unwrap_or((0, 0));
+    let (level, _pref_max_len) = ndr::parse_netr_share_enum_request(stub).unwrap_or((0, 0));
     debug!(level, share_count = ctx.shares.len(), shares = ?ctx.shares.iter().map(|s| &s.name).collect::<Vec<_>>(), "NetrShareEnum");
     match level {
         1 => {
@@ -471,9 +533,12 @@ fn dispatch_netr_share_enum(stub: &[u8], ctx: &RpcCtx) -> Result<Vec<u8>, u32> {
 
 /// NetrShareGetInfo (opnum 16).
 fn dispatch_netr_share_get_info(stub: &[u8], ctx: &RpcCtx) -> Result<Vec<u8>, u32> {
-    let (level, share_name) = ndr::parse_netr_share_get_info_request(stub)
-        .unwrap_or((0, String::new()));
-    let share = ctx.shares.iter().find(|s| s.name.eq_ignore_ascii_case(&share_name));
+    let (level, share_name) =
+        ndr::parse_netr_share_get_info_request(stub).unwrap_or((0, String::new()));
+    let share = ctx
+        .shares
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(&share_name));
     match level {
         1 => {
             let data = ndr::encode_netr_share_get_info_response(share, level);

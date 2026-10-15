@@ -70,7 +70,8 @@ impl Rc4 {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
             self.s.swap(self.i as usize, self.j as usize);
-            let k = self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            let k =
+                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
             *b ^= k;
         }
     }
@@ -85,7 +86,13 @@ pub fn supported(neg_flags: u32) -> bool {
 
 /// Compute the 16-byte NTLM signature of `msg` for `dir` with SeqNum `seq`,
 /// as the first message on that direction's RC4 handle.
-pub fn sign(exported_session_key: &[u8], neg_flags: u32, dir: Direction, seq: u32, msg: &[u8]) -> [u8; 16] {
+pub fn sign(
+    exported_session_key: &[u8],
+    neg_flags: u32,
+    dir: Direction,
+    seq: u32,
+    msg: &[u8],
+) -> [u8; 16] {
     let (sign_magic, seal_magic) = match dir {
         Direction::ClientToServer => (C2S_SIGN, C2S_SEAL),
         Direction::ServerToClient => (S2C_SIGN, S2C_SEAL),
@@ -109,12 +116,27 @@ pub fn sign(exported_session_key: &[u8], neg_flags: u32, dir: Direction, seq: u3
 }
 
 /// Constant-time check of a client's mechListMIC (SeqNum 0).
-pub fn verify_client(exported_session_key: &[u8], neg_flags: u32, mech_types: &[u8], mic: &[u8]) -> bool {
+pub fn verify_client(
+    exported_session_key: &[u8],
+    neg_flags: u32,
+    mech_types: &[u8],
+    mic: &[u8],
+) -> bool {
     if mic.len() != 16 {
         return false;
     }
-    let expected = sign(exported_session_key, neg_flags, Direction::ClientToServer, 0, mech_types);
-    expected.iter().zip(mic).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    let expected = sign(
+        exported_session_key,
+        neg_flags,
+        Direction::ClientToServer,
+        0,
+        mech_types,
+    );
+    expected
+        .iter()
+        .zip(mic)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 #[cfg(test)]
@@ -146,8 +168,20 @@ mod tests {
     #[test]
     fn key_exch_changes_checksum() {
         let key = [0x11u8; 16];
-        let with = sign(&key, FLAG_ESS | FLAG_128 | FLAG_KEY_EXCH, Direction::ServerToClient, 0, b"m");
-        let without = sign(&key, FLAG_ESS | FLAG_128, Direction::ServerToClient, 0, b"m");
+        let with = sign(
+            &key,
+            FLAG_ESS | FLAG_128 | FLAG_KEY_EXCH,
+            Direction::ServerToClient,
+            0,
+            b"m",
+        );
+        let without = sign(
+            &key,
+            FLAG_ESS | FLAG_128,
+            Direction::ServerToClient,
+            0,
+            b"m",
+        );
         assert_ne!(with[4..12], without[4..12]);
     }
 }

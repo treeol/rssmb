@@ -7,7 +7,7 @@
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{FileTime, Boolean, SizedWideString, SizedStringSize, FixedWideString};
+use crate::dtyp::{Boolean, FileTime, FixedWideString, SizedStringSize, SizedWideString};
 
 // ── FileAttributes (MS-FSCC §2.6) ──────────────────────────────────
 // 4-byte LE bitfield.
@@ -240,7 +240,7 @@ pub struct FileStreamInformation {
     #[br(temp)]
     _next_entry_offset: u32,
     /// Length of StreamName in bytes (UTF-16LE).
-    #[bw(try_calc = stream_name.size().try_into())]
+    #[bw(calc = stream_name.size())]
     #[br(temp)]
     _stream_name_length: u32,
     pub stream_size: u64,
@@ -274,7 +274,7 @@ pub struct FileDirectoryInformation {
     pub end_of_file: u64,
     pub allocation_size: u64,
     pub file_attributes: FileAttributes,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     #[br(args { size: SizedStringSize::Bytes(_file_name_length) })]
@@ -294,7 +294,7 @@ pub struct FileFullDirectoryInformation {
     pub end_of_file: u64,
     pub allocation_size: u64,
     pub file_attributes: FileAttributes,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     pub ea_size: u32,
@@ -318,7 +318,7 @@ pub struct FileBothDirectoryInformation {
     pub end_of_file: u64,
     pub allocation_size: u64,
     pub file_attributes: FileAttributes,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     pub ea_size: u32,
@@ -344,7 +344,7 @@ pub struct FileIdBothDirectoryInformation {
     pub end_of_file: u64,
     pub allocation_size: u64,
     pub file_attributes: FileAttributes,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     pub ea_size: u32,
@@ -374,7 +374,7 @@ pub struct FileIdFullDirectoryInformation {
     pub end_of_file: u64,
     pub allocation_size: u64,
     pub file_attributes: FileAttributes,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     pub ea_size: u32,
@@ -392,7 +392,7 @@ pub struct FileIdFullDirectoryInformation {
 #[brw(little)]
 pub struct FileNamesInformation {
     pub file_index: u32,
-    #[bw(try_calc = file_name.size().try_into())]
+    #[bw(calc = file_name.size())]
     #[br(temp)]
     _file_name_length: u32,
     #[br(args { size: SizedStringSize::Bytes(_file_name_length) })]
@@ -408,7 +408,7 @@ pub struct FileNamesInformation {
 pub struct FileFsVolumeInformation {
     pub volume_creation_time: FileTime,
     pub volume_serial_number: u32,
-    #[bw(calc = volume_label.size() as u32)]
+    #[bw(calc = volume_label.size())]
     #[br(temp)]
     _volume_label_length: u32,
     pub supports_objects: Boolean,
@@ -484,7 +484,7 @@ pub struct FileSystemAttributes {
 pub struct FileFsAttributeInformation {
     pub attributes: FileSystemAttributes,
     pub maximum_component_name_length: u32,
-    #[bw(calc = file_system_name.size() as u32)]
+    #[bw(calc = file_system_name.size())]
     #[br(temp)]
     _file_system_name_length: u32,
     #[br(args { size: SizedStringSize::Bytes(_file_system_name_length) })]
@@ -539,8 +539,8 @@ pub struct FileFsDeviceInformation {
 
 // ── ChainedItemList (MS-FSCC directory enumeration) ───────────────
 
-use std::io::SeekFrom;
 use binrw::Endian;
+use std::io::SeekFrom;
 
 /// A chained item list — variable-length entries linked by next_entry_offset.
 #[derive(Debug, PartialEq, Eq)]
@@ -549,26 +549,39 @@ pub struct ChainedItemList<T, const OFFSET_PAD: u32 = 4> {
 }
 
 impl<T, const OFFSET_PAD: u32> ChainedItemList<T, OFFSET_PAD> {
-    pub fn iter(&self) -> impl Iterator<Item = &T> { self.values.iter() }
-    pub fn is_empty(&self) -> bool { self.values.is_empty() }
-    pub fn len(&self) -> usize { self.values.len() }
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.values.iter()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
 }
 
 impl<T: binrw::BinWrite, const OFFSET_PAD: u32> binrw::BinWrite for ChainedItemList<T, OFFSET_PAD>
-where for<'b> <T as binrw::BinWrite>::Args<'b>: Default,
+where
+    for<'b> <T as binrw::BinWrite>::Args<'b>: Default,
 {
     type Args<'a> = ();
     fn write_options<W: std::io::Write + std::io::Seek>(
-        &self, writer: &mut W, endian: Endian, _args: Self::Args<'_>,
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        _args: Self::Args<'_>,
     ) -> binrw::BinResult<()> {
         for (i, item) in self.values.iter().enumerate() {
             let pos_before = writer.stream_position()?;
             let nc_pos = writer.stream_position()?;
             u32::write_options(&0u32, writer, endian, ())?;
             item.write_options(writer, endian, Default::default())?;
-            if i == self.values.len() - 1 { break; }
+            if i == self.values.len() - 1 {
+                break;
+            }
             let pos_after_item = writer.stream_position()?;
-            let pad = (OFFSET_PAD as u64 - (pos_after_item % OFFSET_PAD as u64)) % OFFSET_PAD as u64;
+            let pad =
+                (OFFSET_PAD as u64 - (pos_after_item % OFFSET_PAD as u64)) % OFFSET_PAD as u64;
             writer.seek(SeekFrom::Current(pad as i64))?;
             let pos_after = writer.stream_position()?;
             let nc = (pos_after - pos_before) as u32;
@@ -581,11 +594,14 @@ where for<'b> <T as binrw::BinWrite>::Args<'b>: Default,
 }
 
 impl<T: binrw::BinRead, const OFFSET_PAD: u32> binrw::BinRead for ChainedItemList<T, OFFSET_PAD>
-where for<'b> <T as binrw::BinRead>::Args<'b>: Default,
+where
+    for<'b> <T as binrw::BinRead>::Args<'b>: Default,
 {
     type Args<'a> = ();
     fn read_options<R: std::io::Read + std::io::Seek>(
-        reader: &mut R, endian: Endian, _args: Self::Args<'_>,
+        reader: &mut R,
+        endian: Endian,
+        _args: Self::Args<'_>,
     ) -> binrw::BinResult<Self> {
         let stream_end = {
             let cur = reader.stream_position()?;
@@ -608,7 +624,9 @@ where for<'b> <T as binrw::BinRead>::Args<'b>: Default,
             let next_off = u32::read_options(reader, endian, ())?;
             let item: T = T::read_options(reader, endian, Default::default())?;
             values.push(item);
-            if next_off == 0 { break; }
+            if next_off == 0 {
+                break;
+            }
             reader.seek(SeekFrom::Start(pos_before + next_off as u64))?;
         }
         Ok(Self { values })
@@ -616,26 +634,36 @@ where for<'b> <T as binrw::BinRead>::Args<'b>: Default,
 }
 
 impl<T, const OFFSET_PAD: u32> From<Vec<T>> for ChainedItemList<T, OFFSET_PAD> {
-    fn from(values: Vec<T>) -> Self { Self { values } }
+    fn from(values: Vec<T>) -> Self {
+        Self { values }
+    }
 }
 
 impl<T, const OFFSET_PAD: u32> FromIterator<T> for ChainedItemList<T, OFFSET_PAD> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self { values: iter.into_iter().collect() }
+        Self {
+            values: iter.into_iter().collect(),
+        }
     }
 }
 
 impl<T, const OFFSET_PAD: u32> std::ops::Deref for ChainedItemList<T, OFFSET_PAD> {
     type Target = [T];
-    fn deref(&self) -> &Self::Target { &self.values }
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
 }
 
 impl<T, const OFFSET_PAD: u32> std::ops::DerefMut for ChainedItemList<T, OFFSET_PAD> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.values }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
 }
 
 impl<T, const OFFSET_PAD: u32> Default for ChainedItemList<T, OFFSET_PAD> {
-    fn default() -> Self { Self { values: Vec::new() } }
+    fn default() -> Self {
+        Self { values: Vec::new() }
+    }
 }
 
 #[cfg(test)]
@@ -645,9 +673,7 @@ mod tests {
 
     #[test]
     fn test_file_attributes_roundtrip() {
-        let attrs = FileAttributes::new()
-            .with_normal(true)
-            .with_directory(true);
+        let attrs = FileAttributes::new().with_normal(true).with_directory(true);
         let mut buf = Cursor::new(Vec::new());
         attrs.write(&mut buf).unwrap();
         let bytes = buf.into_inner();

@@ -7,7 +7,7 @@
 
 use std::io::{Read, Seek, Write};
 
-use binrw::{Endian, prelude::*};
+use binrw::{prelude::*, Endian};
 
 // ── Guid ────────────────────────────────────────────────────────────
 // MS-DTYP §2.3.4: 16-byte GUID, little-endian (u32, u16, u16, [u8;8]).
@@ -57,10 +57,14 @@ impl Guid {
             u16::from_be_bytes([pb!(b, so + 9), pb!(b, so + 11)]),
             u16::from_be_bytes([pb!(b, so + 14), pb!(b, so + 16)]),
             [
-                pb!(b, so + 19), pb!(b, so + 21),
-                pb!(b, so + 24), pb!(b, so + 26),
-                pb!(b, so + 28), pb!(b, so + 30),
-                pb!(b, so + 32), pb!(b, so + 34),
+                pb!(b, so + 19),
+                pb!(b, so + 21),
+                pb!(b, so + 24),
+                pb!(b, so + 26),
+                pb!(b, so + 28),
+                pb!(b, so + 30),
+                pb!(b, so + 32),
+                pb!(b, so + 34),
             ],
         ))
     }
@@ -145,8 +149,14 @@ impl std::fmt::Display for Guid {
         write!(
             f,
             "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:012x}",
-            self.0, self.1, self.2, self.3[0], self.3[1],
-            self.3[2..].iter().fold(0u64, |acc, &x| (acc << 8) + x as u64)
+            self.0,
+            self.1,
+            self.2,
+            self.3[0],
+            self.3[1],
+            self.3[2..]
+                .iter()
+                .fold(0u64, |acc, &x| (acc << 8) + x as u64)
         )
     }
 }
@@ -266,8 +276,6 @@ impl binrw::meta::WriteEndian for Boolean {
 // offset/length backpatching in variable-length messages.
 //
 // Source: smb-dtyp binrw_util/pos_marker.rs (MIT). We own this copy.
-
-
 
 /// Wraps a value and records the stream position where it was read.
 ///
@@ -440,7 +448,14 @@ where
             value,
             writer,
             endian,
-            (no_size, Some(write_offset_to), no_base, (), Self::NO_EXTRA_SIZE, Self::NO_EXTRA_OFFSET),
+            (
+                no_size,
+                Some(write_offset_to),
+                no_base,
+                (),
+                Self::NO_EXTRA_SIZE,
+                Self::NO_EXTRA_OFFSET,
+            ),
         )
     }
 
@@ -455,7 +470,14 @@ where
             value,
             writer,
             endian,
-            (Some(write_size_to), no_offset, no_offset, (), Self::NO_EXTRA_SIZE, Self::NO_EXTRA_OFFSET),
+            (
+                Some(write_size_to),
+                no_offset,
+                no_offset,
+                (),
+                Self::NO_EXTRA_SIZE,
+                Self::NO_EXTRA_OFFSET,
+            ),
         )
     }
 
@@ -476,7 +498,14 @@ where
             value,
             writer,
             endian,
-            (Some(write_size_to), Some(write_offset_to), no_base, (), Self::NO_EXTRA_SIZE, Self::NO_EXTRA_OFFSET),
+            (
+                Some(write_size_to),
+                Some(write_offset_to),
+                no_base,
+                (),
+                Self::NO_EXTRA_SIZE,
+                Self::NO_EXTRA_OFFSET,
+            ),
         )
     }
 
@@ -497,7 +526,14 @@ where
             value,
             writer,
             endian,
-            (Some(write_size_to), Some(write_offset_to), no_base, (), Self::NO_EXTRA_SIZE, Self::NO_EXTRA_OFFSET),
+            (
+                Some(write_size_to),
+                Some(write_offset_to),
+                no_base,
+                (),
+                Self::NO_EXTRA_SIZE,
+                Self::NO_EXTRA_OFFSET,
+            ),
         )
     }
 }
@@ -546,6 +582,7 @@ pub struct SizedWideString {
 }
 
 impl SizedWideString {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self {
             data: s.encode_utf16().collect(),
@@ -690,6 +727,7 @@ impl<const N: usize> FixedWideString<N> {
         Self { data }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let u16s: Vec<u16> = s.encode_utf16().collect();
         Self::from_slice(&u16s)
@@ -710,7 +748,12 @@ mod tests {
 
     #[test]
     fn test_guid_roundtrip() {
-        let guid = Guid(0x065eadf1, 0x6daf, 0x1543, [0xb0, 0x4f, 0x10, 0xe6, 0x90, 0x84, 0xc9, 0xae]);
+        let guid = Guid(
+            0x065eadf1,
+            0x6daf,
+            0x1543,
+            [0xb0, 0x4f, 0x10, 0xe6, 0x90, 0x84, 0xc9, 0xae],
+        );
         let mut buf = Cursor::new(Vec::new());
         guid.write(&mut buf).unwrap();
         let bytes = buf.into_inner();
@@ -718,10 +761,7 @@ mod tests {
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: Guid = Guid::read(&mut cursor).unwrap();
         assert_eq!(decoded, guid);
-        assert_eq!(
-            guid.to_string(),
-            "065eadf1-6daf-1543-b04f-10e69084c9ae"
-        );
+        assert_eq!(guid.to_string(), "065eadf1-6daf-1543-b04f-10e69084c9ae");
     }
 
     #[test]
@@ -729,7 +769,12 @@ mod tests {
         let g = make_guid!("4b324fc8-1670-01d3-1278-5a47bf6ee188");
         assert_eq!(
             g,
-            Guid(0x4b324fc8, 0x1670, 0x01d3, [0x12, 0x78, 0x5a, 0x47, 0xbf, 0x6e, 0xe1, 0x88])
+            Guid(
+                0x4b324fc8,
+                0x1670,
+                0x01d3,
+                [0x12, 0x78, 0x5a, 0x47, 0xbf, 0x6e, 0xe1, 0x88]
+            )
         );
     }
 
@@ -764,14 +809,14 @@ mod tests {
         let mut cursor = Cursor::new(&bytes[..]);
         let t: Boolean = Boolean::read(&mut cursor).unwrap();
         let f: Boolean = Boolean::read(&mut cursor).unwrap();
-        assert_eq!(bool::from(t), true);
-        assert_eq!(bool::from(f), false);
+        assert!(bool::from(t));
+        assert!(!bool::from(f));
     }
 
     #[test]
     fn test_boolean_nonzero_is_true() {
         let mut cursor = Cursor::new(&[0x17u8][..]);
         let b: Boolean = Boolean::read(&mut cursor).unwrap();
-        assert_eq!(bool::from(b), true);
+        assert!(bool::from(b));
     }
 }

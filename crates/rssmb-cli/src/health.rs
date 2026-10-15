@@ -3,13 +3,17 @@
 //! Provides liveness (server is running) and readiness (shares/auth initialized)
 //! checks for Kubernetes probes.
 
-use std::sync::Arc;
-use std::net::SocketAddr;
 use rssmb_server::ServerState;
-use tracing::{info, error};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing::{error, info};
 
 /// Serve the health endpoint on the given address and port.
-pub async fn serve(state: Arc<ServerState>, bind_addr: String, port: u16) -> Result<(), std::io::Error> {
+pub async fn serve(
+    state: Arc<ServerState>,
+    bind_addr: String,
+    port: u16,
+) -> Result<(), std::io::Error> {
     let addr: SocketAddr = format!("{}:{}", bind_addr, port).parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Health endpoint listening on {}", addr);
@@ -48,12 +52,9 @@ async fn handle_health_request(
 
     // 5-second read timeout — a slowloris shouldn't hold a health-check thread.
     let mut buf = [0u8; 1024];
-    let n = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read(&mut buf),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "health read timeout"))??;
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "health read timeout"))??;
 
     if n == 0 {
         return Ok(());
@@ -61,7 +62,9 @@ async fn handle_health_request(
 
     // Parse the HTTP request line (simplified)
     let request = String::from_utf8_lossy(&buf[..n]);
-    let path = request.lines().next()
+    let path = request
+        .lines()
+        .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
@@ -107,7 +110,10 @@ async fn write_response(
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        status, status_text, content_type, body.len()
+        status,
+        status_text,
+        content_type,
+        body.len()
     );
 
     stream.write_all(response.as_bytes()).await?;

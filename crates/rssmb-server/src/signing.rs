@@ -58,10 +58,10 @@ pub struct CompoundMember {
 ///
 /// Malformed boundaries (truncated, misaligned, first member related) reject
 /// the whole frame.
-pub fn walk_compound(payload: &[u8]) -> Result<Vec<CompoundMember>, ()> {
+pub fn walk_compound(payload: &[u8]) -> Result<Vec<CompoundMember>, &'static str> {
     let ranges = rssmb_wire_adapter::framing::message_ranges(payload);
     if ranges.is_empty() || ranges.last().map(|r| r.1) != Some(payload.len()) {
-        return Err(());
+        return Err("empty or unterminated compound payload");
     }
     let mut members = Vec::with_capacity(ranges.len());
     let mut prev_sid = 0u64;
@@ -69,12 +69,12 @@ pub fn walk_compound(payload: &[u8]) -> Result<Vec<CompoundMember>, ()> {
     for (s, e) in ranges {
         let msg = &payload[s..e];
         if msg.len() < HDR {
-            return Err(());
+            return Err("compound member shorter than header");
         }
         let related = flags(msg) & FLAG_RELATED != 0;
         let sid = if related {
             if prev_cmd == Some(CMD_SESSION_SETUP) || prev_cmd.is_none() {
-                return Err(());
+                return Err("related member without a prior non-related member");
             }
             prev_sid
         } else {
@@ -100,7 +100,7 @@ pub fn walk_compound(payload: &[u8]) -> Result<Vec<CompoundMember>, ()> {
 pub fn verify_frame(payload: &[u8], lookup: impl Fn(u64) -> Option<SigningState>) -> Verdict {
     let members = match walk_compound(payload) {
         Ok(m) => m,
-        Err(()) => return Verdict::Reject,
+        Err(_) => return Verdict::Reject,
     };
     for m in &members {
         let msg = &payload[m.range.0..m.range.1];
@@ -144,7 +144,11 @@ pub fn verify_request(
     if !signed {
         // On a session that requires signing every request — CANCEL and
         // SESSION_SETUP included — must be signed.
-        return if st.required { Verdict::Reject } else { Verdict::Ok };
+        return if st.required {
+            Verdict::Reject
+        } else {
+            Verdict::Ok
+        };
     }
     let mut copy = msg.to_vec();
     let sig: [u8; 16] = copy[SIG_OFF..SIG_OFF + 16].try_into().unwrap();
@@ -181,7 +185,8 @@ pub fn sign_response_frame(
         if status == 0x0000_0103 {
             continue; // STATUS_PENDING interim
         }
-        let want = st.required || st.force_sign_once || client_signed.get(i).copied().unwrap_or(false);
+        let want =
+            st.required || st.force_sign_once || client_signed.get(i).copied().unwrap_or(false);
         if st.force_sign_once {
             clear_force_sign(sid);
         }
@@ -210,7 +215,13 @@ mod tests {
     use crate::config::DialectConfig;
 
     fn st(required: bool) -> SigningState {
-        SigningState { key: vec![7u8; 16], required, dialect: DialectConfig::Smb21, retiring: false, force_sign_once: false }
+        SigningState {
+            key: vec![7u8; 16],
+            required,
+            dialect: DialectConfig::Smb21,
+            retiring: false,
+            force_sign_once: false,
+        }
     }
 
     /// A minimal 64-byte header + 4 body bytes for `cmd` on session 5.
@@ -223,7 +234,7 @@ mod tests {
         m
     }
 
-    fn sign(m: &mut Vec<u8>, key: &[u8]) {
+    fn sign(m: &mut [u8], key: &[u8]) {
         let f = flags(m) | FLAG_SIGNED;
         m[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&f.to_le_bytes());
         let sig = sign_message(key, m, DialectConfig::Smb21);
@@ -254,14 +265,21 @@ mod tests {
         let m = msg(5);
         assert_eq!(verify_request(&m, 0, |_| Some(st(true))), Verdict::Reject);
         assert_eq!(verify_request(&m, 0, |_| Some(st(false))), Verdict::Ok);
-        assert_eq!(verify_request(&m, 0, |_| None), Verdict::Ok, "guest session");
+        assert_eq!(
+            verify_request(&m, 0, |_| None),
+            Verdict::Ok,
+            "guest session"
+        );
     }
 
     #[test]
     fn negotiate_exempt_but_reauth_session_setup_is_not() {
         assert_eq!(verify_request(&msg(0), 5, |_| Some(st(true))), Verdict::Ok);
         // Unsigned SESSION_SETUP targeting an established signed session.
-        assert_eq!(verify_request(&msg(1), 5, |_| Some(st(true))), Verdict::Reject);
+        assert_eq!(
+            verify_request(&msg(1), 5, |_| Some(st(true))),
+            Verdict::Reject
+        );
         // ...but a fresh/pending one (no signing state yet) is fine.
         assert_eq!(verify_request(&msg(1), 0, |_| None), Verdict::Ok);
     }
@@ -305,7 +323,10 @@ mod tests {
         sign(&mut m0, &key);
         let m1 = related(msg(8), 9);
         let lookup = |sid: u64| if sid == 5 { Some(st(true)) } else { None };
-        assert_eq!(verify_frame(&compound(&[m0.clone(), m1]), lookup), Verdict::Reject);
+        assert_eq!(
+            verify_frame(&compound(&[m0.clone(), m1]), lookup),
+            Verdict::Reject
+        );
         // Signed related member verifies against 5's key.
         let mut m1s = related(msg(8), 9);
         sign(&mut m1s, &key);
@@ -329,7 +350,10 @@ mod tests {
         // member 1 (unrelated, session 5) unsigned
         m0[SESSION_ID_OFF..SESSION_ID_OFF + 8].copy_from_slice(&9u64.to_le_bytes());
         let lookup = |sid: u64| if sid == 5 { Some(st(true)) } else { None };
-        assert_eq!(verify_frame(&compound(&[m0, msg(5)]), lookup), Verdict::Reject);
+        assert_eq!(
+            verify_frame(&compound(&[m0, msg(5)]), lookup),
+            Verdict::Reject
+        );
     }
 
     #[test]
@@ -370,7 +394,10 @@ mod tests {
         assert_eq!(members.len(), 2);
         assert_eq!(members[0].effective_sid, 5);
         assert!(!members[0].related);
-        assert_eq!(members[1].effective_sid, 5, "related member inherits prev sid");
+        assert_eq!(
+            members[1].effective_sid, 5,
+            "related member inherits prev sid"
+        );
         assert!(members[1].related);
     }
 

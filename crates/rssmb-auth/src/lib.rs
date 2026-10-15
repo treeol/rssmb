@@ -8,8 +8,8 @@
 //! wrapping/unwrapping ourselves, because the `Negotiate` SSP doesn't
 //! correctly unwrap SPNEGO negTokenResp on the second round.
 
-use thiserror::Error;
 use std::sync::Arc;
+use thiserror::Error;
 
 pub mod credentials;
 pub mod ntlm_mic;
@@ -19,13 +19,11 @@ pub mod spnego;
 #[allow(deprecated)]
 pub use credentials::CredentialStore;
 pub use credentials::IdentityStore;
-pub use ntlmv2::{nt_hash, compute_session_key};
+pub use ntlmv2::{compute_session_key, nt_hash};
 
 use sspi::{
-    BufferType, DataRepresentation,
-    SecurityBuffer, SecurityStatus,
-    ServerRequestFlags, Sspi, SspiEx, SspiImpl,
-    ntlm::Ntlm,
+    ntlm::Ntlm, BufferType, DataRepresentation, SecurityBuffer, SecurityStatus, ServerRequestFlags,
+    Sspi, SspiEx, SspiImpl,
 };
 
 /// Authentication state during a multi-round exchange.
@@ -153,11 +151,7 @@ pub enum AuthError {
 /// The authentication provider trait — a multi-round acceptor conversation.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
-    async fn step(
-        &self,
-        input_token: &[u8],
-        state: &mut AuthState,
-    ) -> Result<AuthStep, AuthError>;
+    async fn step(&self, input_token: &[u8], state: &mut AuthState) -> Result<AuthStep, AuthError>;
 }
 
 /// NTLM authentication provider using the raw `sspi::ntlm::Ntlm` SSP.
@@ -165,6 +159,7 @@ pub trait AuthProvider: Send + Sync {
 /// We handle SPNEGO unwrapping ourselves:
 /// - Incoming: extract NTLMSSP token from SPNEGO wrapper via `spnego::extract_ntlm_token`
 /// - Outgoing: wrap NTLMSSP response in SPNEGO negTokenResp via `spnego::wrap_ntlm_response`
+///
 /// This avoids the sspi `Negotiate` SSP's bug where it doesn't correctly
 /// unwrap SPNEGO negTokenResp on the second round.
 ///
@@ -195,7 +190,11 @@ impl NtlmAuthProvider {
         // Legacy constructor: convert plaintext-password identities into
         // an IdentityStore by computing NT hashes.
         let store = IdentityStore::from_identities(&identities);
-        Self { identities: Arc::new(store), guest_access: false, require_timestamp: false }
+        Self {
+            identities: Arc::new(store),
+            guest_access: false,
+            require_timestamp: false,
+        }
     }
 
     pub fn with_identities_and_guest(
@@ -203,11 +202,19 @@ impl NtlmAuthProvider {
         guest_access: bool,
     ) -> Self {
         let store = IdentityStore::from_identities(&identities);
-        Self { identities: Arc::new(store), guest_access, require_timestamp: false }
+        Self {
+            identities: Arc::new(store),
+            guest_access,
+            require_timestamp: false,
+        }
     }
 
     pub fn with_identity_store(identities: Arc<IdentityStore>, guest_access: bool) -> Self {
-        Self { identities, guest_access, require_timestamp: false }
+        Self {
+            identities,
+            guest_access,
+            require_timestamp: false,
+        }
     }
 
     pub fn with_identity_store_and_flags(
@@ -215,17 +222,17 @@ impl NtlmAuthProvider {
         guest_access: bool,
         require_timestamp: bool,
     ) -> Self {
-        Self { identities, guest_access, require_timestamp }
+        Self {
+            identities,
+            guest_access,
+            require_timestamp,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl AuthProvider for NtlmAuthProvider {
-    async fn step(
-        &self,
-        input_token: &[u8],
-        state: &mut AuthState,
-    ) -> Result<AuthStep, AuthError> {
+    async fn step(&self, input_token: &[u8], state: &mut AuthState) -> Result<AuthStep, AuthError> {
         // If auth already completed, this is the final SPNEGO round
         // (negTokenResp with the client's mechListMIC). Verify the
         // client's MIC when NTLM signing was negotiated (RFC 4178 §5).
@@ -292,8 +299,8 @@ impl AuthProvider for NtlmAuthProvider {
         }
 
         // Unwrap SPNEGO to get the raw NTLMSSP token
-        let ntlm_token = spnego::extract_ntlm_token(input_token)
-            .unwrap_or_else(|_| input_token.to_vec());
+        let ntlm_token =
+            spnego::extract_ntlm_token(input_token).unwrap_or_else(|_| input_token.to_vec());
 
         // Save the raw NTLMSSP NEGOTIATE (type 1) message for AUTHENTICATE
         // MIC verification (MS-NLMP 3.2.5.1.2). On the first round this is
@@ -318,7 +325,9 @@ impl AuthProvider for NtlmAuthProvider {
             if summary.is_anonymous() {
                 // Only valid as the reply to our CHALLENGE.
                 if state.server_challenge.is_none() {
-                    return Err(AuthError::LogonFailure("AUTHENTICATE before CHALLENGE".into()));
+                    return Err(AuthError::LogonFailure(
+                        "AUTHENTICATE before CHALLENGE".into(),
+                    ));
                 }
                 if !self.guest_access {
                     return Err(AuthError::LogonFailure("anonymous logon disabled".into()));
@@ -367,7 +376,9 @@ impl AuthProvider for NtlmAuthProvider {
         if result.status == SecurityStatus::ContinueNeeded {
             state.server_challenge = ntlmv2::server_challenge(&ntlm_output);
             if state.server_challenge.is_none() {
-                return Err(AuthError::SspiError("CHALLENGE message missing server challenge".into()));
+                return Err(AuthError::SspiError(
+                    "CHALLENGE message missing server challenge".into(),
+                ));
             }
             // Save the raw CHALLENGE message for AUTHENTICATE MIC verification.
             state.challenge_message = Some(ntlm_output.clone());
@@ -400,7 +411,10 @@ impl AuthProvider for NtlmAuthProvider {
             // the user exists and the proof matches.
             let stored = self.identities.lookup(&wire_user);
             let dummy_hash = [0u8; 16];
-            let nt_hash: &[u8] = stored.as_ref().map(|s| &s.nt_hash[..]).unwrap_or(&dummy_hash);
+            let nt_hash: &[u8] = stored
+                .as_ref()
+                .map(|s| &s.nt_hash[..])
+                .unwrap_or(&dummy_hash);
 
             let challenge = state
                 .server_challenge
@@ -456,7 +470,9 @@ impl AuthProvider for NtlmAuthProvider {
             // a timestamp in the blob, making replay of a captured
             // AUTHENTICATE observable by comparison with the challenge time.
             if self.require_timestamp && !ntlmv2::has_timestamp(&fields.nt_response) {
-                tracing::warn!("NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)");
+                tracing::warn!(
+                    "NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)"
+                );
                 return Err(AuthError::LogonFailure("missing NTLMv2 timestamp".into()));
             }
 
@@ -481,11 +497,13 @@ impl AuthProvider for NtlmAuthProvider {
             SecurityStatus::ContinueNeeded => {
                 // Wrap the NTLM challenge in SPNEGO negTokenResp
                 let wrapped = state.wrap(&ntlm_output);
-                Ok(AuthStep::Continue { output_token: wrapped })
+                Ok(AuthStep::Continue {
+                    output_token: wrapped,
+                })
             }
-            SecurityStatus::Ok | SecurityStatus::CompleteNeeded if !state.proof_verified => {
-                Err(AuthError::LogonFailure("acceptor completed without a verified proof".into()))
-            }
+            SecurityStatus::Ok | SecurityStatus::CompleteNeeded if !state.proof_verified => Err(
+                AuthError::LogonFailure("acceptor completed without a verified proof".into()),
+            ),
             SecurityStatus::Ok | SecurityStatus::CompleteNeeded => {
                 // Use the session key we computed ourselves from the NT hash
                 // (set during CompleteNeeded processing). Fall back to sspi's
@@ -495,7 +513,9 @@ impl AuthProvider for NtlmAuthProvider {
                         .query_context_session_key()
                         .map_err(|e| AuthError::SspiError(format!("session_key: {e}")))
                         .ok();
-                    key_info.map(|k| k.session_key.as_ref().clone()).unwrap_or_default()
+                    key_info
+                        .map(|k| k.session_key.as_ref().clone())
+                        .unwrap_or_default()
                 });
 
                 // Authenticated account name. Fail closed rather than invent
@@ -571,9 +591,9 @@ impl AuthProvider for NtlmAuthProvider {
                     identity,
                 })
             }
-            other => {
-                Err(AuthError::SspiError(format!("unexpected status: {other:?}")))
-            }
+            other => Err(AuthError::SspiError(format!(
+                "unexpected status: {other:?}"
+            ))),
         }
     }
 }
@@ -588,7 +608,9 @@ fn account_name(u: &sspi::Username) -> String {
 
 /// Read a little-endian u32 at `offset` from a byte slice, or None if out of bounds.
 fn u32_le(b: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(offset..offset + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        b.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 /// `account_name` for a raw wire string, via the same parser.

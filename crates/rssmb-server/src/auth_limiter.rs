@@ -200,11 +200,7 @@ impl AuthLimiter {
     }
 
     /// Evict entries whose window + cooldown has fully elapsed.
-    fn evict_expired(
-        records: &mut HashMap<IpAddr, FailureRecord>,
-        now: Instant,
-        ttl: Duration,
-    ) {
+    fn evict_expired(records: &mut HashMap<IpAddr, FailureRecord>, now: Instant, ttl: Duration) {
         records.retain(|_, rec| {
             // If in cooldown, keep until cooldown expires.
             if let Some(until) = rec.cooldown_until {
@@ -275,12 +271,15 @@ mod tests {
         // excess 1-5: delays 200, 400, 800, 1600, 3200 — all under 5000
         for _ in 0..5 {
             let d = l.record_failure(ip());
-            assert!(d < Duration::from_millis(5000), "delay {d:?} should be under cap");
+            assert!(
+                d < Duration::from_millis(5000),
+                "delay {d:?} should be under cap"
+            );
         }
         // excess=6: 200×2^5 = 6400 > 5000 → cooldown
         let d = l.record_failure(ip());
         assert_eq!(d, Duration::from_millis(5000)); // capped
-        // Now in cooldown — check returns Refuse
+                                                    // Now in cooldown — check returns Refuse
         assert!(matches!(l.check(&ip()), AuthThrottleResult::Refuse));
     }
 
@@ -384,7 +383,11 @@ mod tests {
         assert_eq!(d, Duration::ZERO);
         // Table should have shrunk
         let records = l.records.read().unwrap();
-        assert!(records.len() < 4100, "table not evicted: {} entries", records.len());
+        assert!(
+            records.len() < 4100,
+            "table not evicted: {} entries",
+            records.len()
+        );
     }
 
     #[test]

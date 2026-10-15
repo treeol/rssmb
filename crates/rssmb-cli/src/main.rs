@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use rssmb_server::{ServerConfig, ServerState};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 mod health;
 
 /// RSSMB — A pure-Rust SMB2/3 server for dynamic container environments.
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match command {
             Command::HashPassword { password } => {
                 let hash = rssmb_auth::nt_hash(password);
-                println!("{}", hex::encode(&hash));
+                println!("{}", hex::encode(hash));
                 return Ok(());
             }
             Command::CheckConfig { config } => {
@@ -75,16 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .init();
 
-                let config_str = std::fs::read_to_string(config)
-                    .map_err(|e| {
-                        error!("Failed to read config file {}: {}", config.display(), e);
-                        e
-                    })?;
-                let config = ServerConfig::from_toml(&config_str)
-                    .map_err(|e| {
-                        error!("Failed to parse config: {}", e);
-                        e
-                    })?;
+                let config_str = std::fs::read_to_string(config).map_err(|e| {
+                    error!("Failed to read config file {}: {}", config.display(), e);
+                    e
+                })?;
+                let config = ServerConfig::from_toml(&config_str).map_err(|e| {
+                    error!("Failed to parse config: {}", e);
+                    e
+                })?;
                 if let Err(msg) = config.validate() {
                     error!("Config validation error: {}", msg);
                     return Err(msg.into());
@@ -96,7 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for warning in config.warnings() {
                     warn!("{}", warning);
                 }
-                info!("Config OK: {} shares, {} users", config.shares.len(), config.users.len());
+                info!(
+                    "Config OK: {} shares, {} users",
+                    config.shares.len(),
+                    config.users.len()
+                );
                 return Ok(());
             }
         }
@@ -108,14 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging — respect RUST_LOG env var, fallback to "info"
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if args.verbose {
-                tracing_subscriber::EnvFilter::new("debug")
-            } else {
-                tracing_subscriber::EnvFilter::new("info")
-            }
-        });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if args.verbose {
+            tracing_subscriber::EnvFilter::new("debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
 
     match args.log_format.as_str() {
         "json" => {
@@ -125,9 +126,7 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 .init();
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
 
@@ -140,7 +139,8 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let location = info.location()
+            let location = info
+                .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "<unknown>".to_string());
             if let Some(payload) = info.payload().downcast_ref::<&str>() {
@@ -155,11 +155,14 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load config
-    let config_str = std::fs::read_to_string(&args.config)
-        .map_err(|e| {
-            error!("Failed to read config file {}: {}", args.config.display(), e);
+    let config_str = std::fs::read_to_string(&args.config).map_err(|e| {
+        error!(
+            "Failed to read config file {}: {}",
+            args.config.display(),
             e
-        })?;
+        );
+        e
+    })?;
 
     // Warn if the config file is too permissive (it may contain passwords or
     // NT hashes). On Unix, 0o640 or stricter is recommended.
@@ -188,11 +191,10 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut config = ServerConfig::from_toml(&config_str)
-        .map_err(|e| {
-            error!("Failed to parse config: {}", e);
-            e
-        })?;
+    let mut config = ServerConfig::from_toml(&config_str).map_err(|e| {
+        error!("Failed to parse config: {}", e);
+        e
+    })?;
 
     // Apply CLI overrides
     if let Some(listen) = args.listen {
@@ -202,7 +204,12 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         config.port = port;
     }
 
-    info!("Config loaded: {} shares, listen {}:{}", config.shares.len(), config.listen_addr, config.port);
+    info!(
+        "Config loaded: {} shares, listen {}:{}",
+        config.shares.len(),
+        config.listen_addr,
+        config.port
+    );
 
     // Validate config consistency (e.g. encrypt_data under encryption=disabled).
     if let Err(msg) = config.validate() {
@@ -241,7 +248,10 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             let swept = sweeper_state.durable_table.sweep().await;
             if swept > 0 {
-                tracing::info!(expired = swept, "durable handle sweeper: cleaned up expired entries");
+                tracing::info!(
+                    expired = swept,
+                    "durable handle sweeper: cleaned up expired entries"
+                );
             }
         }
     });
@@ -273,7 +283,10 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut sig_int = match signal(SignalKind::interrupt()) {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("Failed to install SIGINT handler: {} — Ctrl+C will not trigger shutdown", e);
+                    warn!(
+                        "Failed to install SIGINT handler: {} — Ctrl+C will not trigger shutdown",
+                        e
+                    );
                     return;
                 }
             };
@@ -281,30 +294,23 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut sig_term = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("Failed to install SIGTERM handler: {} — SIGTERM will not trigger shutdown", e);
+                    warn!(
+                        "Failed to install SIGTERM handler: {} — SIGTERM will not trigger shutdown",
+                        e
+                    );
                     return;
                 }
             };
-            // SIGHUP — reload config
+            // SIGHUP — reload config. If we can't install the handler,
+            // just skip reload capability (log and continue).
             let mut sig_hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
+                Ok(s) => Some(s),
                 Err(e) => {
-                    warn!("Failed to install SIGHUP handler: {} — config will not be reloadable", e);
-                    // Still listen for SIGINT/SIGTERM below.
-                    loop {
-                        tokio::select! {
-                            _ = sig_int.recv() => {
-                                warn!("Received SIGINT, initiating graceful shutdown");
-                                shutdown_state.shutdown().await;
-                                return;
-                            }
-                            _ = sig_term.recv() => {
-                                warn!("Received SIGTERM, initiating graceful shutdown");
-                                shutdown_state.shutdown().await;
-                                return;
-                            }
-                        }
-                    }
+                    warn!(
+                        "Failed to install SIGHUP handler: {} — config will not be reloadable",
+                        e
+                    );
+                    None
                 }
             };
 
@@ -320,7 +326,13 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         shutdown_state.shutdown().await;
                         return;
                     }
-                    _ = sig_hup.recv() => {
+                    _ = async {
+                        if let Some(ref mut hup) = sig_hup {
+                            hup.recv().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
                         info!("Received SIGHUP — reloading config from {}", reload_config_path.display());
                         match std::fs::read_to_string(&reload_config_path) {
                             Ok(config_str) => {

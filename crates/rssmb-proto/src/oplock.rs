@@ -5,13 +5,7 @@
 //! This module exists for the `plain` module to import from.
 
 pub use crate::create::{
-    OplockBreakMsg as OplockBreakAck,
-    OplockBreakMsg as OplockBreakNotify,
-    OplockBreakMsg as OplockBreakResponse,
-    LeaseBreakAckResponse as LeaseBreakAck,
-    LeaseBreakAckResponse as LeaseBreakResponse,
-    LeaseBreakNotify,
-    LeaseState,
-    LeaseFlags,
-    OplockLevel,
+    LeaseBreakAckResponse as LeaseBreakAck, LeaseBreakAckResponse as LeaseBreakResponse,
+    LeaseBreakNotify, LeaseFlags, LeaseState, OplockBreakMsg as OplockBreakAck,
+    OplockBreakMsg as OplockBreakNotify, OplockBreakMsg as OplockBreakResponse, OplockLevel,
 };

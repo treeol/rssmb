@@ -12,6 +12,8 @@ libfuzzer-sys = "0.4"
 rssmb-wire-adapter = { path = "../crates/rssmb-wire-adapter" }
 rssmb-proto = { path = "../crates/rssmb-proto" }
 rssmb-auth = { path = "../crates/rssmb-auth" }
+rssmb-vfs = { path = "../crates/rssmb-vfs" }
+rssmb-server = { path = "../crates/rssmb-server" }
 binrw = "0.15"
 
 [[bin]]
@@ -47,5 +49,23 @@ doc = false
 [[bin]]
 name = "proto_decode_plain_request"
 path = "fuzz_targets/proto_decode_plain_request.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "normalize_path"
+path = "fuzz_targets/normalize_path.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ntlm_authenticate"
+path = "fuzz_targets/ntlm_authenticate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decrypt_transform"
+path = "fuzz_targets/decrypt_transform.rs"
 test = false
 doc = false

@@ -69,8 +69,7 @@ impl Tree {
     /// Errors closing individual handles are logged and ignored so that one
     /// failing close does not prevent cleanup of the remaining handles.
     pub async fn close_all(&self) {
-        let handles: Vec<rssmb_vfs::OpenId> =
-            self.open_handles.lock().await.drain().collect();
+        let handles: Vec<rssmb_vfs::OpenId> = self.open_handles.lock().await.drain().collect();
         for open_id in handles {
             if let Err(e) = self.vfs.close(open_id).await {
                 tracing::warn!(
@@ -93,10 +92,12 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rssmb_vfs::{OpenId, Vfs, VfsError, CreateArgs, FileInfo, InfoClass,
-        DirInfoClass, DirEntry, FileId, LockRange, FsCtlCode, FsStats, SecurityInfo};
-    use bytes::Bytes;
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use rssmb_vfs::{
+        CreateArgs, DirEntry, DirInfoClass, FileId, FileInfo, FsCtlCode, FsStats, InfoClass,
+        LockRange, OpenId, SecurityInfo, Vfs, VfsError,
+    };
 
     /// A no-op VFS stub that only records close calls so tests can observe
     /// handle cleanup without exercising a real filesystem.
@@ -106,7 +107,9 @@ mod tests {
 
     impl StubVfs {
         fn new() -> Arc<Self> {
-            Arc::new(Self { closed: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                closed: Mutex::new(Vec::new()),
+            })
         }
 
         async fn closed_ids(&self) -> Vec<OpenId> {
@@ -124,12 +127,7 @@ mod tests {
         ) -> Result<OpenId, VfsError> {
             Err(VfsError::NotSupported)
         }
-        async fn read_at(
-            &self,
-            _open: OpenId,
-            _offset: u64,
-            _len: u32,
-        ) -> Result<Bytes, VfsError> {
+        async fn read_at(&self, _open: OpenId, _offset: u64, _len: u32) -> Result<Bytes, VfsError> {
             Err(VfsError::NotSupported)
         }
         async fn write_at(
@@ -155,18 +153,10 @@ mod tests {
         ) -> Result<(), VfsError> {
             Ok(())
         }
-        async fn unlock(
-            &self,
-            _open: OpenId,
-            _range: LockRange,
-        ) -> Result<(), VfsError> {
+        async fn unlock(&self, _open: OpenId, _range: LockRange) -> Result<(), VfsError> {
             Ok(())
         }
-        async fn query_info(
-            &self,
-            _open: OpenId,
-            _class: InfoClass,
-        ) -> Result<FileInfo, VfsError> {
+        async fn query_info(&self, _open: OpenId, _class: InfoClass) -> Result<FileInfo, VfsError> {
             Err(VfsError::NotSupported)
         }
         async fn set_info(
@@ -280,9 +270,9 @@ mod tests {
             assert!(closed.contains(&id));
         }
         // the tracking set is drained
-        assert!(tree.remove_handle(OpenId(1)).await == false);
-        assert!(tree.remove_handle(OpenId(2)).await == false);
-        assert!(tree.remove_handle(OpenId(3)).await == false);
+        assert!(!tree.remove_handle(OpenId(1)).await);
+        assert!(!tree.remove_handle(OpenId(2)).await);
+        assert!(!tree.remove_handle(OpenId(3)).await);
     }
 
     #[tokio::test]

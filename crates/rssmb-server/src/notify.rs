@@ -11,8 +11,8 @@
 
 use std::path::PathBuf;
 
-use notify::{RecursiveMode, Watcher, EventKind};
 use notify::event::ModifyKind;
+use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -20,7 +20,7 @@ use rssmb_proto::notify::ChangeNotifyResponse;
 use rssmb_proto::plain::ResponseContent;
 use rssmb_wire_adapter::FramedResponse;
 
-use crate::dispatch::{ConnState, build_response, send_unsolicited};
+use crate::dispatch::{build_response, send_unsolicited, ConnState};
 
 // ── FILE_NOTIFY_CHANGE_* constants (MS-FSCC §2.4.34) ───────────────────
 
@@ -68,17 +68,39 @@ impl CompletionFilter {
     /// Convert to a bitmask of FILE_NOTIFY_CHANGE_* flags for filtering.
     fn change_mask(&self) -> u32 {
         let mut mask = 0u32;
-        if self.file_name { mask |= FILE_NOTIFY_CHANGE_FILE_NAME; }
-        if self.dir_name { mask |= FILE_NOTIFY_CHANGE_DIR_NAME; }
-        if self.attributes { mask |= FILE_NOTIFY_CHANGE_ATTRIBUTES; }
-        if self.size { mask |= FILE_NOTIFY_CHANGE_SIZE; }
-        if self.last_write { mask |= FILE_NOTIFY_CHANGE_LAST_WRITE; }
-        if self.last_access { mask |= FILE_NOTIFY_CHANGE_LAST_ACCESS; }
-        if self.creation { mask |= FILE_NOTIFY_CHANGE_CREATION; }
-        if self.security { mask |= FILE_NOTIFY_CHANGE_SECURITY; }
-        if self.stream_name { mask |= FILE_NOTIFY_CHANGE_STREAM_NAME; }
-        if self.stream_size { mask |= FILE_NOTIFY_CHANGE_STREAM_SIZE; }
-        if self.stream_write { mask |= FILE_NOTIFY_CHANGE_STREAM_WRITE; }
+        if self.file_name {
+            mask |= FILE_NOTIFY_CHANGE_FILE_NAME;
+        }
+        if self.dir_name {
+            mask |= FILE_NOTIFY_CHANGE_DIR_NAME;
+        }
+        if self.attributes {
+            mask |= FILE_NOTIFY_CHANGE_ATTRIBUTES;
+        }
+        if self.size {
+            mask |= FILE_NOTIFY_CHANGE_SIZE;
+        }
+        if self.last_write {
+            mask |= FILE_NOTIFY_CHANGE_LAST_WRITE;
+        }
+        if self.last_access {
+            mask |= FILE_NOTIFY_CHANGE_LAST_ACCESS;
+        }
+        if self.creation {
+            mask |= FILE_NOTIFY_CHANGE_CREATION;
+        }
+        if self.security {
+            mask |= FILE_NOTIFY_CHANGE_SECURITY;
+        }
+        if self.stream_name {
+            mask |= FILE_NOTIFY_CHANGE_STREAM_NAME;
+        }
+        if self.stream_size {
+            mask |= FILE_NOTIFY_CHANGE_STREAM_SIZE;
+        }
+        if self.stream_write {
+            mask |= FILE_NOTIFY_CHANGE_STREAM_WRITE;
+        }
         mask
     }
 }
@@ -112,9 +134,7 @@ fn serialize_notify_buffer(entries: &[FileNotifyEntry]) -> Vec<u8> {
         buf.extend_from_slice(&name_len.to_le_bytes());
         buf.extend_from_slice(&name_bytes);
         // Pad to 4-byte alignment.
-        for _ in entry_size..padded_size {
-            buf.push(0);
-        }
+        buf.extend(std::iter::repeat_n(0u8, padded_size - entry_size));
     }
     buf
 }
@@ -150,7 +170,9 @@ fn map_event(event: &notify::Event) -> Option<(u32, u32)> {
             )),
             _ => Some((
                 FILE_ACTION_MODIFIED,
-                FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                FILE_NOTIFY_CHANGE_ATTRIBUTES
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
             )),
         },
         EventKind::Access(_) => None, // Access events don't map to FILE_ACTION_*
@@ -203,20 +225,18 @@ pub fn start_watch(
     let pending_async = conn_state.pending_async.clone();
 
     tokio::spawn(async move {
-        let (event_tx, mut event_rx) =
-            mpsc::channel::<notify::Result<notify::Event>>(128);
+        let (event_tx, mut event_rx) = mpsc::channel::<notify::Result<notify::Event>>(128);
 
-        let watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let _ = event_tx.blocking_send(res);
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(conn_id, error = %e, "change_notify: failed to create watcher");
-                return;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(conn_id, error = %e, "change_notify: failed to create watcher");
+                    return;
+                }
+            };
 
         let mut watcher = watcher;
         let mode = if watch_tree {
@@ -331,7 +351,7 @@ pub fn start_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, RemoveKind, AccessKind};
+    use notify::event::{AccessKind, CreateKind, RemoveKind};
 
     #[test]
     fn test_serialize_notify_buffer_single_entry() {
@@ -346,7 +366,10 @@ mod tests {
         // Last entry: NextEntryOffset = 0
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0);
         // Action = FILE_ACTION_ADDED
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), FILE_ACTION_ADDED);
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            FILE_ACTION_ADDED
+        );
         // FileNameLength = 16 (8 chars × 2 bytes)
         assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 16);
     }
@@ -354,8 +377,14 @@ mod tests {
     #[test]
     fn test_serialize_notify_buffer_multiple_entries() {
         let entries = vec![
-            FileNotifyEntry { action: FILE_ACTION_ADDED, file_name: "a.txt".to_string() },
-            FileNotifyEntry { action: FILE_ACTION_REMOVED, file_name: "b.txt".to_string() },
+            FileNotifyEntry {
+                action: FILE_ACTION_ADDED,
+                file_name: "a.txt".to_string(),
+            },
+            FileNotifyEntry {
+                action: FILE_ACTION_REMOVED,
+                file_name: "b.txt".to_string(),
+            },
         ];
         let buf = serialize_notify_buffer(&entries);
         // First entry: NextEntryOffset should be non-zero

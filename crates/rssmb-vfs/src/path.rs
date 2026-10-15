@@ -59,7 +59,7 @@ impl NormalizedPath {
         let is_directory = nfc.ends_with('\\') || nfc.ends_with('/');
 
         let mut components = Vec::new();
-        for part in nfc.split(|c| c == '\\' || c == '/') {
+        for part in nfc.split(['\\', '/']) {
             if part.is_empty() || part == "." {
                 continue;
             }
@@ -181,6 +181,7 @@ pub enum PathError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_simple_path() {
@@ -343,5 +344,60 @@ mod tests {
             path.push_str(&max_component);
         }
         assert!(NormalizedPath::from_smb_path(&path).is_err());
+    }
+
+    // ---- Property tests (Phase 6.4) ----
+
+    proptest! {
+        /// from_smb_path should never panic on arbitrary valid UTF-8.
+        #[test]
+        fn prop_from_smb_path_no_panic(s in ".*") {
+            let _ = NormalizedPath::from_smb_path(&s);
+        }
+
+        /// A path with traversal (..) should always be rejected, regardless
+        /// of where it appears.
+        #[test]
+        fn prop_traversal_always_rejected(
+            prefix in ".*",
+            suffix in ".*",
+        ) {
+            let path = format!("{}\\..\\{}", prefix, suffix);
+            prop_assert!(NormalizedPath::from_smb_path(&path).is_err(),
+                "traversal path accepted: {:?}", path);
+        }
+
+        /// A simple valid path (alphanumeric components separated by \)
+        /// should always be accepted.
+        #[test]
+        fn prop_simple_valid_path(
+            comps in proptest::collection::vec("[a-zA-Z0-9]{1,50}", 1..=10)
+        ) {
+            let path = comps.join("\\");
+            let result = NormalizedPath::from_smb_path(&path);
+            prop_assert!(result.is_ok(),
+                "valid path rejected: {:?}", path);
+        }
+
+        /// NFC normalization: any input should produce a path whose
+        /// components are in NFC form (idempotent — normalizing again
+        /// should produce the same result).
+        #[test]
+        fn prop_nfc_idempotent(s in ".*") {
+            if let Ok(p1) = NormalizedPath::from_smb_path(&s) {
+                let smb_str = p1.to_smb_string();
+                let p2 = NormalizedPath::from_smb_path(&smb_str).unwrap();
+                prop_assert_eq!(p1.to_smb_string(), p2.to_smb_string(),
+                    "NFC not idempotent for {:?}", s);
+            }
+        }
+
+        /// Paths with control characters should always be rejected.
+        #[test]
+        fn prop_control_chars_rejected(c in 0u8..=0x1f) {
+            let path = format!("file{}test", char::from_u32(c as u32).unwrap());
+            prop_assert!(NormalizedPath::from_smb_path(&path).is_err(),
+                "control char 0x{:02x} accepted", c);
+        }
     }
 }

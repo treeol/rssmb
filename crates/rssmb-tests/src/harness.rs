@@ -1,6 +1,6 @@
 //! Test harness for starting a test SMB server.
 
-use rssmb_server::{ServerConfig, ServerState, connection};
+use rssmb_server::{connection, ServerConfig, ServerState};
 use std::sync::Arc;
 
 /// A running test server instance.
@@ -28,7 +28,11 @@ impl TestServer {
             let _ = connection::listen_on(listener, listen_state).await;
         });
 
-        Ok(Self { state, addr, handle })
+        Ok(Self {
+            state,
+            addr,
+            handle,
+        })
     }
 
     /// Start with default test config.

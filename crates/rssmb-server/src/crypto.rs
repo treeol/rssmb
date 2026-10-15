@@ -72,8 +72,8 @@ pub enum CryptoError {
 fn kdf_sp800_108(session_key: &[u8], label: &[u8], context: &[u8], output_bits: u32) -> Vec<u8> {
     // SMB 3.x uses only the first 16 bytes of the session key as the KDF key.
     let kdf_key = &session_key[..16.min(session_key.len())];
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(kdf_key)
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(kdf_key).expect("HMAC accepts any key length");
     // Counter = 1 (big-endian u32)
     mac.update(&1u32.to_be_bytes());
     // Label
@@ -102,15 +102,21 @@ fn resolve_context<'a>(
 ) -> Result<&'a [u8], CryptoError> {
     match (dialect, ctx) {
         (DialectConfig::Smb311, KdfContext::Preauth(h)) => Ok(h),
-        (DialectConfig::Smb311, KdfContext::Legacy) => {
-            Err(CryptoError::MissingPreauth(dialect))
-        }
-        (DialectConfig::Smb2002 | DialectConfig::Smb21 | DialectConfig::Smb30 | DialectConfig::Smb302, KdfContext::Legacy) => {
-            Ok(legacy_fallback)
-        }
-        (DialectConfig::Smb2002 | DialectConfig::Smb21 | DialectConfig::Smb30 | DialectConfig::Smb302, KdfContext::Preauth(_)) => {
-            Err(CryptoError::UnexpectedPreauth(dialect))
-        }
+        (DialectConfig::Smb311, KdfContext::Legacy) => Err(CryptoError::MissingPreauth(dialect)),
+        (
+            DialectConfig::Smb2002
+            | DialectConfig::Smb21
+            | DialectConfig::Smb30
+            | DialectConfig::Smb302,
+            KdfContext::Legacy,
+        ) => Ok(legacy_fallback),
+        (
+            DialectConfig::Smb2002
+            | DialectConfig::Smb21
+            | DialectConfig::Smb30
+            | DialectConfig::Smb302,
+            KdfContext::Preauth(_),
+        ) => Err(CryptoError::UnexpectedPreauth(dialect)),
     }
 }
 
@@ -146,7 +152,12 @@ pub fn compute_signing_key(
         }
         DialectConfig::Smb311 => {
             let context = resolve_context(dialect, ctx, b"")?;
-            Ok(kdf_sp800_108(session_key, b"SMBSigningKey\x00", context, 128))
+            Ok(kdf_sp800_108(
+                session_key,
+                b"SMBSigningKey\x00",
+                context,
+                128,
+            ))
         }
     }
 }
@@ -174,7 +185,12 @@ pub fn compute_encryption_key(
         }
         DialectConfig::Smb311 => {
             let context = resolve_context(dialect, ctx, b"")?;
-            Ok(kdf_sp800_108(session_key, b"SMBS2CCipherKey\x00", context, 128))
+            Ok(kdf_sp800_108(
+                session_key,
+                b"SMBS2CCipherKey\x00",
+                context,
+                128,
+            ))
         }
     }
 }
@@ -202,7 +218,12 @@ pub fn compute_decryption_key(
         }
         DialectConfig::Smb311 => {
             let context = resolve_context(dialect, ctx, b"")?;
-            Ok(kdf_sp800_108(session_key, b"SMBC2SCipherKey\x00", context, 128))
+            Ok(kdf_sp800_108(
+                session_key,
+                b"SMBC2SCipherKey\x00",
+                context,
+                128,
+            ))
         }
     }
 }
@@ -303,18 +324,23 @@ impl NonceSource {
     /// beyond `nonce_len`) or an error if the counter is exhausted.
     pub fn next(&self) -> Result<[u8; 16], EncryptionError> {
         use std::sync::atomic::Ordering;
-        // fetch_update is non-wrapping: at u64::MAX it returns Err.
-        let n = self.counter.try_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |x| {
-                if x == u64::MAX {
-                    None // permanently exhausted
-                } else {
-                    Some(x + 1)
-                }
-            },
-        ).map_err(|_| EncryptionError::NonceExhausted)?;
+        // Non-wrapping increment via compare_exchange loop.
+        // At u64::MAX the counter is permanently exhausted.
+        let mut current = self.counter.load(Ordering::Relaxed);
+        loop {
+            if current == u64::MAX {
+                return Err(EncryptionError::NonceExhausted);
+            }
+            let new = current + 1;
+            match self
+                .counter
+                .compare_exchange(current, new, Ordering::SeqCst, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        let n = current;
         let mut nonce = [0u8; 16];
         nonce[..8].copy_from_slice(&n.to_le_bytes());
         // Fill nonce[8..nonce_len] with the random suffix.
@@ -366,7 +392,7 @@ pub fn encrypt_message(
     nonce: &[u8; 16],
     original_message_size: u32,
     session_id: u64,
-    plaintext: &mut Vec<u8>,
+    plaintext: &mut [u8],
 ) -> Result<([u8; TRANSFORM_HEADER_SIZE], [u8; 16]), EncryptionError> {
     let hdr = build_transform_header(nonce, original_message_size, session_id);
     let aad = transform_aad(&hdr);
@@ -453,11 +479,7 @@ pub fn preauth_update(hash: &PreauthHashValue, message: &[u8]) -> PreauthHashVal
 ///
 /// The caller must zero the 16-byte `Signature` field of the SMB2 header
 /// in `message` before signing.
-pub fn sign_message(
-    signing_key: &[u8],
-    message: &[u8],
-    dialect: DialectConfig,
-) -> [u8; 16] {
+pub fn sign_message(signing_key: &[u8], message: &[u8], dialect: DialectConfig) -> [u8; 16] {
     match dialect {
         DialectConfig::Smb2002 | DialectConfig::Smb21 => {
             let mut mac = <HmacSha256 as Mac>::new_from_slice(signing_key)
@@ -504,8 +526,7 @@ pub fn filetime_now() -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before Unix epoch");
-    (UNIX_EPOCH_DELTA_SECS + now.as_secs()) * HUNDRED_NS_PER_SEC
-        + (now.subsec_nanos() / 100) as u64
+    (UNIX_EPOCH_DELTA_SECS + now.as_secs()) * HUNDRED_NS_PER_SEC + (now.subsec_nanos() / 100) as u64
 }
 
 #[cfg(test)]
@@ -513,15 +534,19 @@ mod tests {
     use super::*;
 
     const TEST_SESSION_KEY_16: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
     ];
 
     #[test]
     fn test_sign_verify_roundtrip_smb21_hmac() {
         let dialect = DialectConfig::Smb21;
         let key = compute_signing_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
-        assert_eq!(key.len(), 16, "SMB 2.x signing key should be 16 bytes (session key)");
+        assert_eq!(
+            key.len(),
+            16,
+            "SMB 2.x signing key should be 16 bytes (session key)"
+        );
         let message = b"hello SMB 2.1 message to sign";
         let sig = sign_message(&key, message, dialect);
         assert_eq!(sig.len(), 16);
@@ -538,7 +563,11 @@ mod tests {
     fn test_sign_verify_roundtrip_smb30_cmac() {
         let dialect = DialectConfig::Smb30;
         let key = compute_signing_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
-        assert_eq!(key.len(), 16, "SMB 3.0 signing key should be 16 bytes (L=128)");
+        assert_eq!(
+            key.len(),
+            16,
+            "SMB 3.0 signing key should be 16 bytes (L=128)"
+        );
         let message = b"hello SMB 3.0 message to sign";
         let sig = sign_message(&key, message, dialect);
         assert_eq!(sig.len(), 16);
@@ -555,7 +584,8 @@ mod tests {
     fn test_sign_verify_roundtrip_smb311_cmac() {
         let dialect = DialectConfig::Smb311;
         let preauth = [0u8; 64];
-        let key = compute_signing_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let key = compute_signing_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Preauth(&preauth))
+            .unwrap();
         assert_eq!(key.len(), 16);
         let message = b"hello SMB 3.1.1 message to sign";
         let sig = sign_message(&key, message, dialect);
@@ -575,13 +605,28 @@ mod tests {
 
     #[test]
     fn test_signing_keys_differ_per_dialect() {
-        let k30 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb30, KdfContext::Legacy).unwrap();
+        let k30 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb30,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         let preauth = [0u8; 64];
-        let k311 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
+        let k311 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
         assert_ne!(k30, k311, "3.0 and 3.1.1 signing keys must differ");
 
         // SMB 2.1 uses session key directly — different from 3.0 KDF output.
-        let k21 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb21, KdfContext::Legacy).unwrap();
+        let k21 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb21,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         assert_ne!(k21, k30);
         // 2.1 key IS the session key (first 16 bytes).
         assert_eq!(k21, &TEST_SESSION_KEY_16[..]);
@@ -589,21 +634,43 @@ mod tests {
 
     #[test]
     fn test_smb30_and_smb302_keys_match() {
-        let k30 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb30, KdfContext::Legacy).unwrap();
-        let k302 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb302, KdfContext::Legacy).unwrap();
+        let k30 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb30,
+            KdfContext::Legacy,
+        )
+        .unwrap();
+        let k302 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb302,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         assert_eq!(k30, k302);
     }
 
     #[test]
     fn test_encryption_decryption_keys_differ() {
         let dialect = DialectConfig::Smb30;
-        let enc = compute_encryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
-        let dec = compute_decryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
+        let enc =
+            compute_encryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
+        let dec =
+            compute_decryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
         assert_ne!(enc, dec, "encryption and decryption keys must differ");
 
         let preauth = [0u8; 64];
-        let enc = compute_encryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
-        let dec = compute_decryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
+        let enc = compute_encryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
+        let dec = compute_decryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
         assert_ne!(enc, dec);
     }
 
@@ -611,17 +678,37 @@ mod tests {
     /// (SMBS2CCipherKey vs SMB2AESCCM).
     #[test]
     fn test_smb311_encryption_labels_differ_from_smb30() {
-        let enc30 = compute_encryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb30, KdfContext::Legacy).unwrap();
+        let enc30 = compute_encryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb30,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         let preauth = [0u8; 64];
-        let enc311 = compute_encryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
+        let enc311 = compute_encryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
         assert_ne!(enc30, enc311);
     }
 
     #[test]
     fn test_signing_key_is_deterministic() {
         let preauth = [0u8; 64];
-        let k1 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
-        let k2 = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Preauth(&preauth)).unwrap();
+        let k1 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
+        let k2 = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Preauth(&preauth),
+        )
+        .unwrap();
         assert_eq!(k1, k2);
     }
 
@@ -635,7 +722,11 @@ mod tests {
             DialectConfig::Smb302,
             DialectConfig::Smb311,
         ] {
-            let ctx = if d == DialectConfig::Smb311 { KdfContext::Preauth(&preauth) } else { KdfContext::Legacy };
+            let ctx = if d == DialectConfig::Smb311 {
+                KdfContext::Preauth(&preauth)
+            } else {
+                KdfContext::Legacy
+            };
             let k = compute_signing_key(&TEST_SESSION_KEY_16, d, ctx).unwrap();
             assert_eq!(k.len(), 16, "signing key for {:?} should be 16 bytes", d);
         }
@@ -657,7 +748,10 @@ mod tests {
             ft > 132_500_000_000_000_000,
             "filetime_now returned {ft}, expected a value in the 2020s"
         );
-        assert!(ft < 134_800_000_000_000_000, "filetime_now returned {ft}, suspiciously far in the future");
+        assert!(
+            ft < 134_800_000_000_000_000,
+            "filetime_now returned {ft}, suspiciously far in the future"
+        );
     }
 
     #[test]
@@ -671,7 +765,12 @@ mod tests {
     #[test]
     fn test_smb21_signing_key_is_session_key() {
         // SMB 2.x: signing key = session key (first 16 bytes), no derivation.
-        let key = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb21, KdfContext::Legacy).unwrap();
+        let key = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb21,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         assert_eq!(key, &TEST_SESSION_KEY_16[..]);
     }
 
@@ -681,29 +780,27 @@ mod tests {
     #[test]
     fn test_kdf_sp800_108_known_answer() {
         let session_key: [u8; 16] = [
-            0xDA, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F,
-            0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4, 0x5C, 0xB6,
+            0xDA, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F, 0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4,
+            0x5C, 0xB6,
         ];
         let preauth_hash: PreauthHashValue = [
-            0x47, 0x95, 0x78, 0xb1, 0x87, 0x23, 0x05, 0x6a,
-            0x4c, 0x3e, 0x6f, 0x73, 0x2f, 0x36, 0xf1, 0x9c,
-            0xcc, 0xdd, 0x51, 0x6f, 0x49, 0x56, 0x6b, 0xa0,
-            0x43, 0xce, 0x59, 0x6a, 0x13, 0x42, 0x27, 0xd9,
-            0x64, 0xef, 0x0a, 0xa6, 0xa6, 0x27, 0x1a, 0xfe,
-            0x4f, 0xe6, 0x4b, 0x4d, 0x8c, 0xb2, 0xe6, 0xa1,
-            0x95, 0x11, 0xed, 0xbb, 0xf6, 0xd7, 0x7d, 0xce,
+            0x47, 0x95, 0x78, 0xb1, 0x87, 0x23, 0x05, 0x6a, 0x4c, 0x3e, 0x6f, 0x73, 0x2f, 0x36,
+            0xf1, 0x9c, 0xcc, 0xdd, 0x51, 0x6f, 0x49, 0x56, 0x6b, 0xa0, 0x43, 0xce, 0x59, 0x6a,
+            0x13, 0x42, 0x27, 0xd9, 0x64, 0xef, 0x0a, 0xa6, 0xa6, 0x27, 0x1a, 0xfe, 0x4f, 0xe6,
+            0x4b, 0x4d, 0x8c, 0xb2, 0xe6, 0xa1, 0x95, 0x11, 0xed, 0xbb, 0xf6, 0xd7, 0x7d, 0xce,
             0xf0, 0x33, 0xda, 0xed, 0x8c, 0x71, 0x81, 0xb2,
         ];
         let expected_signing_key: [u8; 16] = [
-            0x6D, 0xAC, 0xCE, 0xDE, 0x5B, 0x4E, 0x36, 0x08,
-            0xAD, 0x6E, 0xA5, 0x47, 0x33, 0xCA, 0x31, 0x63,
+            0x6D, 0xAC, 0xCE, 0xDE, 0x5B, 0x4E, 0x36, 0x08, 0xAD, 0x6E, 0xA5, 0x47, 0x33, 0xCA,
+            0x31, 0x63,
         ];
         // Test through the public API with KdfContext::Preauth.
         let derived = compute_signing_key(
             &session_key,
             DialectConfig::Smb311,
             KdfContext::Preauth(&preauth_hash),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             derived, expected_signing_key,
             "KDF output does not match known-answer vector"
@@ -716,12 +813,24 @@ mod tests {
     #[test]
     fn test_smb30_encryption_keys_differ_by_direction() {
         let dialect = DialectConfig::Smb30;
-        let enc = compute_encryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
-        let dec = compute_decryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
+        let enc =
+            compute_encryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
+        let dec =
+            compute_decryption_key(&TEST_SESSION_KEY_16, dialect, KdfContext::Legacy).unwrap();
         assert_ne!(enc, dec, "ServerOut and ServerIn keys must differ");
         // Also verify 3.0.2 produces the same keys as 3.0
-        let enc2 = compute_encryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb302, KdfContext::Legacy).unwrap();
-        let dec2 = compute_decryption_key(&TEST_SESSION_KEY_16, DialectConfig::Smb302, KdfContext::Legacy).unwrap();
+        let enc2 = compute_encryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb302,
+            KdfContext::Legacy,
+        )
+        .unwrap();
+        let dec2 = compute_decryption_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb302,
+            KdfContext::Legacy,
+        )
+        .unwrap();
         assert_eq!(enc, enc2, "3.0 and 3.0.2 encryption keys must match");
         assert_eq!(dec, dec2, "3.0 and 3.0.2 decryption keys must match");
     }
@@ -730,21 +839,33 @@ mod tests {
 
     #[test]
     fn test_kdf_rejects_311_with_legacy() {
-        let result = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb311, KdfContext::Legacy);
+        let result = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb311,
+            KdfContext::Legacy,
+        );
         assert!(matches!(result, Err(CryptoError::MissingPreauth(_))));
     }
 
     #[test]
     fn test_kdf_rejects_30_with_preauth() {
         let preauth = [0u8; 64];
-        let result = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb30, KdfContext::Preauth(&preauth));
+        let result = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb30,
+            KdfContext::Preauth(&preauth),
+        );
         assert!(matches!(result, Err(CryptoError::UnexpectedPreauth(_))));
     }
 
     #[test]
     fn test_kdf_rejects_21_with_preauth() {
         let preauth = [0u8; 64];
-        let result = compute_signing_key(&TEST_SESSION_KEY_16, DialectConfig::Smb21, KdfContext::Preauth(&preauth));
+        let result = compute_signing_key(
+            &TEST_SESSION_KEY_16,
+            DialectConfig::Smb21,
+            KdfContext::Preauth(&preauth),
+        );
         assert!(matches!(result, Err(CryptoError::UnexpectedPreauth(_))));
     }
 
@@ -798,13 +919,8 @@ mod tests {
         let nonce = nonce_src.next().unwrap();
         let plaintext = b"Hello, SMB 3.1.1 encrypted message!".to_vec();
         let mut pt = plaintext.clone();
-        let (hdr, tag) = encrypt_message(
-            &key,
-            &nonce,
-            pt.len() as u32,
-            0x1234_5678,
-            &mut pt,
-        ).unwrap();
+        let (hdr, tag) =
+            encrypt_message(&key, &nonce, pt.len() as u32, 0x1234_5678, &mut pt).unwrap();
         // hdr is the 52-byte transform header (sig zeroed); tag is the AEAD tag.
         // Write the tag into the header's signature field.
         let mut full_hdr = hdr;
@@ -893,7 +1009,10 @@ mod tests {
         wire.extend_from_slice(&pt);
         // Corrupt the flags field (offset 42..44) from 1 to 0.
         wire[42] = 0;
-        assert!(decrypt_message(&key, &wire).is_err(), "flags != 1 must be rejected");
+        assert!(
+            decrypt_message(&key, &wire).is_err(),
+            "flags != 1 must be rejected"
+        );
     }
 
     #[test]
@@ -911,7 +1030,10 @@ mod tests {
         wire.extend_from_slice(&pt);
         // Corrupt OriginalMessageSize (offset 36..40) to a wrong value.
         wire[36] = 0xFF;
-        assert!(decrypt_message(&key, &wire).is_err(), "size mismatch must be rejected");
+        assert!(
+            decrypt_message(&key, &wire).is_err(),
+            "size mismatch must be rejected"
+        );
     }
 
     #[test]
@@ -969,13 +1091,19 @@ mod tests {
         // Nonce (offset 20..36).
         assert_eq!(&hdr[20..36], &nonce[..]);
         // OriginalMessageSize (offset 36..40, LE).
-        assert_eq!(u32::from_le_bytes(hdr[36..40].try_into().unwrap()), 0x1234_5678);
+        assert_eq!(
+            u32::from_le_bytes(hdr[36..40].try_into().unwrap()),
+            0x1234_5678
+        );
         // Reserved (offset 40..42) = 0.
         assert_eq!(hdr[40..42], [0, 0]);
         // Flags (offset 42..44) = 1.
         assert_eq!(u16::from_le_bytes(hdr[42..44].try_into().unwrap()), 1);
         // SessionId (offset 44..52, LE).
-        assert_eq!(u64::from_le_bytes(hdr[44..52].try_into().unwrap()), 0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(
+            u64::from_le_bytes(hdr[44..52].try_into().unwrap()),
+            0xDEAD_BEEF_CAFE_BABE
+        );
     }
 
     // ── 3.1.1 preauth/KDF end-to-end transcript golden test ──────────────
@@ -1021,15 +1149,16 @@ mod tests {
 
         // Step 3: Derive signing key from session key + final preauth hash.
         let session_key: [u8; 16] = [
-            0xDA, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F,
-            0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4, 0x5C, 0xB6,
+            0xDA, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F, 0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4,
+            0x5C, 0xB6,
         ];
-        let signing_key = compute_signing_key(
-            &session_key,
-            dialect,
-            KdfContext::Preauth(&h2),
-        ).unwrap();
-        assert_eq!(signing_key.len(), 16, "signing key must be 16 bytes (AES-128)");
+        let signing_key =
+            compute_signing_key(&session_key, dialect, KdfContext::Preauth(&h2)).unwrap();
+        assert_eq!(
+            signing_key.len(),
+            16,
+            "signing key must be 16 bytes (AES-128)"
+        );
 
         // Step 4: Sign a mock SMB2 message with AES-128-CMAC.
         // In a real session, the 16-byte Signature field in the SMB2 header
@@ -1039,7 +1168,12 @@ mod tests {
         assert_eq!(signature.len(), 16);
 
         // Step 5: Verify the signature round-trips.
-        assert!(verify_signature(&signing_key, mock_message, &signature, dialect));
+        assert!(verify_signature(
+            &signing_key,
+            mock_message,
+            &signature,
+            dialect
+        ));
 
         // Step 6: Verify tampering is detected.
         let tampered = {
@@ -1047,27 +1181,27 @@ mod tests {
             m[4] ^= 0x01;
             m
         };
-        assert!(!verify_signature(&signing_key, &tampered, &signature, dialect),
-            "tampered message must fail signature verification");
+        assert!(
+            !verify_signature(&signing_key, &tampered, &signature, dialect),
+            "tampered message must fail signature verification"
+        );
 
         // Step 7: Verify a different preauth hash produces a different signing key.
         let h_alt = preauth_update(&h0, b"different_message");
-        let signing_key_alt = compute_signing_key(
-            &session_key,
-            dialect,
-            KdfContext::Preauth(&h_alt),
-        ).unwrap();
-        assert_ne!(signing_key, signing_key_alt,
-            "different preauth hashes must produce different signing keys");
+        let signing_key_alt =
+            compute_signing_key(&session_key, dialect, KdfContext::Preauth(&h_alt)).unwrap();
+        assert_ne!(
+            signing_key, signing_key_alt,
+            "different preauth hashes must produce different signing keys"
+        );
 
         // Step 8: Verify the same inputs produce the same signing key (determinism).
-        let signing_key_again = compute_signing_key(
-            &session_key,
-            dialect,
-            KdfContext::Preauth(&h2),
-        ).unwrap();
-        assert_eq!(signing_key, signing_key_again,
-            "same preauth hash must produce same signing key (determinism)");
+        let signing_key_again =
+            compute_signing_key(&session_key, dialect, KdfContext::Preauth(&h2)).unwrap();
+        assert_eq!(
+            signing_key, signing_key_again,
+            "same preauth hash must produce same signing key (determinism)"
+        );
     }
 
     /// Verify that the 3.1.1 encryption/decryption key derivation produces
@@ -1078,13 +1212,25 @@ mod tests {
         let preauth: PreauthHashValue = [0x55u8; 64];
         let dialect = DialectConfig::Smb311;
 
-        let signing_key = compute_signing_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
-        let enc_key = compute_encryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
-        let dec_key = compute_decryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let signing_key =
+            compute_signing_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let enc_key =
+            compute_encryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
+        let dec_key =
+            compute_decryption_key(&session_key, dialect, KdfContext::Preauth(&preauth)).unwrap();
 
         // All three keys must be different (different labels).
-        assert_ne!(signing_key, enc_key, "signing and encryption keys must differ");
-        assert_ne!(signing_key, dec_key, "signing and decryption keys must differ");
-        assert_ne!(enc_key, dec_key, "encryption and decryption keys must differ");
+        assert_ne!(
+            signing_key, enc_key,
+            "signing and encryption keys must differ"
+        );
+        assert_ne!(
+            signing_key, dec_key,
+            "signing and decryption keys must differ"
+        );
+        assert_ne!(
+            enc_key, dec_key,
+            "encryption and decryption keys must differ"
+        );
     }
 }

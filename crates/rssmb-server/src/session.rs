@@ -268,7 +268,12 @@ mod tests {
             strict_sync: true,
             case_sensitive: false,
         };
-        session.add_tree(2, Arc::new(Tree::new(2, 1, "other".to_string(), share2, vfs2))).await;
+        session
+            .add_tree(
+                2,
+                Arc::new(Tree::new(2, 1, "other".to_string(), share2, vfs2)),
+            )
+            .await;
         assert_eq!(session.trees.read().await.len(), 2);
 
         session.close().await;
@@ -289,7 +294,11 @@ mod tests {
             .expect("guest auth step");
 
         match step {
-            AuthStep::Complete { identity, session_key, .. } => {
+            AuthStep::Complete {
+                identity,
+                session_key,
+                ..
+            } => {
                 assert_eq!(identity.username, "guest");
                 assert!(identity.is_guest);
                 assert!(session_key.is_empty());

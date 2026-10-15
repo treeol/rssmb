@@ -208,7 +208,7 @@ pub struct QueryInfoResponse {
 impl QueryInfoResponse {
     /// Construct from raw bytes.
     pub fn from_bytes(data: Vec<u8>) -> Self {
-        QueryInfoResponse { data, ..Default::default() }
+        QueryInfoResponse { data }
     }
 }
 

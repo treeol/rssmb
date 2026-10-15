@@ -5,7 +5,7 @@
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
-use crate::dtyp::{Guid, FileTime, PosMarker, SizedWideString, SizedStringSize};
+use crate::dtyp::{FileTime, Guid, PosMarker, SizedStringSize, SizedWideString};
 use crate::fscc::FileAttributes;
 
 // ── FileId (MS-SMB2 2.2.14.1) ──────────────────────────────────────
@@ -35,18 +35,14 @@ impl std::fmt::Debug for FileId {
 /// Oplock level values.
 #[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
 #[brw(repr(u8))]
+#[derive(Default)]
 pub enum OplockLevel {
+    #[default]
     None = 0,
     II = 1,
     Exclusive = 2,
     Batch = 0x09,
     Lease = 0xFF,
-}
-
-impl Default for OplockLevel {
-    fn default() -> Self {
-        OplockLevel::None
-    }
 }
 
 // ── ImpersonationLevel (MS-SMB2 2.2.13) ───────────────────────────
@@ -138,32 +134,32 @@ pub struct ShareAccessFlags {
 #[bw(map = |&x| Self::into_bytes(x))]
 #[br(map = Self::from_bytes)]
 pub struct FileAccessMask {
-    pub file_read_data: bool,       // bit 0
-    pub file_write_data: bool,      // bit 1
-    pub file_append_data: bool,     // bit 2
-    pub file_read_ea: bool,         // bit 3
-    pub file_write_ea: bool,        // bit 4
+    pub file_read_data: bool,        // bit 0
+    pub file_write_data: bool,       // bit 1
+    pub file_append_data: bool,      // bit 2
+    pub file_read_ea: bool,          // bit 3
+    pub file_write_ea: bool,         // bit 4
     pub file_execute: bool,          // bit 5
-    pub file_delete_child: bool,    // bit 6
-    pub file_read_attributes: bool, // bit 7
+    pub file_delete_child: bool,     // bit 6
+    pub file_read_attributes: bool,  // bit 7
     pub file_write_attributes: bool, // bit 8
     #[skip]
     __: B7,
-    pub delete: bool,               // bit 16
-    pub read_control: bool,         // bit 17
-    pub write_dacl: bool,           // bit 18
-    pub write_owner: bool,          // bit 19
-    pub synchronize: bool,          // bit 20
+    pub delete: bool,       // bit 16
+    pub read_control: bool, // bit 17
+    pub write_dacl: bool,   // bit 18
+    pub write_owner: bool,  // bit 19
+    pub synchronize: bool,  // bit 20
     #[skip]
     __: B3,
     pub access_system_security: bool, // bit 24
-    pub maximum_allowed: bool,       // bit 25
+    pub maximum_allowed: bool,        // bit 25
     #[skip]
     __: B2,
-    pub generic_all: bool,          // bit 28
-    pub generic_execute: bool,      // bit 29
-    pub generic_write: bool,        // bit 30
-    pub generic_read: bool,         // bit 31
+    pub generic_all: bool,     // bit 28
+    pub generic_execute: bool, // bit 29
+    pub generic_write: bool,   // bit 30
+    pub generic_read: bool,    // bit 31
 }
 
 // ── CreateRequest (MS-SMB2 2.2.13) ────────────────────────────────
@@ -443,13 +439,19 @@ mod tests {
 
     #[test]
     fn test_file_id_display() {
-        let fid = FileId { persistent: 42, volatile: 99 };
+        let fid = FileId {
+            persistent: 42,
+            volatile: 99,
+        };
         assert_eq!(format!("{}", fid), "{2a|63}");
     }
 
     #[test]
     fn test_file_id_roundtrip() {
-        let fid = FileId { persistent: 0xDEAD_BEEF_CAFE_BABE, volatile: 0x1234_5678_9ABC_DEF0 };
+        let fid = FileId {
+            persistent: 0xDEAD_BEEF_CAFE_BABE,
+            volatile: 0x1234_5678_9ABC_DEF0,
+        };
         let mut buf = Cursor::new(Vec::new());
         fid.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();
@@ -468,7 +470,10 @@ mod tests {
             oplock_level: 2,
             reserved: 0,
             _reserved2: 0,
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
         };
         let mut buf = Cursor::new(Vec::new());
         msg.write_le(&mut buf).unwrap();
@@ -478,7 +483,13 @@ mod tests {
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: OplockBreakMsg = OplockBreakMsg::read_le(&mut cursor).unwrap();
         assert_eq!(decoded.oplock_level, 2);
-        assert_eq!(decoded.file_id, FileId { persistent: 1, volatile: 2 });
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                persistent: 1,
+                volatile: 2
+            }
+        );
     }
 
     #[test]
@@ -488,7 +499,9 @@ mod tests {
             ack_required: 1,
             lease_key: Guid::from([0xABu8; 16]),
             current_lease_state: LeaseState::new().with_read_caching(true),
-            new_lease_state: LeaseState::new().with_read_caching(true).with_handle_caching(true),
+            new_lease_state: LeaseState::new()
+                .with_read_caching(true)
+                .with_handle_caching(true),
         };
         let mut buf = Cursor::new(Vec::new());
         msg.write_le(&mut buf).unwrap();
@@ -543,8 +556,10 @@ mod tests {
             allocation_size: 4096,
             endof_file: 2048,
             file_attributes: FileAttributes::new().with_normal(true),
-            file_id: FileId { persistent: 0xCAFE, volatile: 0xBABE },
-            ..Default::default()
+            file_id: FileId {
+                persistent: 0xCAFE,
+                volatile: 0xBABE,
+            },
         };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();
@@ -558,14 +573,23 @@ mod tests {
         assert_eq!(decoded.oplock_level, OplockLevel::II);
         assert_eq!(decoded.create_action, CreateAction::Created);
         assert_eq!(decoded.endof_file, 2048);
-        assert_eq!(decoded.file_id, FileId { persistent: 0xCAFE, volatile: 0xBABE });
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                persistent: 0xCAFE,
+                volatile: 0xBABE
+            }
+        );
     }
 
     #[test]
     fn test_close_request_roundtrip() {
         let req = CloseRequest {
             flags: CloseFlags::new().with_postquery_attrib(true),
-            file_id: FileId { persistent: 0xAAAA, volatile: 0xBBBB },
+            file_id: FileId {
+                persistent: 0xAAAA,
+                volatile: 0xBBBB,
+            },
         };
         let mut buf = Cursor::new(Vec::new());
         req.write_le(&mut buf).unwrap();
@@ -574,7 +598,13 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 24);
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: CloseRequest = CloseRequest::read_le(&mut cursor).unwrap();
-        assert_eq!(decoded.file_id, FileId { persistent: 0xAAAA, volatile: 0xBBBB });
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                persistent: 0xAAAA,
+                volatile: 0xBBBB
+            }
+        );
         assert!(decoded.flags.postquery_attrib());
     }
 
@@ -597,8 +627,11 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 60);
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: CloseResponse = CloseResponse::read_le(&mut cursor).unwrap();
-        assert_eq!(decoded.file_attributes.directory(), true);
-        assert_eq!(decoded.last_write_time, FileTime::from(130000000000000002u64));
+        assert!(decoded.file_attributes.directory());
+        assert_eq!(
+            decoded.last_write_time,
+            FileTime::from(130000000000000002u64)
+        );
     }
 
     #[test]
@@ -654,9 +687,7 @@ mod tests {
 
     #[test]
     fn test_share_access_flags_roundtrip() {
-        let flags = ShareAccessFlags::new()
-            .with_read(true)
-            .with_delete(true);
+        let flags = ShareAccessFlags::new().with_read(true).with_delete(true);
         let mut buf = Cursor::new(Vec::new());
         flags.write_le(&mut buf).unwrap();
         let bytes = buf.into_inner();

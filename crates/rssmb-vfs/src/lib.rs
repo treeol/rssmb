@@ -65,10 +65,18 @@ pub struct ShareAccess {
 
 impl ShareAccess {
     pub fn all() -> Self {
-        Self { read: true, write: true, delete: true }
+        Self {
+            read: true,
+            write: true,
+            delete: true,
+        }
     }
     pub fn none() -> Self {
-        Self { read: false, write: false, delete: false }
+        Self {
+            read: false,
+            write: false,
+            delete: false,
+        }
     }
 }
 
@@ -112,7 +120,11 @@ impl CreateArgs {
         Self {
             disposition: CreateDisposition::Open,
             share_access: ShareAccess::all(),
-            desired_access: DesiredAccess { read: true, read_attributes: true, ..Default::default() },
+            desired_access: DesiredAccess {
+                read: true,
+                read_attributes: true,
+                ..Default::default()
+            },
             create_options: CreateOptions::default(),
         }
     }
@@ -316,21 +328,11 @@ pub trait Vfs: Send + Sync {
 
     /// Read data from an open file at the given offset.
     /// Returns the bytes read (may be fewer than requested at EOF).
-    async fn read_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        len: u32,
-    ) -> Result<Bytes, VfsError>;
+    async fn read_at(&self, open: OpenId, offset: u64, len: u32) -> Result<Bytes, VfsError>;
 
     /// Write data to an open file at the given offset.
     /// Returns the number of bytes written.
-    async fn write_at(
-        &self,
-        open: OpenId,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u32, VfsError>;
+    async fn write_at(&self, open: OpenId, offset: u64, data: &[u8]) -> Result<u32, VfsError>;
 
     /// Close an open handle. Performs delete-on-close if flag is set.
     async fn close(&self, open: OpenId) -> Result<(), VfsError>;
@@ -339,26 +341,13 @@ pub trait Vfs: Send + Sync {
     async fn flush(&self, open: OpenId) -> Result<(), VfsError>;
 
     /// Acquire a byte-range lock.
-    async fn lock(
-        &self,
-        open: OpenId,
-        range: LockRange,
-        exclusive: bool,
-    ) -> Result<(), VfsError>;
+    async fn lock(&self, open: OpenId, range: LockRange, exclusive: bool) -> Result<(), VfsError>;
 
     /// Release a byte-range lock.
-    async fn unlock(
-        &self,
-        open: OpenId,
-        range: LockRange,
-    ) -> Result<(), VfsError>;
+    async fn unlock(&self, open: OpenId, range: LockRange) -> Result<(), VfsError>;
 
     /// Query file/directory information.
-    async fn query_info(
-        &self,
-        open: OpenId,
-        class: InfoClass,
-    ) -> Result<FileInfo, VfsError>;
+    async fn query_info(&self, open: OpenId, class: InfoClass) -> Result<FileInfo, VfsError>;
 
     /// Set file/directory information.
     async fn set_info(
@@ -395,20 +384,10 @@ pub trait Vfs: Send + Sync {
     }
 
     /// Rename a file.
-    async fn rename(
-        &self,
-        open: OpenId,
-        new_path: &str,
-        replace: bool,
-    ) -> Result<(), VfsError>;
+    async fn rename(&self, open: OpenId, new_path: &str, replace: bool) -> Result<(), VfsError>;
 
     /// IOCTL / FSCTL handler.
-    async fn ioctl(
-        &self,
-        open: OpenId,
-        ctl: FsCtlCode,
-        input: &[u8],
-    ) -> Result<Vec<u8>, VfsError>;
+    async fn ioctl(&self, open: OpenId, ctl: FsCtlCode, input: &[u8]) -> Result<Vec<u8>, VfsError>;
 
     /// Query filesystem statistics for the share backing this handle.
     /// Used for FileFsSizeInformation / FileFsFullSizeInformation.

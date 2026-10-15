@@ -38,7 +38,6 @@ pub struct ErrorResponse {
 ///
 /// The typed ErrorResponse above serializes to the same 9 bytes when
 /// error_data is empty (the default).
-
 impl ErrorResponse {
     /// Fixed size of the error response body in bytes.
     pub const STRUCT_SIZE: usize = 9;

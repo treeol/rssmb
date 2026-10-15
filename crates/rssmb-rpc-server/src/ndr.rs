@@ -4,7 +4,7 @@
 //! NetrShareEnum (opnum 15), NetrShareGetInfo (16), NetrServerGetInfo (21).
 //! Only little-endian NDR20 is supported.
 
-use super::{ShareInfo};
+use super::ShareInfo;
 
 // --- WERROR codes ---
 pub const WERR_SUCCESS: u32 = 0;
@@ -81,7 +81,7 @@ impl NdrWriter {
             self.write_u16(ch);
         }
         self.write_u16(0); // NUL terminator
-        // Pad to 4-byte boundary.
+                           // Pad to 4-byte boundary.
         let pad = (4 - (self.buf.len() % 4)) % 4;
         for _ in 0..pad {
             self.buf.push(0);
@@ -97,6 +97,12 @@ impl NdrWriter {
         for _ in 0..pad {
             self.buf.push(0);
         }
+    }
+}
+
+impl Default for NdrWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -217,10 +223,7 @@ pub fn encode_share_info_1(w: &mut NdrWriter, share: &ShareInfo) {
 /// ResumeHandlePtr (u32) = 0 (null)
 /// WERROR (u32) = 0
 /// ```
-pub fn encode_netr_share_enum_response(
-    shares: &[ShareInfo],
-    level: u32,
-) -> Vec<u8> {
+pub fn encode_netr_share_enum_response(shares: &[ShareInfo], level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
     let count = shares.len() as u32;
 
@@ -274,10 +277,7 @@ pub fn encode_netr_share_enum_response(
 
 /// Encode a NetrShareGetInfo response (opnum 16, level 1).
 /// Returns a SHARE_INFO_1 for the named share, or WERR_NERR_NETNAMENOTFOUND.
-pub fn encode_netr_share_get_info_response(
-    share: Option<&ShareInfo>,
-    level: u32,
-) -> Vec<u8> {
+pub fn encode_netr_share_get_info_response(share: Option<&ShareInfo>, level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
 
     if let Some(s) = share {
@@ -314,10 +314,7 @@ pub fn encode_netr_share_get_info_response(
 
 /// Encode a NetrServerGetInfo response (opnum 21, level 100).
 /// SERVER_INFO_100: {sv100_platform_id (u32), sv100_name (wstr)}
-pub fn encode_netr_server_get_info_response(
-    server_name: &str,
-    level: u32,
-) -> Vec<u8> {
+pub fn encode_netr_server_get_info_response(server_name: &str, level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
 
     match level {
@@ -343,7 +340,7 @@ pub fn encode_netr_server_get_info_response(
                 w.write_u32(0x000a0000); // sv101_version_major:minor (10.0)
                 w.write_u32(0x00000003); // sv101_type: SV_TYPE_SERVER | SV_TYPE_NT | SV_TYPE_WORKSTATION
                 let _comment_ptr = w.write_unique_ptr(false); // no comment
-                // Deferred: name
+                                                              // Deferred: name
                 w.write_wstr_conformant(server_name);
                 // No comment (null pointer)
             }
@@ -390,7 +387,7 @@ pub fn parse_netr_share_get_info_request(stub: &[u8]) -> Option<(u32, String)> {
     }
     // NetName: reference pointer (always present) to conformant wstr
     let _netname_ptr = r.read_u32()?; // reference pointer (always non-null)
-    // Read the conformant wstr (max_count, offset, actual_count, chars...)
+                                      // Read the conformant wstr (max_count, offset, actual_count, chars...)
     let max_count = r.read_u32()?;
     let _offset = r.read_u32()?;
     let actual_count = r.read_u32()?;
@@ -596,14 +593,12 @@ mod tests {
 
     #[test]
     fn netr_share_enum_golden_bytes_single_share() {
-        let shares = vec![
-            ShareInfo {
-                name: "public".to_string(),
-                comment: "Public".to_string(),
-                share_type: 0,
-                encrypt_data: false,
-            },
-        ];
+        let shares = vec![ShareInfo {
+            name: "public".to_string(),
+            comment: "Public".to_string(),
+            share_type: 0,
+            encrypt_data: false,
+        }];
         let data = encode_netr_share_enum_response(&shares, 1);
 
         // Walk the NDR structure:
@@ -633,12 +628,15 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
         assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
         assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // ContainerPtr = null
-        // TotalEntries
+                                                                            // TotalEntries
         assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 0);
         // ResumeHandlePtr = 0
         assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 0);
         // WERROR = 0
-        assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), WERR_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes(data[20..24].try_into().unwrap()),
+            WERR_SUCCESS
+        );
         assert_eq!(data.len(), 24);
     }
 
@@ -717,7 +715,7 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
         assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
         assert_ne!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // UnionPtr
-        // WERROR at the end
+                                                                            // WERROR at the end
         let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         assert_eq!(werr, WERR_SUCCESS);
     }

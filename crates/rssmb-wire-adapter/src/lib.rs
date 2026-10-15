@@ -11,11 +11,11 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-pub mod framing;
 pub mod credits;
 pub mod error;
+pub mod framing;
 
-pub use error::{WireError, NtStatus};
+pub use error::{NtStatus, WireError};
 
 /// SMB2 protocol magic bytes.
 pub const SMB2_MAGIC: [u8; 4] = [0xfe, 0x53, 0x4d, 0x42];
@@ -41,9 +41,9 @@ pub const NETBIOS_PORT: u16 = 139;
 
 /// Re-export key types from rssmb-proto for convenience.
 pub use rssmb_proto::{
-    header::{Header, Command},
-    plain::{PlainRequest, PlainResponse, RequestContent, ResponseContent},
+    header::{Command, Header},
     negotiate::{NegotiateRequest, NegotiateResponse},
+    plain::{PlainRequest, PlainResponse, RequestContent, ResponseContent},
 };
 
 /// A framed message received from the wire.
@@ -138,25 +138,28 @@ pub fn encode_response(resp: &FramedResponse) -> Bytes {
             // Patch next_command and pad each non-last body to 8 bytes.
             let n = bodies.len();
             let mut frame = Vec::new();
-            for i in 0..n {
-                let body = &mut bodies[i];
+            for (i, body) in bodies.iter_mut().enumerate() {
                 let is_last = i == n - 1;
                 if !is_last {
                     let len = body.len();
                     let aligned = (len + 7) & !7;
                     let pad = aligned - len;
-                    body.extend(std::iter::repeat(0u8).take(pad));
+                    body.extend(std::iter::repeat_n(0u8, pad));
                     let aligned_u32 = aligned as u32;
                     body[20..24].copy_from_slice(&aligned_u32.to_le_bytes());
                 } else {
                     let zero = 0u32;
                     body[20..24].copy_from_slice(&zero.to_le_bytes());
                 }
-                frame.extend_from_slice(&bodies[i][..]);
+                frame.extend_from_slice(&body[..]);
             }
 
             let len = frame.len();
-            tracing::debug!("Encoded CompoundResponse: {} bytes ({} members)", len, bodies.len());
+            tracing::debug!(
+                "Encoded CompoundResponse: {} bytes ({} members)",
+                len,
+                bodies.len()
+            );
             buf.put_u8(0x00);
             buf.put_u8((len >> 16) as u8);
             buf.put_u8((len >> 8) as u8);
@@ -180,7 +183,13 @@ pub fn encode_response(resp: &FramedResponse) -> Bytes {
             buf.put_u8(len as u8);
             buf.extend_from_slice(data);
         }
-        FramedResponse::Error { command, status, message_id, session_id, tree_id } => {
+        FramedResponse::Error {
+            command,
+            status,
+            message_id,
+            session_id,
+            tree_id,
+        } => {
             let body = build_error_response(*command, *status, *message_id, *session_id, *tree_id);
             if body.is_empty() {
                 tracing::error!("build_error_response returned empty for {:?}", *command);
