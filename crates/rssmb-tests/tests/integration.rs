@@ -204,7 +204,7 @@ async fn test_negotiate_smb21() {
     let server = TestServer::start(config).await.expect("start server");
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -232,7 +232,7 @@ async fn test_negotiate_smb30() {
     let server = TestServer::start(config).await.expect("start server");
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
-    let req = make_negotiate(vec![Dialect::Smb030], 1);
+    let req = make_negotiate(vec![Dialect::Smb030], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -255,7 +255,7 @@ async fn test_negotiate_smb302() {
     let server = TestServer::start(config).await.expect("start server");
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
-    let req = make_negotiate(vec![Dialect::Smb0302], 1);
+    let req = make_negotiate(vec![Dialect::Smb0302], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -278,7 +278,7 @@ async fn test_negotiate_smb311() {
     let server = TestServer::start(config).await.expect("start server");
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
-    let req = make_negotiate(vec![Dialect::Smb0311], 1);
+    let req = make_negotiate(vec![Dialect::Smb0311], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -305,7 +305,7 @@ async fn test_negotiate_max_common_dialect() {
 
     let req = make_negotiate(
         vec![Dialect::Smb021, Dialect::Smb030, Dialect::Smb0302, Dialect::Smb0311],
-        1,
+        0,
     );
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
@@ -331,13 +331,13 @@ async fn test_echo_after_negotiate() {
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
     // Must negotiate first — the negotiate gate rejects pre-NEGOTIATE commands.
-    let neg_req = make_negotiate(vec![Dialect::Smb021], 1);
+    let neg_req = make_negotiate(vec![Dialect::Smb021], 0);
     let neg_resp = send_and_recv(&mut stream, &neg_req).await.expect("negotiate response");
     assert_eq!(neg_resp.header.command, Command::Negotiate);
     assert_eq!(neg_resp.header.status, 0, "negotiate should succeed");
 
     // Now send an ECHO. The server should respond with a successful echo.
-    let echo_req = make_echo(2);
+    let echo_req = make_echo(1);
     let resp = send_and_recv(&mut stream, &echo_req).await;
     server.stop().await;
 
@@ -355,7 +355,7 @@ async fn test_compound_negotiate_rejected() {
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
     // Build two negotiate requests, chain them.
-    let neg1 = make_negotiate(vec![Dialect::Smb021], 1);
+    let neg1 = make_negotiate(vec![Dialect::Smb021], 0);
     let neg2 = make_negotiate(vec![Dialect::Smb021], 2);
 
     // Encode neg1 to find its length, then patch next_command.
@@ -415,7 +415,7 @@ async fn test_smb1_magic_dropped() {
 
     // The server drops the SMB1 negotiate (no response). Send a valid
     // SMB2 NEGOTIATE — the server should still be alive and respond.
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -442,7 +442,7 @@ async fn test_bad_magic_dropped() {
     stream.flush().await.expect("flush");
 
     // Now send a valid NEGOTIATE — the server should still be alive.
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -464,7 +464,7 @@ async fn test_malformed_body_gets_error_response() {
     // Build a valid negotiate request, then send only the 64-byte header
     // (truncating the body). The server parses the header successfully,
     // but the body decode fails → STATUS_INVALID_PARAMETER error.
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let mut full = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut full);
     req.write_le(&mut cursor).unwrap();
@@ -500,7 +500,7 @@ async fn test_empty_payload_ignored() {
 
     // Now send a proper NEGOTIATE — the server should still be alive
     // and respond to it.
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -524,7 +524,7 @@ async fn test_netbios_keepalive_ignored() {
     stream.flush().await.expect("flush");
 
     // Send a proper NEGOTIATE — server should still be alive.
-    let req = make_negotiate(vec![Dialect::Smb021], 1);
+    let req = make_negotiate(vec![Dialect::Smb021], 0);
     let resp = send_and_recv(&mut stream, &req).await;
     server.stop().await;
 
@@ -542,7 +542,7 @@ async fn test_multiple_negotiates_same_connection() {
     let mut stream = TcpStream::connect(server.addr).await.expect("connect");
 
     // First negotiate — should succeed.
-    let req1 = make_negotiate(vec![Dialect::Smb021], 1);
+    let req1 = make_negotiate(vec![Dialect::Smb021], 0);
     let resp1 = send_and_recv(&mut stream, &req1).await;
     assert!(resp1.is_some());
     assert_eq!(resp1.unwrap().header.status, 0);

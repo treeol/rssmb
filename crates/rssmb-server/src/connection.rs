@@ -462,7 +462,7 @@ impl Connection {
                         if valid && payload.len() >= 64 {
                             match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(&payload)) {
                                 Ok(hdr) => {
-                                    if conn_state.credits.check_and_deduct(hdr.credit_charge.max(1) as u32)
+                                    if conn_state.credits.check_and_deduct(hdr.message_id, hdr.credit_charge.max(1) as u32)
                                         .is_err_and(|e| matches!(e, rssmb_wire_adapter::credits::CreditError::InsufficientCredits { .. }))
                                     {
                                         warn!(conn_id = conn_state.conn_id, "malformed decrypted request without credits — terminating");
@@ -559,7 +559,7 @@ impl Connection {
                         if payload.len() >= 64 && verdict == signing::Verdict::Ok {
                             match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(&payload)) {
                                 Ok(hdr) => {
-                                    if conn_state.credits.check_and_deduct(hdr.credit_charge.max(1) as u32)
+                                    if conn_state.credits.check_and_deduct(hdr.message_id, hdr.credit_charge.max(1) as u32)
                                         .is_err_and(|e| matches!(e, rssmb_wire_adapter::credits::CreditError::InsufficientCredits { .. }))
                                     {
                                         warn!(conn_id = conn_state.conn_id, "malformed request without credits — terminating connection");

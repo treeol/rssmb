@@ -661,18 +661,21 @@ fn substitute_file_id(req: &mut rssmb_proto::plain::PlainRequest, fid: rssmb_pro
 /// the client sent is charged — including compound members that are never
 /// executed — so the ledger follows the client's own count.
 ///
-/// - No credits for it: a sequence-window violation (MS-SMB2 3.3.5.2.3) →
-///   `Err(Disconnect)`: terminate the connection without replying. The
-///   scalar balance stands in for the MessageId window, not implemented yet.
+/// The MessageId sequence window (MS-SMB2 3.3.1.1) is enforced inside
+/// `CreditManager::check_and_deduct`: the request's MessageId must be inside
+/// the window `[low, high)` and not already used.
+///
+/// - Outside the window or already used: a sequence-window violation
+///   (MS-SMB2 3.3.5.2.3) → `Err(Disconnect)`: terminate the connection.
 /// - Affordable but above our local cap (256, policy rather than a protocol
 ///   limit) → `Err(INVALID_PARAMETER reply)`; the credits are still spent.
 fn charge_credits(conn_state: &ConnState, header: &Header) -> Result<(), FramedResponse> {
     use rssmb_wire_adapter::credits::CreditError;
-    match conn_state.credits.check_and_deduct(header.credit_charge.max(1) as u32) {
+    match conn_state.credits.check_and_deduct(header.message_id, header.credit_charge.max(1) as u32) {
         Ok(()) => Ok(()),
         Err(CreditError::InsufficientCredits { available, requested }) => {
             tracing::warn!(conn_id = conn_state.conn_id, available, requested,
-                message_id = header.message_id, "request without credits — terminating connection");
+                message_id = header.message_id, "request outside credit window — terminating connection");
             Err(FramedResponse::Disconnect)
         }
         Err(CreditError::ExcessiveCharge(charge)) => {
@@ -3364,7 +3367,7 @@ mod tests {
                 credit_request: 1,
                 flags: HeaderFlags::new(),
                 next_command: 0,
-                message_id: 1,
+                message_id: 0,
                 tree_id: Some(0),
                 async_id: None,
                 session_id: 0,
@@ -3404,7 +3407,7 @@ mod tests {
                 credit_request: 1,
                 flags: HeaderFlags::new(),
                 next_command: 0,
-                message_id: 1,
+                message_id: 0,
                 tree_id: Some(0),
                 async_id: None,
                 session_id: 0,
@@ -3415,6 +3418,10 @@ mod tests {
     }
 
     fn make_echo_request() -> rssmb_proto::plain::PlainRequest {
+        make_echo_request_with_id(1)
+    }
+
+    fn make_echo_request_with_id(message_id: u64) -> rssmb_proto::plain::PlainRequest {
         use rssmb_proto::echo::EchoRequest;
         let content = RequestContent::Echo(EchoRequest::default());
         rssmb_proto::plain::PlainRequest {
@@ -3425,7 +3432,7 @@ mod tests {
                 credit_request: 1,
                 flags: HeaderFlags::new(),
                 next_command: 0,
-                message_id: 2,
+                message_id,
                 tree_id: Some(0),
                 async_id: None,
                 session_id: 0,
@@ -3677,17 +3684,18 @@ mod tests {
         let state = make_test_state();
         let conn = make_conn_state(); // 1 initial credit
         establish_negotiation(&state, &conn).await;
-        // establish_negotiation consumed 1 and granted 16, leaving 16.
-        // Drain all but 1 credit by sending 15 echoes.
-        for _ in 0..15 {
-            let r = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request()), &[], None).await;
+        // establish_negotiation consumed 1 (message_id 0) and granted 16,
+        // leaving 16 credits. Window is [1..17).
+        // Drain all but 1 credit by sending 15 echoes with unique MessageIds.
+        for i in 0..15 {
+            let r = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(i + 1)), &[], None).await;
             assert!(r.is_some(), "echo should produce a response");
         }
-        // Now exactly 1 credit remains. The next echo uses it, then 0 remain.
-        let r1 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request()), &[], None).await;
+        // Now exactly 1 credit remains (message_id 16). The next echo uses it.
+        let r1 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(16)), &[], None).await;
         assert!(matches!(r1, Some(FramedResponse::Plain(_))), "echo should succeed with the last credit");
         // Now 0 credits — next request must disconnect.
-        let r2 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request()), &[], None).await;
+        let r2 = handle_message(&state, &conn, FramedMessage::Plain(make_echo_request_with_id(17)), &[], None).await;
         assert!(matches!(r2, Some(FramedResponse::Disconnect)), "expected disconnect, got {:?}", r2);
     }
 
@@ -3708,7 +3716,7 @@ mod tests {
             server_security_mode: NegotiateSecurityMode::new().with_signing_enabled(true),
             neg311: None,
         });
-        let reqs = vec![close_req(1, 42, false), close_req(2, 42, false)];
+        let reqs = vec![close_req(0, 42, false), close_req(1, 42, false)];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
         assert!(matches!(resp, Some(FramedResponse::Disconnect)), "expected disconnect, got {:?}", resp);
     }
@@ -3727,7 +3735,7 @@ mod tests {
             neg311: None,
         });
         conn.credits.grant(2); // 1 + 2 = 3 total
-        let reqs = vec![close_req(1, 42, false), close_req(2, u64::MAX, true), close_req(3, u64::MAX, true)];
+        let reqs = vec![close_req(0, 42, false), close_req(1, u64::MAX, true), close_req(2, u64::MAX, true)];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
         assert!(matches!(resp, Some(FramedResponse::Compound(ref ps)) if ps.len() == 3), "got {:?}", resp);
         assert_eq!(conn.credits.available_credits(), 0);
@@ -3740,7 +3748,7 @@ mod tests {
         let state = make_test_state();
         let conn = make_conn_state();
         conn.credits.grant(1);
-        let reqs = vec![close_req(1, 42, false), close_req(2, u64::MAX, true), close_req(3, u64::MAX, true)];
+        let reqs = vec![close_req(0, 42, false), close_req(1, u64::MAX, true), close_req(2, u64::MAX, true)];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
         assert!(matches!(resp, Some(FramedResponse::Disconnect)), "got {:?}", resp);
     }
