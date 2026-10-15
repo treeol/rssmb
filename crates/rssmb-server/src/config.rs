@@ -6,6 +6,7 @@ use rssmb_vfs::FollowSymlinks;
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Listen address (default: 0.0.0.0)
     #[serde(default = "default_listen_addr")]
@@ -113,6 +114,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub server_name: String,
 
+    /// Grace period (seconds) for draining active connections on shutdown.
+    /// After this, remaining connections are aborted. Default: 10.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+
     /// User accounts for authentication.
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -129,6 +135,7 @@ pub struct ServerConfig {
 /// restricted (e.g. `chmod 600`) and it should be mounted as a secret, not
 /// committed to version control.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserConfig {
     pub username: String,
     /// Plaintext password (optional if `nt_hash` is provided).
@@ -164,6 +171,7 @@ fn default_auth_delay_max_ms() -> u64 { 5000 }
 fn default_auth_cooldown_secs() -> u64 { 60 }
 fn default_auth_max_failures_per_conn() -> u32 { 10 }
 fn default_durable_timeout_secs() -> u64 { 900 }
+fn default_shutdown_grace_secs() -> u64 { 10 }
 fn default_max_dialect() -> DialectConfig { DialectConfig::Smb311 }
 fn default_idle_timeout() -> u64 { 900 }
 fn default_health_bind_addr() -> String { "127.0.0.1".to_string() }
@@ -220,6 +228,7 @@ impl Default for EncryptionPolicy {
 
 /// Per-share configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShareConfig {
     /// Share name
     pub name: String,
@@ -297,6 +306,64 @@ impl ServerConfig {
     /// `encryption = "disabled"` is a startup error (MS-SMB2: encryption
     /// cannot be required on a share if the server doesn't support encryption).
     pub fn validate(&self) -> Result<(), String> {
+        // Dialect range: min ≤ max.
+        if self.min_dialect > self.max_dialect {
+            return Err(format!(
+                "min_dialect ({:?}) must be <= max_dialect ({:?})",
+                self.min_dialect, self.max_dialect
+            ));
+        }
+        // Port collision: SMB and health must not share a port (when both > 0).
+        if self.port > 0 && self.health_port > 0 && self.port == self.health_port {
+            return Err(format!(
+                "port ({}) and health_port ({}) must not be the same",
+                self.port, self.health_port
+            ));
+        }
+        // Frame size: at least 64 KiB (SMB2 minimum).
+        if self.max_frame_size < 65536 {
+            return Err(format!(
+                "max_frame_size ({}) must be >= 65536 (64 KiB)",
+                self.max_frame_size
+            ));
+        }
+        // Credits: must be > 0.
+        if self.max_credits == 0 {
+            return Err("max_credits must be > 0".to_string());
+        }
+        // User validation: each non-disabled user needs a username and
+        // at least one credential (password or nt_hash).
+        for (i, user) in self.users.iter().enumerate() {
+            if !user.disabled {
+                if user.username.trim().is_empty() {
+                    return Err(format!("user #{} has an empty username", i + 1));
+                }
+                if user.password.is_empty() && user.nt_hash.is_empty() {
+                    return Err(format!(
+                        "user '{}' has neither password nor nt_hash set (and is not disabled)",
+                        user.username
+                    ));
+                }
+                // Validate nt_hash is valid hex if present.
+                if !user.nt_hash.is_empty() {
+                    if user.nt_hash.len() != 32 || !user.nt_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(format!(
+                            "user '{}': nt_hash must be 32 hex characters (16 bytes), got {} chars",
+                            user.username, user.nt_hash.len()
+                        ));
+                    }
+                }
+            }
+        }
+        // Encryption required with a dialect below 3.0 — encryption is only
+        // available in SMB 3.x, so requiring it with 2.x is a contradiction.
+        if self.encryption == EncryptionPolicy::Required && self.max_dialect < DialectConfig::Smb30 {
+            return Err(format!(
+                "encryption = 'required' but max_dialect ({:?}) < smb30 — \
+                 encryption is only available in SMB 3.x",
+                self.max_dialect
+            ));
+        }
         if self.encryption == EncryptionPolicy::Disabled {
             for share in self.shares.values() {
                 if share.encrypt_data {
@@ -339,6 +406,79 @@ impl ServerConfig {
             }
         }
         Ok(())
+    }
+
+    /// Validate that share paths exist and are directories. Called by
+    /// `rssmb check-config` and server startup (not by `validate()`, which
+    /// is also used by in-memory unit tests with synthetic paths).
+    pub fn validate_paths(&self) -> Result<(), String> {
+        for share in self.shares.values() {
+            if share.path.is_empty() {
+                continue;
+            }
+            let meta = std::fs::metadata(&share.path).map_err(|e| {
+                format!(
+                    "share '{}': path '{}' is not accessible: {}",
+                    share.name, share.path, e
+                )
+            })?;
+            if !meta.is_dir() {
+                return Err(format!(
+                    "share '{}': path '{}' is not a directory",
+                    share.name, share.path
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-fatal configuration warnings (logged at startup, not errors).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // Signing not required on a non-loopback address — exposed to
+        // network attackers who could downgrade or tamper.
+        let is_loopback = self.listen_addr == "127.0.0.1"
+            || self.listen_addr == "::1"
+            || self.listen_addr == "localhost"
+            || self.listen_addr.is_empty();
+        if self.signing != SigningPolicy::Required && !is_loopback {
+            warnings.push(format!(
+                "signing is not 'required' but listen_addr '{}' is not loopback — \
+                 unauthenticated tampering and downgrade attacks are possible",
+                self.listen_addr
+            ));
+        }
+
+        // Share with guest_ok = true but server-level guest_access = false —
+        // the share-level flag is ineffective.
+        if !self.guest_access {
+            for share in self.shares.values() {
+                if share.guest_ok {
+                    warnings.push(format!(
+                        "share '{}' has guest_ok = true but server guest_access = false \
+                         — guest access on this share is ineffective",
+                        share.name
+                    ));
+                }
+            }
+        }
+
+        // Share with guest_ok = true on a signing=required server — guests
+        // can never be signed, so guest_ok is ineffective here too.
+        if self.signing == SigningPolicy::Required {
+            for share in self.shares.values() {
+                if share.guest_ok {
+                    warnings.push(format!(
+                        "share '{}' has guest_ok = true but signing = 'required' — \
+                         guest sessions are never signed, so guest access is ineffective",
+                        share.name
+                    ));
+                }
+            }
+        }
+
+        warnings
     }
 
     /// Default config for testing.
@@ -384,6 +524,7 @@ impl ServerConfig {
             ntlm_require_timestamp: false,
             durable_timeout_secs: 900,
             server_name: "rssmb".to_string(),
+            shutdown_grace_secs: 10,
             users: vec![],
         }
     }
@@ -637,5 +778,187 @@ disabled = false
             case_sensitive: false,
         });
         assert!(config.validate().is_ok(), "write_users on read-write share should be accepted");
+    }
+
+    #[test]
+    fn test_validate_rejects_dialect_range_inverted() {
+        let mut config = ServerConfig::for_testing();
+        config.min_dialect = DialectConfig::Smb311;
+        config.max_dialect = DialectConfig::Smb21;
+        assert!(config.validate().is_err(), "min > max dialect must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_port_collision() {
+        let mut config = ServerConfig::for_testing();
+        config.port = 8080;
+        config.health_port = 8080;
+        assert!(config.validate().is_err(), "port == health_port must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_small_frame_size() {
+        let mut config = ServerConfig::for_testing();
+        config.max_frame_size = 1024;
+        assert!(config.validate().is_err(), "max_frame_size < 65536 must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_credits() {
+        let mut config = ServerConfig::for_testing();
+        config.max_credits = 0;
+        assert!(config.validate().is_err(), "max_credits = 0 must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_user_without_credentials() {
+        let mut config = ServerConfig::for_testing();
+        config.users = vec![UserConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            nt_hash: String::new(),
+            disabled: false,
+        }];
+        assert!(config.validate().is_err(), "non-disabled user without credentials must be rejected");
+    }
+
+    #[test]
+    fn test_validate_allows_disabled_user_without_credentials() {
+        let mut config = ServerConfig::for_testing();
+        config.users = vec![UserConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            nt_hash: String::new(),
+            disabled: true,
+        }];
+        assert!(config.validate().is_ok(), "disabled user without credentials should be accepted");
+    }
+
+    #[test]
+    fn test_warnings_signing_not_required_non_loopback() {
+        let mut config = ServerConfig::for_testing();
+        config.listen_addr = "0.0.0.0".to_string();
+        config.signing = SigningPolicy::Desired;
+        let warnings = config.warnings();
+        assert!(warnings.iter().any(|w| w.contains("signing is not 'required'")),
+            "should warn about signing on non-loopback: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_warnings_no_signing_warning_on_loopback() {
+        let config = ServerConfig::for_testing();
+        // for_testing uses 127.0.0.1 + signing=Required — no signing warning.
+        let warnings = config.warnings();
+        assert!(!warnings.iter().any(|w| w.contains("signing")),
+            "should not warn about signing on loopback with required: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_warnings_guest_ok_with_server_guest_disabled() {
+        let mut config = ServerConfig::for_testing();
+        config.guest_access = false;
+        config.shares.insert("guest_share".to_string(), ShareConfig {
+            name: "guest_share".to_string(),
+            path: "/tmp/guest".to_string(),
+            comment: String::new(),
+            read_only: false,
+            browseable: true,
+            guest_ok: true,
+            valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
+            encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
+        });
+        let warnings = config.warnings();
+        assert!(warnings.iter().any(|w| w.contains("guest_access = false")),
+            "should warn about guest_ok with server guest disabled: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_deny_unknown_fields_rejects_extra_key() {
+        let toml_str = r#"
+listen_addr = "127.0.0.1"
+port = 445
+unknown_field = "should be rejected"
+"#;
+        let result = ServerConfig::from_toml(toml_str);
+        assert!(result.is_err(), "deny_unknown_fields should reject unknown keys");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_nt_hash_length() {
+        let mut config = ServerConfig::for_testing();
+        config.users = vec![UserConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            nt_hash: "short".to_string(),
+            disabled: false,
+        }];
+        assert!(config.validate().is_err(), "nt_hash with wrong length must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_non_hex_nt_hash() {
+        let mut config = ServerConfig::for_testing();
+        config.users = vec![UserConfig {
+            username: "alice".to_string(),
+            password: String::new(),
+            nt_hash: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(), // 32 chars but not hex
+            disabled: false,
+        }];
+        assert!(config.validate().is_err(), "nt_hash with non-hex chars must be rejected");
+    }
+
+    #[test]
+    fn test_validate_rejects_encryption_required_below_smb30() {
+        let mut config = ServerConfig::for_testing();
+        config.encryption = EncryptionPolicy::Required;
+        config.max_dialect = DialectConfig::Smb21;
+        assert!(config.validate().is_err(),
+            "encryption=required with max_dialect < smb30 must be rejected");
+    }
+
+    #[test]
+    fn test_validate_allows_encryption_desired_below_smb30() {
+        let mut config = ServerConfig::for_testing();
+        config.encryption = EncryptionPolicy::Desired;
+        config.max_dialect = DialectConfig::Smb21;
+        assert!(config.validate().is_ok(),
+            "encryption=desired with smb21 should be accepted");
+    }
+
+    #[test]
+    fn test_deny_unknown_fields_on_share() {
+        let toml_str = r#"
+listen_addr = "127.0.0.1"
+port = 445
+max_credits = 1024
+
+[shares.public]
+name = "public"
+path = "/data/public"
+bogus_field = true
+"#;
+        let result = ServerConfig::from_toml(toml_str);
+        assert!(result.is_err(), "deny_unknown_fields should reject unknown share keys");
+    }
+
+    #[test]
+    fn test_deny_unknown_fields_on_user() {
+        let toml_str = r#"
+listen_addr = "127.0.0.1"
+port = 445
+max_credits = 1024
+
+[[users]]
+username = "alice"
+password = "secret"
+bogus_field = true
+"#;
+        let result = ServerConfig::from_toml(toml_str);
+        assert!(result.is_err(), "deny_unknown_fields should reject unknown user keys");
     }
 }

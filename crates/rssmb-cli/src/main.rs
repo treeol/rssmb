@@ -5,7 +5,6 @@ use rssmb_server::{ServerConfig, ServerState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn, error};
-
 mod health;
 
 /// RSSMB — A pure-Rust SMB2/3 server for dynamic container environments.
@@ -30,6 +29,10 @@ struct Args {
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Log format: "text" (default) or "json"
+    #[arg(long, default_value = "text")]
+    log_format: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -86,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error!("Config validation error: {}", msg);
                     return Err(msg.into());
                 }
+                if let Err(msg) = config.validate_paths() {
+                    error!("Config path validation error: {}", msg);
+                    return Err(msg.into());
+                }
+                for warning in config.warnings() {
+                    warn!("{}", warning);
+                }
                 info!("Config OK: {} shares, {} users", config.shares.len(), config.users.len());
                 return Ok(());
             }
@@ -106,9 +116,20 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 tracing_subscriber::EnvFilter::new("info")
             }
         });
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+
+    match args.log_format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+        }
+    }
 
     info!("RSSMB server starting");
 
@@ -189,6 +210,17 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err(msg.into());
     }
 
+    // Validate share paths exist and are directories.
+    if let Err(msg) = config.validate_paths() {
+        error!("Config path validation error: {}", msg);
+        return Err(msg.into());
+    }
+
+    // Log non-fatal config warnings.
+    for warning in config.warnings() {
+        warn!("{}", warning);
+    }
+
     // Create server state
     let state = Arc::new(ServerState::new(config.clone()));
 
@@ -229,29 +261,110 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = config.listen_addr.clone();
     let port = config.port;
 
-    // Signal handling
+    // Signal handling — SIGINT/SIGTERM for shutdown, SIGHUP for config reload.
     let shutdown_state = state.clone();
+    let reload_config_path = args.config.clone();
     tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
-        let sigterm = async {
+        {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut stream = signal(SignalKind::terminate()).unwrap();
-            stream.recv().await;
-        };
-        #[cfg(not(unix))]
-        let sigterm = std::future::pending::<()>();
 
-        tokio::select! {
-            _ = ctrl_c => {
-                warn!("Received SIGINT, initiating graceful shutdown");
-            }
-            _ = sigterm => {
-                warn!("Received SIGTERM, initiating graceful shutdown");
+            // SIGINT
+            let mut sig_int = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to install SIGINT handler: {} — Ctrl+C will not trigger shutdown", e);
+                    return;
+                }
+            };
+            // SIGTERM
+            let mut sig_term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to install SIGTERM handler: {} — SIGTERM will not trigger shutdown", e);
+                    return;
+                }
+            };
+            // SIGHUP — reload config
+            let mut sig_hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to install SIGHUP handler: {} — config will not be reloadable", e);
+                    // Still listen for SIGINT/SIGTERM below.
+                    loop {
+                        tokio::select! {
+                            _ = sig_int.recv() => {
+                                warn!("Received SIGINT, initiating graceful shutdown");
+                                shutdown_state.shutdown().await;
+                                return;
+                            }
+                            _ = sig_term.recv() => {
+                                warn!("Received SIGTERM, initiating graceful shutdown");
+                                shutdown_state.shutdown().await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    _ = sig_int.recv() => {
+                        warn!("Received SIGINT, initiating graceful shutdown");
+                        shutdown_state.shutdown().await;
+                        return;
+                    }
+                    _ = sig_term.recv() => {
+                        warn!("Received SIGTERM, initiating graceful shutdown");
+                        shutdown_state.shutdown().await;
+                        return;
+                    }
+                    _ = sig_hup.recv() => {
+                        info!("Received SIGHUP — reloading config from {}", reload_config_path.display());
+                        match std::fs::read_to_string(&reload_config_path) {
+                            Ok(config_str) => {
+                                match ServerConfig::from_toml(&config_str) {
+                                    Ok(new_config) => {
+                                        if let Err(msg) = new_config.validate() {
+                                            error!("Config reload validation error: {} — keeping current config", msg);
+                                            continue;
+                                        }
+                                        if let Err(msg) = new_config.validate_paths() {
+                                            error!("Config reload path validation error: {} — keeping current config", msg);
+                                            continue;
+                                        }
+                                        for warning in new_config.warnings() {
+                                            warn!("{}", warning);
+                                        }
+                                        info!("Config reloaded: {} shares, {} users — applying",
+                                              new_config.shares.len(), new_config.users.len());
+                                        shutdown_state.reload(new_config);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse config during reload: {} — keeping current config", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to read config file during reload: {} — keeping current config", e);
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        shutdown_state.shutdown().await;
+        #[cfg(not(unix))]
+        {
+            // Non-unix: Ctrl+C for shutdown, no SIGHUP.
+            loop {
+                tokio::signal::ctrl_c().await.ok();
+                warn!("Received Ctrl+C, initiating graceful shutdown");
+                shutdown_state.shutdown().await;
+                return;
+            }
+        }
     });
 
     info!("SMB listener starting on {}:{}", listen_addr, port);

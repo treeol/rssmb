@@ -716,6 +716,8 @@ async fn handle_plain(
 ) -> Option<FramedResponse> {
     let command = req.header.command;
     let credit_charge = req.header.credit_charge;
+    // Record per-command request metric.
+    state.metrics.record_request(command as usize);
     debug!(
         conn_id = conn_state.conn_id,
         command = %command,
@@ -1013,7 +1015,7 @@ async fn handle_session_setup(
         && state.config.signing != crate::config::SigningPolicy::Required;
     let provider: Box<dyn rssmb_auth::AuthProvider> =
         Box::new(rssmb_auth::NtlmAuthProvider::with_identity_store_and_flags(
-            state.identities.clone(),
+            state.identities_snapshot(),
             guest_allowed,
             state.config.ntlm_require_timestamp,
         ));
@@ -1359,6 +1361,20 @@ async fn handle_session_setup(
                 }
                 tracing::debug!(conn_id = conn_state.conn_id, username = %identity.username,
                     is_guest = identity.is_guest, signing = session.signing_required, "session authenticated");
+                // Audit: logon success.
+                tracing::info!(
+                    target: "rssmb::audit",
+                    conn_id = conn_state.conn_id,
+                    session_id,
+                    username = %identity.username,
+                    is_guest = identity.is_guest,
+                    ip = %conn_state.remote_addr,
+                    dialect = ?dialect,
+                    signing = session.signing_required,
+                    encrypted = enc_state_derived.is_some(),
+                    "logon success",
+                );
+                state.metrics.auth_success_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 conn_state.sessions.write().await.push(Arc::new(session));
                 // SMB 3.1.1: remove the preauth session entry (keys derived).
                 conn_state.preauth_sessions.lock().unwrap().remove(&session_id);
@@ -1420,6 +1436,16 @@ async fn handle_session_setup(
             // The delay is applied after dropping auth_guard (the lock is no
             // longer needed). The failure is recorded BEFORE the delay so
             // disconnecting during the wait cannot evade accounting.
+            // Audit: logon failure.
+            tracing::warn!(
+                target: "rssmb::audit",
+                conn_id = conn_state.conn_id,
+                session_id,
+                ip = %conn_state.remote_addr,
+                reason = %reason,
+                "logon failure",
+            );
+            state.metrics.auth_failures_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(auth_guard);
             let delay = state.auth_limiter.record_failure(conn_state.remote_addr);
             let conn_fails = conn_state.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1667,10 +1693,9 @@ async fn handle_tree_connect(
         return FramedResponse::Plain(response);
     }
 
-    // Look up share in config (share names are case-insensitive)
-    let share_config = match state
-        .config
-        .shares
+    // Look up share in the live shares snapshot (case-insensitive).
+    let live_shares = state.shares_snapshot();
+    let share_config = match live_shares
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(&share_name))
         .map(|(_, v)| v)
@@ -1768,6 +1793,20 @@ async fn handle_tree_connect(
         encrypt_data: tree_encrypt_data,
         is_ipc: false,
     });
+
+    // Audit: tree connect.
+    tracing::info!(
+        target: "rssmb::audit",
+        conn_id = conn_state.conn_id,
+        session_id,
+        tree_id,
+        share = %share_name,
+        username = %identity.username,
+        ip = %conn_state.remote_addr,
+        read_only = share_config.read_only,
+        write_access,
+        "tree connect",
+    );
 
     let tree_connect_response = rssmb_proto::tree_connect::TreeConnectResponse {
         share_type: rssmb_proto::tree_connect::ShareType::Disk,
@@ -2779,7 +2818,7 @@ async fn handle_write(
 
         let ps = entry.pipe_state.as_ref().expect("pipe open without pipe_state");
         let identity = lookup_session_identity(conn_state, session_id).await;
-        let shares = visible_shares_for_ctx(&state.config, identity.as_ref());
+        let shares = visible_shares_for_ctx(&state.shares_snapshot(), identity.as_ref());
         let server_name = if !state.config.server_name.is_empty() {
             &state.config.server_name
         } else {
@@ -3430,7 +3469,7 @@ async fn handle_set_info(
 /// On CLOSE, CANCEL, tree-disconnect, or logoff, the watch is cancelled
 /// and the async op is removed from `pending_async`.
 async fn handle_change_notify(
-    _state: &ServerState,
+    state: &ServerState,
     conn_state: &ConnState,
     req: rssmb_proto::plain::PlainRequest,
 ) -> FramedResponse {
@@ -3501,7 +3540,7 @@ async fn handle_change_notify(
         let trees = conn_state.trees.read().await;
         let share_name = trees.get(&tree_id).map(|t| t.share_name.clone()).unwrap_or_default();
         // Look up the share path from config.
-        let share_path = _state.config.shares
+        let share_path = state.shares_snapshot()
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(&share_name))
             .map(|(_, v)| v.path.clone())
@@ -3608,7 +3647,7 @@ async fn handle_ioctl(
         }
         let ps = entry.pipe_state.as_ref().expect("pipe open without pipe_state");
         let identity = lookup_session_identity(conn_state, session_id).await;
-        let shares = visible_shares_for_ctx(&state.config, identity.as_ref());
+        let shares = visible_shares_for_ctx(&state.shares_snapshot(), identity.as_ref());
         let server_name = if !state.config.server_name.is_empty() {
             &state.config.server_name
         } else {
@@ -4073,14 +4112,13 @@ async fn tree_write_access(conn_state: &ConnState, tree_id: u32) -> bool {
 /// visibility filtering comes in Step 8.5). Returns all configured shares
 /// that the session can see, sorted by name, plus a synthetic IPC$ entry.
 fn visible_shares_for_ctx(
-    config: &crate::config::ServerConfig,
+    shares: &std::collections::HashMap<String, crate::config::ShareConfig>,
     identity: Option<&rssmb_auth::Identity>,
 ) -> Vec<rssmb_rpc_server::ShareInfo> {
     let is_guest = identity.map(|i| i.is_guest).unwrap_or(true);
     let username = identity.map(|i| i.username.as_str()).unwrap_or("");
 
-    let mut shares: Vec<rssmb_rpc_server::ShareInfo> = config
-        .shares
+    let mut result: Vec<rssmb_rpc_server::ShareInfo> = shares
         .iter()
         .filter(|(_, sc)| {
             // Browseable + access policy (same as TREE_CONNECT).
@@ -4110,15 +4148,15 @@ fn visible_shares_for_ctx(
         })
         .collect();
     // Sort by name for deterministic enumeration.
-    shares.sort_by(|a, b| a.name.cmp(&b.name));
+    result.sort_by(|a, b| a.name.cmp(&b.name));
     // Append synthetic IPC$.
-    shares.push(rssmb_rpc_server::ShareInfo {
+    result.push(rssmb_rpc_server::ShareInfo {
         name: "IPC$".to_string(),
         comment: String::new(),
         share_type: 0x80000003, // STYPE_IPC | STYPE_SPECIAL
         encrypt_data: false,
     });
-    shares
+    result
 }
 
 /// Look up an open handle, validating that it belongs to the request's
@@ -4905,7 +4943,7 @@ mod tests {
 
         // Alice can see alpha but not beta.
         let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
-        let visible = visible_shares_for_ctx(&config, Some(&alice));
+        let visible = visible_shares_for_ctx(&config.shares, Some(&alice));
         let names: Vec<&str> = visible.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"alpha"), "alice should see alpha");
         assert!(!names.contains(&"beta"), "alice should not see beta");
@@ -4920,7 +4958,7 @@ mod tests {
             c
         };
         let bob = rssmb_auth::Identity { username: "bob".to_string(), domain: String::new(), is_guest: false };
-        let visible = visible_shares_for_ctx(&config, Some(&bob));
+        let visible = visible_shares_for_ctx(&config.shares, Some(&bob));
         assert!(visible.iter().any(|s| s.name == "open"), "bob should see open share (empty read_users)");
     }
 
@@ -4933,7 +4971,7 @@ mod tests {
             c
         };
         let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
-        let visible = visible_shares_for_ctx(&config, Some(&alice));
+        let visible = visible_shares_for_ctx(&config.shares, Some(&alice));
         assert!(visible.iter().any(|s| s.name == "alpha"), "case-insensitive read_users match should work");
     }
 }

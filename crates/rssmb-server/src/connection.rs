@@ -22,7 +22,7 @@ use std::sync::RwLock as StdRwLock;
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use rssmb_wire_adapter::credits::CreditManager;
 use rssmb_wire_adapter::framing::parse_payload;
@@ -293,6 +293,8 @@ impl Connection {
             }
         }
 
+        // Decrement active connection count.
+        state.metrics.connections_active.fetch_sub(1, Ordering::Relaxed);
         info!(conn_id, %remote_addr, "connection closed");
     }
 
@@ -432,9 +434,10 @@ impl Connection {
                     // an error response with the correct message_id/session_id.
                     // Otherwise the client waits forever for a reply.
                     warn!(conn_id = conn_state.conn_id, error = %e, "failed to parse payload");
-                    // Hex preview at debug for diagnostics (first 128 bytes).
+                    // Hex preview at trace for diagnostics — never at debug
+                    // (filenames and payloads should not appear in debug logs).
                     let preview_len = payload.len().min(128);
-                    debug!(conn_id = conn_state.conn_id, hex_preview = ?&payload[..preview_len],
+                    trace!(conn_id = conn_state.conn_id, hex_preview = ?&payload[..preview_len],
                         "payload hex preview");
                     if let Some(transform_sid) = was_encrypted {
                         // Decrypted frame: the AEAD authenticated the content,
@@ -1035,6 +1038,7 @@ pub async fn listen_on(
     info!(addr = %addr, "SMB listener bound (pre-bound)");
 
     let next_conn_id = Arc::new(AtomicU64::new(1));
+    let mut connections = tokio::task::JoinSet::<()>::new();
 
     loop {
         let (stream, remote_addr) = tokio::select! {
@@ -1042,7 +1046,7 @@ pub async fn listen_on(
 
             _ = state.shutdown.notified() => {
                 info!("shutdown signaled; listener stopping");
-                return Ok(addr);
+                break;
             }
 
             res = listener.accept() => match res {
@@ -1063,20 +1067,74 @@ pub async fn listen_on(
             None => {
                 // Limit exceeded — drop the connection without a response.
                 debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
+                state.metrics.connections_rejected_limit_total.fetch_add(1, Ordering::Relaxed);
                 // The stream is dropped here, closing the TCP connection.
                 continue;
             }
         };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
+        state.metrics.connections_accepted_total.fetch_add(1, Ordering::Relaxed);
+        state.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
 
         let state = state.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             // The guard lives for the duration of the connection task.
             let _guard = guard;
             Connection::handle(state, stream, conn_id).await;
         });
+
+        // Reap completed connection tasks non-blockingly.
+        while connections.try_join_next().is_some() {}
     }
+
+    // Graceful drain: wait up to shutdown_grace_secs for active connections
+    // to finish, then abort any that remain.
+    drain_connections(&mut connections, state.config.shutdown_grace_secs).await;
+
+    // Close all durable VFS handles so they don't leak.
+    let durable_closed = state.durable_table.close_all().await;
+    if durable_closed > 0 {
+        info!(durable_closed, "closed durable handles during shutdown");
+    }
+
+    Ok(addr)
+}
+
+/// Drain active connections up to a grace period, then abort any that remain.
+///
+/// Each connection task runs `Connection::cleanup` on exit, which closes
+/// all VFS handles for that connection. After the grace period expires,
+/// remaining tasks are aborted (their cleanup may not run, but the OS
+/// closes the sockets).
+async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace_secs: u64) {
+    let grace = std::time::Duration::from_secs(grace_secs);
+    let deadline = tokio::time::Instant::now() + grace;
+
+    while !connections.is_empty() {
+        let remaining = connections.len();
+        match tokio::time::timeout_at(deadline, connections.join_next()).await {
+            Ok(Some(result)) => {
+                if let Err(e) = result {
+                    // Task panicked or was cancelled — log but continue draining.
+                    if !e.is_cancelled() {
+                        warn!(error = %e, "connection task panicked during drain");
+                    }
+                }
+            }
+            Ok(None) => break, // all done
+            Err(_) => {
+                // Grace period expired — abort remaining tasks.
+                let stuck = connections.len();
+                warn!(stuck, remaining, "grace period expired — aborting {} connection(s)", stuck);
+                connections.abort_all();
+                // Wait briefly for aborts to complete.
+                while connections.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    debug!("connection drain complete");
 }
 
 /// Bind a TCP listener using an externally constructed [`ServerState`] and
@@ -1098,6 +1156,7 @@ where
 
     // Connection ID counter — starts at 1.
     let next_conn_id = Arc::new(AtomicU64::new(1));
+    let mut connections = tokio::task::JoinSet::<()>::new();
 
     loop {
         // Accept loop races shutdown against the next incoming connection.
@@ -1106,7 +1165,7 @@ where
 
             _ = state.shutdown.notified() => {
                 info!("shutdown signaled; listener stopping");
-                return Ok(());
+                break;
             }
 
             res = listener.accept() => match res {
@@ -1126,18 +1185,36 @@ where
             Some(g) => g,
             None => {
                 debug!(conn_id, %remote_addr, "connection limit exceeded — dropping");
+                state.metrics.connections_rejected_limit_total.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
 
         debug!(conn_id, %remote_addr, "spawning connection task");
+        state.metrics.connections_accepted_total.fetch_add(1, Ordering::Relaxed);
+        state.metrics.connections_active.fetch_add(1, Ordering::Relaxed);
 
         let state = state.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _guard = guard;
             Connection::handle(state, stream, conn_id).await;
         });
+
+        // Reap completed connection tasks non-blockingly.
+        while connections.try_join_next().is_some() {}
     }
+
+    // Graceful drain: wait up to shutdown_grace_secs for active connections
+    // to finish, then abort any that remain.
+    drain_connections(&mut connections, state.config.shutdown_grace_secs).await;
+
+    // Close all durable VFS handles so they don't leak.
+    let durable_closed = state.durable_table.close_all().await;
+    if durable_closed > 0 {
+        info!(durable_closed, "closed durable handles during shutdown");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1189,10 +1266,10 @@ mod tests {
 
         // The state's shutdown Notify is usable.
         state.shutdown().await;
-        // Subsequent waits should complete immediately (notified_waiters).
+        // Subsequent waits should complete immediately — the signal is
+        // stateful: once triggered, all future notified() calls return
+        // instantly without re-triggering.
         let notified = state.shutdown.notified();
-        // It will not fire again until a new notify — but the point is that
-        // shutdown() doesn't panic and the Notify is wired.
         drop(notified);
     }
 

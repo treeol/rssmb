@@ -27,6 +27,10 @@ guest_access = false
 # Bind to localhost for security — change if you need remote access.
 health_port = 8080
 
+# Grace period (seconds) for draining active connections on shutdown.
+# After this, remaining connections are aborted. Default: 10.
+# shutdown_grace_secs = 10
+
 # ── Shares ──────────────────────────────────────────────────────────────
 # Add your shares here. Each share needs a path, and at minimum
 # read_only and guest_ok settings.

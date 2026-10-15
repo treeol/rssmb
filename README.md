@@ -113,6 +113,10 @@ See `config/rssmb.example.toml` for production-safe defaults, or
   SMB 3.1.1 AES-128-GCM encryption. `required` denies sessions without a cipher.
 - `guest_access` — allow anonymous logons as guest (only for shares with `guest_ok`)
 - `health_port` — HTTP health/metrics endpoint (default: `8080`)
+- `shutdown_grace_secs` — graceful drain timeout on SIGTERM/SIGINT (default: `10`)
+- `--log-format json` — structured JSON log output (default: `text`)
+- `SIGHUP` — live-reload users and shares without restart (server-level settings need a restart)
+- `/metrics` — Prometheus text-format metrics on the health endpoint
 - `[shares.<name>]` — `path`, `read_only`, `guest_ok`, `valid_users`, `read_users`, `write_users`
   - `valid_users` — restrict access to named users (empty = all authenticated users)
   - `read_users` — restrict read access to named users (empty = all `valid_users`)

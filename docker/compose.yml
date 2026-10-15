@@ -41,14 +41,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
-    # Security: read-only root filesystem, write only to /data
-    # (comment out tmpfs if your Docker version doesn't support it)
-    # read_only: true
-    # tmpfs:
-    #   - /tmp
-    # No special capabilities needed — port 445 is mapped by Docker
+    # Security: read-only root filesystem, write only to /data and /tmp
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Port 445 may need CAP_NET_BIND_SERVICE on hosts without
+    # ip_unprivileged_port_start=0. Docker's -p maps the port at the
+    # container boundary, so this is mainly for host networking mode.
     cap_drop:
       - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
 

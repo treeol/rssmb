@@ -239,6 +239,24 @@ impl DurableTable {
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
     }
+
+    /// Close all durable VFS handles and clear the table. Called during
+    /// graceful shutdown to ensure durable handles are properly cleaned up.
+    pub async fn close_all(&self) -> usize {
+        let mut entries = self.entries.write().await;
+        let drained: Vec<([u8; 16], DurableEntry)> = entries.drain().collect();
+        let count = drained.len();
+        for (_guid, entry) in drained {
+            let vfs = entry.vfs.clone();
+            let open_id = entry.open_id;
+            tokio::spawn(async move {
+                if let Err(e) = vfs.close(open_id).await {
+                    tracing::warn!(error = %e, "durable close_all: VFS close failed");
+                }
+            });
+        }
+        count
+    }
 }
 
 impl Default for DurableTable {

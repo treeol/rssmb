@@ -76,15 +76,9 @@ async fn handle_health_request(
             }
         }
         "/metrics" => {
-            // Basic metrics (extensible for Prometheus)
-            let sessions = _state.sessions.read().await.len();
-            let body = format!(
-                "# HELP rssmb_sessions_active Active sessions\n\
-                 # TYPE rssmb_sessions_active gauge\n\
-                 rssmb_sessions_active {}\n",
-                sessions
-            );
-            return write_response(stream, 200, "text/plain", body.as_bytes()).await;
+            // Prometheus text-format metrics.
+            let body = _state.metrics.render_prometheus();
+            return write_response(stream, 200, "text/plain; version=0.0.4", body.as_bytes()).await;
         }
         _ => (404, "not found"),
     };

@@ -47,7 +47,7 @@ rand = "0.8"
 # External — utility
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
