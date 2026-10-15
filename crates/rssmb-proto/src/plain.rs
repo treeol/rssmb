@@ -71,6 +71,8 @@ pub enum RequestContent {
     SetInfo(SetInfoRequest),
     #[br(pre_assert(matches!(command, Command::Ioctl)))]
     Ioctl(crate::ioctl::IoctlRequest),
+    #[br(pre_assert(matches!(command, Command::Lock)))]
+    Lock(crate::lock::LockRequest),
     #[br(pre_assert(matches!(command, Command::Cancel)))]
     Cancel(CancelRequest),
     #[br(pre_assert(matches!(command, Command::OplockBreak)))]
@@ -98,6 +100,7 @@ impl RequestContent {
             RequestContent::QueryInfo(_) => Command::QueryInfo,
             RequestContent::SetInfo(_) => Command::SetInfo,
             RequestContent::Ioctl(_) => Command::Ioctl,
+            RequestContent::Lock(_) => Command::Lock,
             RequestContent::Cancel(_) => Command::Cancel,
             RequestContent::OplockBreakAck(_) | RequestContent::LeaseBreakAck(_) => Command::OplockBreak,
         }
@@ -141,6 +144,8 @@ pub enum ResponseContent {
     SetInfo(SetInfoResponse),
     #[br(pre_assert(matches!(command, Command::Ioctl)))]
     Ioctl(crate::ioctl::IoctlResponse),
+    #[br(pre_assert(matches!(command, Command::Lock)))]
+    Lock(crate::lock::LockResponse),
     #[br(pre_assert(matches!(command, Command::OplockBreak)))]
     OplockBreakNotify(OplockBreakNotify),
     #[br(pre_assert(matches!(command, Command::OplockBreak)))]
@@ -174,6 +179,7 @@ impl ResponseContent {
             ResponseContent::QueryInfo(_) => Command::QueryInfo,
             ResponseContent::SetInfo(_) => Command::SetInfo,
             ResponseContent::Ioctl(_) => Command::Ioctl,
+            ResponseContent::Lock(_) => Command::Lock,
             ResponseContent::OplockBreakNotify(_)
             | ResponseContent::OplockBreak(_)
             | ResponseContent::LeaseBreakNotify(_)
@@ -201,6 +207,7 @@ impl From<ChangeNotifyRequest> for RequestContent { fn from(v: ChangeNotifyReque
 impl From<QueryInfoRequest> for RequestContent { fn from(v: QueryInfoRequest) -> Self { RequestContent::QueryInfo(v) } }
 impl From<SetInfoRequest> for RequestContent { fn from(v: SetInfoRequest) -> Self { RequestContent::SetInfo(v) } }
 impl From<crate::ioctl::IoctlRequest> for RequestContent { fn from(v: crate::ioctl::IoctlRequest) -> Self { RequestContent::Ioctl(v) } }
+impl From<crate::lock::LockRequest> for RequestContent { fn from(v: crate::lock::LockRequest) -> Self { RequestContent::Lock(v) } }
 impl From<CancelRequest> for RequestContent { fn from(v: CancelRequest) -> Self { RequestContent::Cancel(v) } }
 
 // From impls for common response types.
@@ -220,6 +227,7 @@ impl From<ChangeNotifyResponse> for ResponseContent { fn from(v: ChangeNotifyRes
 impl From<QueryInfoResponse> for ResponseContent { fn from(v: QueryInfoResponse) -> Self { ResponseContent::QueryInfo(v) } }
 impl From<SetInfoResponse> for ResponseContent { fn from(v: SetInfoResponse) -> Self { ResponseContent::SetInfo(v) } }
 impl From<crate::ioctl::IoctlResponse> for ResponseContent { fn from(v: crate::ioctl::IoctlResponse) -> Self { ResponseContent::Ioctl(v) } }
+impl From<crate::lock::LockResponse> for ResponseContent { fn from(v: crate::lock::LockResponse) -> Self { ResponseContent::Lock(v) } }
 impl From<ErrorResponse> for ResponseContent { fn from(v: ErrorResponse) -> Self { ResponseContent::Error(v) } }
 
 /// A plain, single SMB2 request message.

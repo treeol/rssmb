@@ -24,6 +24,51 @@ use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
 use thiserror::Error;
 use tracing::{debug, instrument};
 
+/// A byte-range lock held by a specific open handle.
+///
+/// Locks are identified by `(session_id, tree_id, open_id)` — the SMB lock
+/// owner tuple. A lock conflicts with another if their ranges overlap and
+/// at least one is exclusive.
+#[derive(Debug, Clone, Copy)]
+struct RangeLock {
+    offset: u64,
+    length: u64,
+    exclusive: bool,
+    /// The open handle that owns this lock.
+    open_id: OpenId,
+    /// Session owning the lock (for cross-session conflict attribution).
+    session_id: u64,
+    /// Tree on which the lock was acquired.
+    tree_id: u32,
+}
+
+/// Error describing a byte-range lock conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LockConflict {
+    #[error("lock conflict: range [{offset}, {offset}+{length}) is locked by open {open_id:?} (session {session_id})")]
+    RangeConflict {
+        file_id: FileId,
+        offset: u64,
+        length: u64,
+        open_id: OpenId,
+        session_id: u64,
+    },
+    #[error("invalid lock range: zero length")]
+    ZeroLength,
+}
+
+/// Check whether two byte ranges `[o1, o1+l1)` and `[o2, o2+l2)` overlap.
+///
+/// Uses `u128` arithmetic for the end calculation to correctly handle
+/// ranges near `u64::MAX` without overflow or saturation.
+fn ranges_overlap(o1: u64, l1: u64, o2: u64, l2: u64) -> bool {
+    let s1 = o1 as u128;
+    let e1 = o1 as u128 + l1 as u128;
+    let s2 = o2 as u128;
+    let e2 = o2 as u128 + l2 as u128;
+    s1 < e2 && s2 < e1
+}
+
 /// Error describing a sharing-mode conflict between a new open and an
 /// existing open of the same file.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -122,12 +167,20 @@ pub struct RemoveResult {
 /// A `delete_pending` set tracks files with an outstanding delete-on-close
 /// disposition. This persists beyond the removal of the entry that set it,
 /// so the caller can determine at last-close whether to unlink the file.
+///
+/// Byte-range locks are tracked per file identity in `range_locks`. Each lock
+/// records the owning `(session_id, tree_id, open_id)` tuple, the byte range,
+/// and whether it is exclusive. The check-then-acquire step is atomic under
+/// the lock. Locks are released on CLOSE (all locks for the open_id) and on
+/// tree-disconnect/session-logoff (all locks for the tree/session).
 #[derive(Debug)]
 pub struct OpenTable {
     opens: RwLock<HashMap<FileId, Vec<OpenEntry>>>,
     /// Files with at least one open that has delete_on_close = true.
     /// Survives entry removal until the last close clears it.
     delete_pending: RwLock<HashSet<FileId>>,
+    /// Per-file byte-range locks, keyed by file identity.
+    range_locks: RwLock<HashMap<FileId, Vec<RangeLock>>>,
 }
 
 impl OpenTable {
@@ -136,6 +189,7 @@ impl OpenTable {
         Self {
             opens: RwLock::new(HashMap::new()),
             delete_pending: RwLock::new(HashSet::new()),
+            range_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -359,6 +413,236 @@ impl OpenTable {
     pub async fn count(&self, file_id: FileId) -> usize {
         let map = self.opens.read().await;
         map.get(&file_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    // ---- Byte-range lock management ----
+
+    /// Check whether a byte range `[offset, offset+length)` is locked by
+    /// another open (not the one identified by `owner_open_id`). Returns
+    /// `Ok(())` if no conflicting lock exists, or `Err(LockConflict)` with
+    /// details about the conflicting lock.
+    ///
+    /// A lock conflicts if the ranges overlap AND the existing lock is
+    /// exclusive. (Used for READ — a read conflicts only with exclusive
+    /// locks by other opens.)
+    /// Locks owned by the same `owner_open_id` never conflict with each other
+    /// (an open can upgrade its own lock).
+    #[instrument(skip(self, file_id))]
+    pub async fn check_range_lock(
+        &self,
+        file_id: FileId,
+        owner_open_id: OpenId,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), LockConflict> {
+        if length == 0 {
+            return Ok(());
+        }
+        let locks = self.range_locks.read().await;
+        if let Some(list) = locks.get(&file_id) {
+            for lock in list {
+                if lock.open_id == owner_open_id {
+                    continue;
+                }
+                if !ranges_overlap(offset, length, lock.offset, lock.length) {
+                    continue;
+                }
+                // Overlap with an exclusive lock by another open → conflict.
+                if lock.exclusive {
+                    return Err(LockConflict::RangeConflict {
+                        file_id,
+                        offset: lock.offset,
+                        length: lock.length,
+                        open_id: lock.open_id,
+                        session_id: lock.session_id,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether a WRITE to `[offset, offset+length)` would conflict
+    /// with any lock held by a different open. A write conflicts with ANY
+    /// overlapping lock (shared or exclusive) held by another open,
+    /// per MS-SMB2 mandatory locking semantics.
+    #[instrument(skip(self, file_id))]
+    pub async fn check_range_lock_for_write(
+        &self,
+        file_id: FileId,
+        owner_open_id: OpenId,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), LockConflict> {
+        if length == 0 {
+            return Ok(());
+        }
+        let locks = self.range_locks.read().await;
+        if let Some(list) = locks.get(&file_id) {
+            for lock in list {
+                if lock.open_id == owner_open_id {
+                    continue;
+                }
+                if !ranges_overlap(offset, length, lock.offset, lock.length) {
+                    continue;
+                }
+                // Any overlapping lock by another open blocks writes.
+                return Err(LockConflict::RangeConflict {
+                    file_id,
+                    offset: lock.offset,
+                    length: lock.length,
+                    open_id: lock.open_id,
+                    session_id: lock.session_id,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Acquire a byte-range lock on `file_id` for the open identified by
+    /// `(owner_open_id, session_id, tree_id)`. The lock is exclusive if
+    /// `exclusive` is true, shared otherwise.
+    ///
+    /// Checks for conflicts first: if any existing lock by a *different* open
+    /// overlaps this range and either is exclusive, returns `Err(LockConflict)`.
+    /// The check-and-add is atomic under the write lock.
+    ///
+    /// For an exclusive lock, any overlapping lock by a different open
+    /// (even shared) conflicts. For a shared lock, only an overlapping
+    /// exclusive lock by a different open conflicts.
+    #[instrument(skip(self, file_id, owner_open_id))]
+    pub async fn acquire_range_lock(
+        &self,
+        file_id: FileId,
+        owner_open_id: OpenId,
+        session_id: u64,
+        tree_id: u32,
+        offset: u64,
+        length: u64,
+        exclusive: bool,
+    ) -> Result<(), LockConflict> {
+        if length == 0 {
+            return Err(LockConflict::ZeroLength);
+        }
+        let mut locks = self.range_locks.write().await;
+        if let Some(list) = locks.get(&file_id) {
+            for lock in list {
+                if lock.open_id == owner_open_id {
+                    continue;
+                }
+                if !ranges_overlap(offset, length, lock.offset, lock.length) {
+                    continue;
+                }
+                // Overlap with a different open's lock.
+                // Conflict if the existing is exclusive OR the new one is exclusive.
+                if lock.exclusive || exclusive {
+                    return Err(LockConflict::RangeConflict {
+                        file_id,
+                        offset: lock.offset,
+                        length: lock.length,
+                        open_id: lock.open_id,
+                        session_id: lock.session_id,
+                    });
+                }
+            }
+        }
+        locks.entry(file_id).or_default().push(RangeLock {
+            offset,
+            length,
+            exclusive,
+            open_id: owner_open_id,
+            session_id,
+            tree_id,
+        });
+        Ok(())
+    }
+
+    /// Release a byte-range lock on `file_id` for the open identified by
+    /// `owner_open_id`. Only a lock with the exact same `(offset, length)`
+    /// is removed. If no matching lock is found, this is a no-op (MS-SMB2
+    /// allows unlocking a non-held range without error).
+    #[instrument(skip(self, file_id, owner_open_id))]
+    pub async fn release_range_lock(
+        &self,
+        file_id: FileId,
+        owner_open_id: OpenId,
+        offset: u64,
+        length: u64,
+    ) {
+        let mut locks = self.range_locks.write().await;
+        if let Some(list) = locks.get_mut(&file_id) {
+            list.retain(|l| {
+                !(l.open_id == owner_open_id
+                    && l.offset == offset
+                    && l.length == length)
+            });
+            if list.is_empty() {
+                locks.remove(&file_id);
+            }
+        }
+    }
+
+    /// Release all byte-range locks held by `owner_open_id` on any file.
+    /// Called on CLOSE. Returns the number of locks released.
+    #[instrument(skip(self, owner_open_id))]
+    pub async fn release_all_locks_for_open(&self, owner_open_id: OpenId) -> usize {
+        let mut locks = self.range_locks.write().await;
+        let mut released = 0;
+        let empty_keys: Vec<FileId> = locks
+            .iter_mut()
+            .filter_map(|(fid, list)| {
+                let before = list.len();
+                list.retain(|l| l.open_id != owner_open_id);
+                released += before - list.len();
+                if list.is_empty() { Some(*fid) } else { None }
+            })
+            .collect();
+        for key in empty_keys {
+            locks.remove(&key);
+        }
+        released
+    }
+
+    /// Release all byte-range locks held by `tree_id` on any file.
+    /// Called on tree-disconnect. Returns the number of locks released.
+    #[instrument(skip(self, tree_id))]
+    pub async fn release_all_locks_for_tree(&self, tree_id: u32) -> usize {
+        let mut locks = self.range_locks.write().await;
+        let mut released = 0;
+        let empty_keys: Vec<FileId> = locks
+            .iter_mut()
+            .filter_map(|(fid, list)| {
+                let before = list.len();
+                list.retain(|l| l.tree_id != tree_id);
+                released += before - list.len();
+                if list.is_empty() { Some(*fid) } else { None }
+            })
+            .collect();
+        for key in empty_keys {
+            locks.remove(&key);
+        }
+        released
+    }
+
+    /// Release all byte-range locks held by `session_id` on any file.
+    /// Called on logoff. Returns the number of locks released.
+    #[instrument(skip(self, session_id))]
+    pub async fn release_all_locks_for_session(&self, session_id: u64) -> usize {
+        let mut locks = self.range_locks.write().await;
+        let mut released = 0;
+        let empty_keys: Vec<FileId> = locks
+            .iter_mut()
+            .filter_map(|(fid, list)| {
+                let before = list.len();
+                list.retain(|l| l.session_id != session_id);
+                released += before - list.len();
+                if list.is_empty() { Some(*fid) } else { None }
+            })
+            .collect();
+        for key in empty_keys {
+            locks.remove(&key);
+        }
+        released
     }
 }
 
@@ -868,5 +1152,277 @@ mod tests {
         assert!(res.was_last);
         assert!(res.any_delete_on_close);
         assert!(!table.is_delete_pending(fid(70)).await);
+    }
+
+    // ---- Byte-range lock tests ----
+
+    #[tokio::test]
+    async fn lock_acquire_and_release() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .expect("exclusive lock should succeed");
+        // Same open can re-lock overlapping range (upgrade).
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 50, 200, true)
+            .await
+            .expect("same open can lock overlapping range");
+        table.release_range_lock(fid(1), oid(1), 0, 100).await;
+        table.release_range_lock(fid(1), oid(1), 50, 200).await;
+    }
+
+    #[tokio::test]
+    async fn lock_exclusive_blocks_other_open() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        let err = table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 50, 100, true)
+            .await
+            .expect_err("should conflict");
+        match err {
+            LockConflict::RangeConflict { open_id, .. } => {
+                assert_eq!(open_id, oid(1));
+            }
+            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_shared_allows_shared_no_overlap() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, false)
+            .await
+            .unwrap();
+        // Non-overlapping shared lock by another open should succeed.
+        table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 200, 100, false)
+            .await
+            .expect("non-overlapping shared lock should succeed");
+    }
+
+    #[tokio::test]
+    async fn lock_shared_blocks_shared_overlap() {
+        // A shared lock blocks another open's shared lock if they overlap?
+        // No — per MS-SMB2, shared locks don't block each other; only
+        // exclusive locks block, and an exclusive lock blocks any overlap.
+        // Actually, for mandatory locking: a write requires no conflicting
+        // lock (shared or exclusive) by another open. But LOCK acquisition:
+        // a new shared lock only conflicts with an existing exclusive lock
+        // by another open. A new exclusive lock conflicts with any existing
+        // lock (shared or exclusive) by another open.
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, false)
+            .await
+            .unwrap();
+        // Another open's shared lock on overlapping range should succeed.
+        table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 50, 100, false)
+            .await
+            .expect("overlapping shared locks should coexist");
+        // Another open's exclusive lock on overlapping range should fail.
+        let err = table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 50, 100, true)
+            .await
+            .expect_err("exclusive should conflict with existing shared");
+        match err {
+            LockConflict::RangeConflict { open_id, .. } => {
+                // The conflict could be with either existing lock (oid 1 or oid 2).
+                assert!(open_id == oid(1) || open_id == oid(2));
+            }
+            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_exclusive_blocks_shared_overlap() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        let err = table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 50, 100, false)
+            .await
+            .expect_err("shared lock should conflict with existing exclusive");
+        match err {
+            LockConflict::RangeConflict { open_id, .. } => assert_eq!(open_id, oid(1)),
+            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_release_nonexistent_is_noop() {
+        let table = OpenTable::new();
+        // Releasing a lock that doesn't exist should not panic.
+        table.release_range_lock(fid(1), oid(1), 0, 100).await;
+    }
+
+    #[tokio::test]
+    async fn lock_zero_length_rejected() {
+        let table = OpenTable::new();
+        let err = table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 0, true)
+            .await
+            .expect_err("zero-length lock should be rejected");
+        assert!(matches!(err, LockConflict::ZeroLength));
+    }
+
+    #[tokio::test]
+    async fn lock_check_no_locks_succeeds() {
+        let table = OpenTable::new();
+        table
+            .check_range_lock(fid(1), oid(1), 0, 100)
+            .await
+            .expect("no locks → no conflict");
+    }
+
+    #[tokio::test]
+    async fn lock_check_same_open_no_conflict() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        // The same open checking its own range should not conflict.
+        table
+            .check_range_lock(fid(1), oid(1), 0, 100)
+            .await
+            .expect("own lock should not conflict with own read");
+    }
+
+    #[tokio::test]
+    async fn lock_check_for_write_blocks_shared() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, false)
+            .await
+            .unwrap();
+        // A write by another open on the same range should conflict
+        // even though the existing lock is shared.
+        let err = table
+            .check_range_lock_for_write(fid(1), oid(2), 50, 50)
+            .await
+            .expect_err("write should conflict with shared lock by other open");
+        match err {
+            LockConflict::RangeConflict { open_id, .. } => assert_eq!(open_id, oid(1)),
+            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_check_for_read_allows_shared() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, false)
+            .await
+            .unwrap();
+        // A read by another open on the same range should NOT conflict
+        // with a shared lock.
+        table
+            .check_range_lock(fid(1), oid(2), 50, 50)
+            .await
+            .expect("shared lock should not block reads by other opens");
+    }
+
+    #[tokio::test]
+    async fn lock_release_all_for_open() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 200, 100, true)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(2), oid(1), 100, 1, 0, 50, true)
+            .await
+            .unwrap();
+        let released = table.release_all_locks_for_open(oid(1)).await;
+        assert_eq!(released, 3);
+        // No locks should remain.
+        table
+            .check_range_lock(fid(1), oid(2), 0, 1000)
+            .await
+            .expect("all locks released");
+    }
+
+    #[tokio::test]
+    async fn lock_release_all_for_tree() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(2), 100, 2, 200, 100, true)
+            .await
+            .unwrap();
+        let released = table.release_all_locks_for_tree(1).await;
+        assert_eq!(released, 1);
+        // oid(2)'s lock on tree 2 should remain.
+        table
+            .check_range_lock(fid(1), oid(3), 200, 100)
+            .await
+            .expect_err("tree 2 lock should still block");
+    }
+
+    #[tokio::test]
+    async fn lock_release_all_for_session() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(2), 200, 2, 200, 100, true)
+            .await
+            .unwrap();
+        let released = table.release_all_locks_for_session(100).await;
+        assert_eq!(released, 1);
+        // Session 200's lock should remain.
+        table
+            .check_range_lock(fid(1), oid(3), 0, 100)
+            .await
+            .expect("session 100 locks released");
+        table
+            .check_range_lock(fid(1), oid(3), 200, 100)
+            .await
+            .expect_err("session 200 lock should still block");
+    }
+
+    #[tokio::test]
+    async fn lock_boundary_no_conflict_adjacent() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        // [100, 200) does not overlap [0, 100).
+        table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 100, 100, true)
+            .await
+            .expect("adjacent range should not conflict");
+    }
+
+    #[tokio::test]
+    async fn lock_check_zero_length_no_conflict() {
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
+            .await
+            .unwrap();
+        // Zero-length read should never conflict.
+        table
+            .check_range_lock(fid(1), oid(2), 0, 0)
+            .await
+            .expect("zero-length read never conflicts");
     }
 }

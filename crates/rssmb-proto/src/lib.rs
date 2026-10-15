@@ -27,6 +27,7 @@ pub mod info;
 pub mod query_dir;
 pub mod notify;
 pub mod ioctl;
+pub mod lock;
 pub mod plain;
 
 pub use dtyp::{Guid, FileTime, Boolean, PosMarker, SizedWideString, SizedStringSize, FixedWideString};

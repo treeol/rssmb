@@ -22,7 +22,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use std::sync::Arc;
 
 use crate::*;
 
@@ -103,7 +104,7 @@ pub struct LocalFs {
     follow_symlinks: FollowSymlinks,
     /// Whether file name lookup is case-sensitive.
     case_sensitive: bool,
-    opens: Mutex<HashMap<OpenId, FileHandle>>,
+    opens: RwLock<HashMap<OpenId, Arc<Mutex<FileHandle>>>>,
     next_open_id: Mutex<u64>,
 }
 
@@ -123,7 +124,7 @@ impl LocalFs {
             dir,
             follow_symlinks,
             case_sensitive,
-            opens: Mutex::new(HashMap::new()),
+            opens: RwLock::new(HashMap::new()),
             next_open_id: Mutex::new(1),
         })
     }
@@ -391,16 +392,16 @@ impl Vfs for LocalFs {
         let file_name = Self::file_name_from_rel(&effective_rel);
 
         let open_id = self.next_open_id().await;
-        let mut opens = self.opens.lock().await;
+        let mut opens = self.opens.write().await;
         opens.insert(
             open_id,
-            FileHandle {
+            Arc::new(Mutex::new(FileHandle {
                 file,
                 rel_path: effective_rel,
                 file_name,
                 is_directory: target_is_dir,
                 delete_on_close: args.create_options.delete_on_close,
-            },
+            })),
         );
         Ok(open_id)
     }
@@ -411,8 +412,11 @@ impl Vfs for LocalFs {
         offset: u64,
         len: u32,
     ) -> Result<Bytes, VfsError> {
-        let mut opens = self.opens.lock().await;
-        let handle = opens.get_mut(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let mut handle = handle.lock().await;
         if handle.is_directory {
             return Err(VfsError::IsDirectory);
         }
@@ -437,8 +441,11 @@ impl Vfs for LocalFs {
         offset: u64,
         data: &[u8],
     ) -> Result<u32, VfsError> {
-        let mut opens = self.opens.lock().await;
-        let handle = opens.get_mut(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let mut handle = handle.lock().await;
         if handle.is_directory {
             return Err(VfsError::IsDirectory);
         }
@@ -456,14 +463,19 @@ impl Vfs for LocalFs {
     }
 
     async fn close(&self, open: OpenId) -> Result<(), VfsError> {
-        let mut opens = self.opens.lock().await;
-        let handle = opens.remove(&open).ok_or(VfsError::InvalidHandle)?;
-        if handle.delete_on_close {
-            let rel = handle.rel_path.clone();
-            let is_dir = handle.is_directory;
-            // TokioFile is dropped here, closing the fd.
-            drop(handle);
-            drop(opens);
+        let handle_arc = {
+            let mut opens = self.opens.write().await;
+            opens.remove(&open).ok_or(VfsError::InvalidHandle)?
+        };
+        // Lock the handle to read delete_on_close and rel_path, then drop
+        // the lock (and the Arc, which closes the fd) before doing I/O.
+        let (rel, is_dir, delete_on_close) = {
+            let handle = handle_arc.lock().await;
+            (handle.rel_path.clone(), handle.is_directory, handle.delete_on_close)
+        };
+        // handle_arc is dropped here, closing the fd.
+        drop(handle_arc);
+        if delete_on_close {
             if is_dir {
                 self.dir
                     .remove_dir(&rel)
@@ -473,16 +485,16 @@ impl Vfs for LocalFs {
                     .remove_file(&rel)
                     .map_err(|e| VfsError::Io(format!("close delete_on_close remove_file: {e}")))?;
             }
-        } else {
-            // TokioFile is dropped here, closing the fd.
-            drop(handle);
         }
         Ok(())
     }
 
     async fn flush(&self, open: OpenId) -> Result<(), VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
         handle
             .file
             .sync_data()
@@ -508,8 +520,11 @@ impl Vfs for LocalFs {
         open: OpenId,
         _class: InfoClass,
     ) -> Result<FileInfo, VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
         let meta = handle
             .file
             .metadata()
@@ -519,7 +534,7 @@ impl Vfs for LocalFs {
         let file_id = file_id_from_metadata(&meta);
         let size = if attrs.directory { 0 } else { meta.len() };
         let file_name = handle.file_name.clone();
-        drop(opens);
+        drop(handle);
 
         Ok(FileInfo {
             file_id,
@@ -548,8 +563,11 @@ impl Vfs for LocalFs {
         _class: InfoClass,
         info: &FileInfo,
     ) -> Result<(), VfsError> {
-        let mut opens = self.opens.lock().await;
-        let handle = opens.get_mut(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
 
         if info.size != 0 && !handle.is_directory {
             handle
@@ -611,7 +629,7 @@ impl Vfs for LocalFs {
                 };
                 let perms = CapPermissionsExt::from_mode(new_mode);
                 let rel = handle.rel_path.clone();
-                drop(opens);
+                drop(handle);
                 if let Err(e) = self.dir.set_permissions(&rel, perms) {
                     return Err(VfsError::Io(format!("set_permissions: {e}")));
                 }
@@ -629,13 +647,16 @@ impl Vfs for LocalFs {
         _restart: bool,
         max_results: usize,
     ) -> Result<Vec<DirEntry>, VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
         if !handle.is_directory {
             return Err(VfsError::NotDirectory);
         }
         let rel = handle.rel_path.clone();
-        drop(opens);
+        drop(handle);
 
         let mut entries = Vec::new();
         // Open the subdirectory via cap-std (confined). Root ("." or "")
@@ -733,8 +754,11 @@ impl Vfs for LocalFs {
     }
 
     async fn file_id(&self, open: OpenId) -> Result<FileId, VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
         let meta = handle
             .file
             .metadata()
@@ -744,11 +768,14 @@ impl Vfs for LocalFs {
     }
 
     async fn set_delete_on_close(&self, open: OpenId, delete: bool) -> Result<(), VfsError> {
-        // Read the handle info without holding the lock during dir I/O.
+        // Clone the Arc to avoid holding the map lock across the handle lock.
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
         let (rel, is_dir) = {
-            let opens = self.opens.lock().await;
-            let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
-            (handle.rel_path.clone(), handle.is_directory)
+            let h = handle.lock().await;
+            (h.rel_path.clone(), h.is_directory)
         };
 
         if delete && is_dir {
@@ -769,19 +796,25 @@ impl Vfs for LocalFs {
             }
         }
 
-        let mut opens = self.opens.lock().await;
-        if let Some(h) = opens.get_mut(&open) {
-            h.delete_on_close = delete;
-        }
+        // Re-acquire from the map to verify the handle is still open.
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let mut h = handle.lock().await;
+        h.delete_on_close = delete;
         Ok(())
     }
 
     async fn delete(&self, open: OpenId) -> Result<(), VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
-        let rel = handle.rel_path.clone();
-        let is_dir = handle.is_directory;
-        drop(opens);
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let h = handle.lock().await;
+        let rel = h.rel_path.clone();
+        let is_dir = h.is_directory;
+        drop(h);
 
         if is_dir {
             self.dir
@@ -800,10 +833,13 @@ impl Vfs for LocalFs {
         new_path: &str,
         replace: bool,
     ) -> Result<(), VfsError> {
-        let opens = self.opens.lock().await;
-        let handle = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
-        let old_rel = handle.rel_path.clone();
-        drop(opens);
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle_guard = handle.lock().await;
+        let old_rel = handle_guard.rel_path.clone();
+        drop(handle_guard);
 
         let new_rel = self.resolve_rel(new_path)?;
 
@@ -815,11 +851,9 @@ impl Vfs for LocalFs {
             .rename(&old_rel, &self.dir, &new_rel)
             .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
 
-        let mut opens = self.opens.lock().await;
-        if let Some(handle) = opens.get_mut(&open) {
-            handle.rel_path = new_rel.clone();
-            handle.file_name = Self::file_name_from_rel(&new_rel);
-        }
+        let mut handle_guard = handle.lock().await;
+        handle_guard.rel_path = new_rel.clone();
+        handle_guard.file_name = Self::file_name_from_rel(&new_rel);
         Ok(())
     }
 
