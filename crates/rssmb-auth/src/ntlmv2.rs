@@ -122,6 +122,110 @@ pub fn compute_session_key(nt_hash: &[u8], fields: &AuthenticateFields) -> Vec<u
     mac.finalize().into_bytes().to_vec()
 }
 
+// ---------------------------------------------------------------------------
+// AV_PAIR parsing (MS-NLMP 2.2.2) — used for AUTHENTICATE MIC verification.
+//
+// The NTLMv2 response is NTProofStr(16) followed by a blob:
+//   Signature(4) | Reserved(4) | Timestamp(8) | ClientChallenge(8) | Reserved(4)
+//   | AvPairs(variable)
+// AvPairs start at offset 16 + 28 = 44 in the nt_response.
+
+/// AV_PAIR attribute IDs (MS-NLMP 2.2.2).
+const MSV_AV_EOL: u16 = 0;
+const MSV_AV_FLAGS: u16 = 6;
+const MSV_AV_TIMESTAMP: u16 = 7;
+
+/// MsvAvFlags bit: the client is providing a MIC (MS-NLMP 2.2.2.8).
+const AV_FLAG_MIC_PRESENT: u32 = 0x0000_0002;
+
+/// Fixed offset of the MIC field in the AUTHENTICATE message (MS-NLMP 2.2.1.3).
+const AUTHENTICATE_MIC_OFFSET: usize = 72;
+const AUTHENTICATE_MIC_LEN: usize = 16;
+
+/// Find an AV_PAIR value in the NTLMv2 blob's AvPairs section.
+/// Returns a slice of the value bytes, or None if not found / malformed.
+fn find_av_pair(nt_response: &[u8], av_id: u16) -> Option<&[u8]> {
+    // AvPairs start at offset 44 (16-byte NTProofStr + 28-byte blob header).
+    let av_start = 16 + 28;
+    if nt_response.len() < av_start {
+        return None;
+    }
+    let av_pairs = &nt_response[av_start..];
+    let mut p = 0;
+    while p + 4 <= av_pairs.len() {
+        let id = u16::from_le_bytes([av_pairs[p], av_pairs[p + 1]]);
+        let len = u16::from_le_bytes([av_pairs[p + 2], av_pairs[p + 3]]) as usize;
+        p += 4;
+        if id == MSV_AV_EOL {
+            break;
+        }
+        if p + len > av_pairs.len() {
+            return None; // truncated
+        }
+        if id == av_id {
+            return Some(&av_pairs[p..p + len]);
+        }
+        p += len;
+    }
+    None
+}
+
+/// Whether the NTLMv2 blob's MsvAvFlags has the MIC-present bit set.
+/// Requires MsvAvFlags to be exactly 4 bytes (MS-NLMP 2.2.2.8).
+pub fn has_mic_flag(nt_response: &[u8]) -> bool {
+    match find_av_pair(nt_response, MSV_AV_FLAGS) {
+        Some(v) if v.len() == 4 => {
+            let flags = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            flags & AV_FLAG_MIC_PRESENT != 0
+        }
+        _ => false,
+    }
+}
+
+/// Whether the NTLMv2 blob contains a MsvAvTimestamp AV_PAIR.
+/// Requires MsvAvTimestamp to be exactly 8 bytes (MS-NLMP 2.2.2.7).
+pub fn has_timestamp(nt_response: &[u8]) -> bool {
+    match find_av_pair(nt_response, MSV_AV_TIMESTAMP) {
+        Some(v) => v.len() == 8,
+        None => false,
+    }
+}
+
+/// Verify the AUTHENTICATE message MIC (MS-NLMP 3.2.5.1.2).
+///
+/// The MIC is at offset 72 in the AUTHENTICATE message. It is computed as
+/// `HMAC_MD5(SessionBaseKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)` where
+/// the AUTHENTICATE's MIC field is zeroed before hashing. The client
+/// signals its presence via the MsvAvFlags MIC-present bit.
+///
+/// Returns `false` if the AUTHENTICATE is too short, the MIC is all-zero
+/// (not actually set), or the computed value does not match.
+pub fn verify_authenticate_mic(
+    session_key: &[u8],
+    negotiate_msg: &[u8],
+    challenge_msg: &[u8],
+    authenticate_msg: &[u8],
+) -> bool {
+    if authenticate_msg.len() < AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN {
+        return false;
+    }
+    let mic = &authenticate_msg[AUTHENTICATE_MIC_OFFSET..AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN];
+    if mic.iter().all(|&b| b == 0) {
+        return false; // MIC not actually set
+    }
+    let mut auth_zeroed = authenticate_msg.to_vec();
+    auth_zeroed[AUTHENTICATE_MIC_OFFSET..AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN].fill(0);
+    let mut mac = match <HmacMd5 as Mac>::new_from_slice(session_key) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(negotiate_msg);
+    mac.update(challenge_msg);
+    mac.update(&auth_zeroed);
+    let expected = mac.finalize().into_bytes();
+    expected.iter().zip(mic).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 fn u16_le(b: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?))
 }
@@ -245,5 +349,203 @@ mod tests {
         let wrong_hash = nt_hash("wrong");
         let wrong_key = compute_session_key(&wrong_hash, &f);
         assert_ne!(key, wrong_key);
+    }
+
+    // ---- AV_PAIR / MIC tests ----
+
+    /// Build a minimal AUTHENTICATE message with AvPairs containing
+    /// MsvAvFlags (MIC_PRESENT) and MsvAvTimestamp, plus a correctly
+    /// computed MIC at offset 72.
+    fn make_authenticate_with_mic(
+        session_key: &[u8],
+        negotiate_msg: &[u8],
+        challenge_msg: &[u8],
+        user: &str,
+        domain: &str,
+        include_timestamp: bool,
+    ) -> Vec<u8> {
+        // Build NTLMv2 blob: Signature(4) + Reserved(4) + Timestamp(8) +
+        // ClientChallenge(8) + Reserved(4) + AvPairs
+        let mut blob = vec![0u8; 28]; // header
+
+        // AvPairs: MsvAvFlags (MIC present) + optional MsvAvTimestamp + EOL
+        let mut av_pairs = Vec::new();
+        // MsvAvFlags = 0x00000002 (MIC_PRESENT)
+        av_pairs.extend_from_slice(&MSV_AV_FLAGS.to_le_bytes());
+        av_pairs.extend_from_slice(&4u16.to_le_bytes());
+        av_pairs.extend_from_slice(&AV_FLAG_MIC_PRESENT.to_le_bytes());
+        if include_timestamp {
+            av_pairs.extend_from_slice(&MSV_AV_TIMESTAMP.to_le_bytes());
+            av_pairs.extend_from_slice(&8u16.to_le_bytes());
+            av_pairs.extend_from_slice(&0u64.to_le_bytes());
+        }
+        // EOL
+        av_pairs.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        av_pairs.extend_from_slice(&0u16.to_le_bytes());
+
+        // NTProofStr (16 bytes) — not checked by MIC verify, just needs to be present
+        let mut nt_response = vec![0u8; 16]; // NTProofStr placeholder
+        nt_response.extend_from_slice(&blob);
+        nt_response.extend_from_slice(&av_pairs);
+
+        // Build a minimal AUTHENTICATE message header (88 bytes) with
+        // the NT response placed at the end. Field offsets:
+        // 0: signature(8) 8: type(4) 12: LmFields(8) 20: NtFields(8)
+        // 28: DomainFields(8) 36: UserFields(8) 44: WorkstationFields(8)
+        // 52: EncryptedRandomSessionKeyFields(8) 60: NegFlags(4)
+        // 64: Version(8) 72: MIC(16)
+        let mut msg = b"NTLMSSP\0".to_vec();
+        msg.extend_from_slice(&3u32.to_le_bytes()); // type 3
+        msg.extend_from_slice(&[0u8; 8]); // LmFields: len=0, maxlen=0, offset=0
+        let nt_off = 88u32;
+        let nt_len = nt_response.len() as u16;
+        msg.extend_from_slice(&nt_len.to_le_bytes());
+        msg.extend_from_slice(&nt_len.to_le_bytes());
+        msg.extend_from_slice(&nt_off.to_le_bytes());
+        let dom_utf16 = string_to_utf16le(domain);
+        let dom_len = dom_utf16.len() as u16;
+        let dom_off = 88u32 + nt_response.len() as u32;
+        msg.extend_from_slice(&dom_len.to_le_bytes());
+        msg.extend_from_slice(&dom_len.to_le_bytes());
+        msg.extend_from_slice(&dom_off.to_le_bytes());
+        let user_utf16 = string_to_utf16le(user);
+        let user_len = user_utf16.len() as u16;
+        let user_off = dom_off + dom_utf16.len() as u32;
+        msg.extend_from_slice(&user_len.to_le_bytes());
+        msg.extend_from_slice(&user_len.to_le_bytes());
+        msg.extend_from_slice(&user_off.to_le_bytes());
+        // WorkstationFields: empty
+        msg.extend_from_slice(&[0u8; 8]);
+        // EncryptedRandomSessionKeyFields: empty
+        msg.extend_from_slice(&[0u8; 8]);
+        // NegFlags
+        msg.extend_from_slice(&0x0008_2882u32.to_le_bytes()); // ESS | 128 | KEY_EXCH | ...
+        // Version (8 bytes)
+        msg.extend_from_slice(&[0u8; 8]);
+        // MIC placeholder (16 bytes) — will be filled in
+        msg.extend_from_slice(&[0u8; 16]);
+        // Payload
+        msg.extend_from_slice(&nt_response);
+        msg.extend_from_slice(&dom_utf16);
+        msg.extend_from_slice(&user_utf16);
+
+        // Compute the real MIC: HMAC_MD5(SessionKey, NEGOTIATE || CHALLENGE || AUTH(zeroed MIC))
+        // At this point msg[72..88] is all zeros (the MIC placeholder).
+        let mut mac = <HmacMd5 as Mac>::new_from_slice(session_key).unwrap();
+        mac.update(negotiate_msg);
+        mac.update(challenge_msg);
+        mac.update(&msg); // entire message with MIC zeroed
+        let mic = mac.finalize().into_bytes();
+        msg[72..88].copy_from_slice(&mic);
+
+        msg
+    }
+
+    #[test]
+    fn authenticate_mic_verifies() {
+        let key = [0x42u8; 16];
+        let neg: Vec<u8> = b"NTLMSSP\0\x01\x00\x00\x00".to_vec();
+        let chal: Vec<u8> = b"NTLMSSP\0\x02\x00\x00\x00".to_vec();
+        let auth = make_authenticate_with_mic(&key, &neg, &chal, "user", "DOM", false);
+        assert!(verify_authenticate_mic(&key, &neg, &chal, &auth));
+    }
+
+    #[test]
+    fn authenticate_mic_tampered_rejected() {
+        let key = [0x42u8; 16];
+        let neg: Vec<u8> = b"NTLMSSP\0\x01\x00\x00\x00".to_vec();
+        let chal: Vec<u8> = b"NTLMSSP\0\x02\x00\x00\x00".to_vec();
+        let mut auth = make_authenticate_with_mic(&key, &neg, &chal, "user", "DOM", false);
+        auth[72] ^= 0x01; // tamper with MIC
+        assert!(!verify_authenticate_mic(&key, &neg, &chal, &auth));
+    }
+
+    #[test]
+    fn authenticate_mic_wrong_key_rejected() {
+        let key = [0x42u8; 16];
+        let neg: Vec<u8> = b"NTLMSSP\0\x01\x00\x00\x00".to_vec();
+        let chal: Vec<u8> = b"NTLMSSP\0\x02\x00\x00\x00".to_vec();
+        let auth = make_authenticate_with_mic(&key, &neg, &chal, "user", "DOM", false);
+        let wrong_key = [0x99u8; 16];
+        assert!(!verify_authenticate_mic(&wrong_key, &neg, &chal, &auth));
+    }
+
+    #[test]
+    fn authenticate_mic_zeroed_rejected() {
+        let key = [0x42u8; 16];
+        let neg: Vec<u8> = b"NTLMSSP\0\x01\x00\x00\x00".to_vec();
+        let chal: Vec<u8> = b"NTLMSSP\0\x02\x00\x00\x00".to_vec();
+        let mut auth = make_authenticate_with_mic(&key, &neg, &chal, "user", "DOM", false);
+        auth[72..88].fill(0); // zero out the MIC
+        assert!(!verify_authenticate_mic(&key, &neg, &chal, &auth));
+    }
+
+    #[test]
+    fn has_mic_flag_detected() {
+        let auth = make_authenticate_with_mic(&[0x42u8; 16], b"neg", b"chal", "user", "DOM", false);
+        // Extract nt_response from the auth message
+        let nt_len = u16::from_le_bytes([auth[20], auth[21]]) as usize;
+        let nt_off = u32::from_le_bytes([auth[24], auth[25], auth[26], auth[27]]) as usize;
+        let nt_response = &auth[nt_off..nt_off + nt_len];
+        assert!(has_mic_flag(nt_response));
+    }
+
+    #[test]
+    fn has_mic_flag_absent() {
+        // Build nt_response without MsvAvFlags
+        let mut nt_response = vec![0u8; 44]; // 16 NTProofStr + 28 blob header
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+        assert!(!has_mic_flag(&nt_response));
+    }
+
+    #[test]
+    fn has_timestamp_present() {
+        let auth = make_authenticate_with_mic(&[0x42u8; 16], b"neg", b"chal", "user", "DOM", true);
+        let nt_len = u16::from_le_bytes([auth[20], auth[21]]) as usize;
+        let nt_off = u32::from_le_bytes([auth[24], auth[25], auth[26], auth[27]]) as usize;
+        let nt_response = &auth[nt_off..nt_off + nt_len];
+        assert!(has_timestamp(nt_response));
+    }
+
+    #[test]
+    fn has_timestamp_absent() {
+        let auth = make_authenticate_with_mic(&[0x42u8; 16], b"neg", b"chal", "user", "DOM", false);
+        let nt_len = u16::from_le_bytes([auth[20], auth[21]]) as usize;
+        let nt_off = u32::from_le_bytes([auth[24], auth[25], auth[26], auth[27]]) as usize;
+        let nt_response = &auth[nt_off..nt_off + nt_len];
+        assert!(!has_timestamp(nt_response));
+    }
+
+    #[test]
+    fn find_av_pair_truncated_returns_none() {
+        // nt_response shorter than AvPairs start
+        assert!(find_av_pair(&[0u8; 10], MSV_AV_FLAGS).is_none());
+    }
+
+    #[test]
+    fn has_mic_flag_wrong_length_rejected() {
+        // MsvAvFlags with length != 4 should not be accepted
+        let mut nt_response = vec![0u8; 44]; // 16 NTProofStr + 28 blob header
+        // MsvAvFlags with length 2 (too short)
+        nt_response.extend_from_slice(&MSV_AV_FLAGS.to_le_bytes());
+        nt_response.extend_from_slice(&2u16.to_le_bytes());
+        nt_response.extend_from_slice(&[0u8; 2]);
+        // EOL
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+        assert!(!has_mic_flag(&nt_response));
+    }
+
+    #[test]
+    fn has_timestamp_wrong_length_rejected() {
+        // MsvAvTimestamp with length != 8 should not be accepted
+        let mut nt_response = vec![0u8; 44];
+        nt_response.extend_from_slice(&MSV_AV_TIMESTAMP.to_le_bytes());
+        nt_response.extend_from_slice(&4u16.to_le_bytes()); // wrong length
+        nt_response.extend_from_slice(&[0u8; 4]);
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+        assert!(!has_timestamp(&nt_response));
     }
 }

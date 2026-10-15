@@ -54,6 +54,12 @@ pub struct AuthState {
     mech_types: Option<Vec<u8>>,
     /// NTLM negotiate flags from the AUTHENTICATE message, for MIC signing.
     ntlm_neg_flags: u32,
+    /// The raw NTLMSSP NEGOTIATE message (type 1) from the first round,
+    /// saved for AUTHENTICATE MIC verification (MS-NLMP 3.2.5.1.2).
+    negotiate_message: Option<Vec<u8>>,
+    /// The raw NTLMSSP CHALLENGE message (type 2) we sent, for AUTHENTICATE
+    /// MIC verification (MS-NLMP 3.2.5.1.2).
+    challenge_message: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for AuthState {
@@ -79,6 +85,8 @@ impl AuthState {
             raw_ntlmssp: false,
             mech_types: None,
             ntlm_neg_flags: 0,
+            negotiate_message: None,
+            challenge_message: None,
         }
     }
 
@@ -169,6 +177,8 @@ pub struct NtlmAuthProvider {
     identities: Arc<IdentityStore>,
     /// Whether guest access is enabled at the server level.
     guest_access: bool,
+    /// Whether to require MsvAvTimestamp in the NTLMv2 blob (anti-replay).
+    require_timestamp: bool,
 }
 
 impl NtlmAuthProvider {
@@ -177,6 +187,7 @@ impl NtlmAuthProvider {
         Self {
             identities: Arc::new(IdentityStore::empty()),
             guest_access: false,
+            require_timestamp: false,
         }
     }
 
@@ -184,7 +195,7 @@ impl NtlmAuthProvider {
         // Legacy constructor: convert plaintext-password identities into
         // an IdentityStore by computing NT hashes.
         let store = IdentityStore::from_identities(&identities);
-        Self { identities: Arc::new(store), guest_access: false }
+        Self { identities: Arc::new(store), guest_access: false, require_timestamp: false }
     }
 
     pub fn with_identities_and_guest(
@@ -192,11 +203,19 @@ impl NtlmAuthProvider {
         guest_access: bool,
     ) -> Self {
         let store = IdentityStore::from_identities(&identities);
-        Self { identities: Arc::new(store), guest_access }
+        Self { identities: Arc::new(store), guest_access, require_timestamp: false }
     }
 
     pub fn with_identity_store(identities: Arc<IdentityStore>, guest_access: bool) -> Self {
-        Self { identities, guest_access }
+        Self { identities, guest_access, require_timestamp: false }
+    }
+
+    pub fn with_identity_store_and_flags(
+        identities: Arc<IdentityStore>,
+        guest_access: bool,
+        require_timestamp: bool,
+    ) -> Self {
+        Self { identities, guest_access, require_timestamp }
     }
 }
 
@@ -276,6 +295,21 @@ impl AuthProvider for NtlmAuthProvider {
         let ntlm_token = spnego::extract_ntlm_token(input_token)
             .unwrap_or_else(|_| input_token.to_vec());
 
+        // Save the raw NTLMSSP NEGOTIATE (type 1) message for AUTHENTICATE
+        // MIC verification (MS-NLMP 3.2.5.1.2). On the first round this is
+        // the NEGOTIATE; on the second round it's the AUTHENTICATE, and the
+        // NEGOTIATE was already saved.
+        if state.negotiate_message.is_none() && ntlm_token.starts_with(b"NTLMSSP\0") {
+            // Check the message type: type 1 = NEGOTIATE
+            if ntlm_token.len() >= 12 && u32_le(&ntlm_token, 8) == Some(1) {
+                state.negotiate_message = Some(ntlm_token.clone());
+            }
+        }
+
+        // Save a clone for AUTHENTICATE MIC verification — the original is
+        // moved into SecurityBuffer below.
+        let ntlm_token_for_mic = ntlm_token.clone();
+
         // Anonymous AUTHENTICATE (MS-NLMP 3.2.5.1.2) is recognised
         // structurally — never from sspi error text. It never reaches the
         // proof verifier: either it becomes a guest session (when the server
@@ -335,6 +369,8 @@ impl AuthProvider for NtlmAuthProvider {
             if state.server_challenge.is_none() {
                 return Err(AuthError::SspiError("CHALLENGE message missing server challenge".into()));
             }
+            // Save the raw CHALLENGE message for AUTHENTICATE MIC verification.
+            state.challenge_message = Some(ntlm_output.clone());
         }
 
         let mut status = result.status;
@@ -394,16 +430,41 @@ impl AuthProvider for NtlmAuthProvider {
                     return Err(AuthError::LogonFailure("unknown user".into()));
                 }
             };
-            state.proof_verified = true;
-
-            // Save the negotiate flags for the mechListMIC computation.
-            state.ntlm_neg_flags = fields.neg_flags;
 
             // Compute the session key directly from the NT hash — we don't
             // need sspi to do this for us, and we don't have the plaintext
             // password to pass to sspi's identity machinery.
             let session_key = ntlmv2::compute_session_key(&stored.nt_hash, &fields);
-            state.session_key = Some(session_key.clone());
+
+            // AUTHENTICATE message MIC verification (MS-NLMP 3.2.5.1.2).
+            // If the client's MsvAvFlags has the MIC-present bit set, the
+            // AUTHENTICATE message carries a MIC at offset 72 computed over
+            // NEGOTIATE || CHALLENGE || AUTHENTICATE (with the MIC field
+            // zeroed). We verify it with the SessionBaseKey.
+            if ntlmv2::has_mic_flag(&fields.nt_response) {
+                let neg = state.negotiate_message.as_deref().unwrap_or(&[]);
+                let chal = state.challenge_message.as_deref().unwrap_or(&[]);
+                if !ntlmv2::verify_authenticate_mic(&session_key, neg, chal, &ntlm_token_for_mic) {
+                    tracing::warn!("AUTHENTICATE MIC verification failed — rejecting");
+                    return Err(AuthError::LogonFailure("AUTHENTICATE MIC mismatch".into()));
+                }
+                tracing::debug!("AUTHENTICATE MIC verified successfully");
+            }
+
+            // Anti-replay: require MsvAvTimestamp in the NTLMv2 blob.
+            // This is a presence check — it requires that the client include
+            // a timestamp in the blob, making replay of a captured
+            // AUTHENTICATE observable by comparison with the challenge time.
+            if self.require_timestamp && !ntlmv2::has_timestamp(&fields.nt_response) {
+                tracing::warn!("NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)");
+                return Err(AuthError::LogonFailure("missing NTLMv2 timestamp".into()));
+            }
+
+            // All checks passed — commit state.
+            state.proof_verified = true;
+            state.session_key = Some(session_key);
+            // Save the negotiate flags for the mechListMIC computation.
+            state.ntlm_neg_flags = fields.neg_flags;
 
             // Still call complete_auth_token so sspi transitions its internal
             // state, but pass an empty identity list — we've already verified
@@ -523,6 +584,11 @@ fn account_name(u: &sspi::Username) -> String {
         sspi::UsernameParts::DownLevelLogonName(d) => d.account_name().to_string(),
         sspi::UsernameParts::UserPrincipalName(p) => p.account_name().to_string(),
     }
+}
+
+/// Read a little-endian u32 at `offset` from a byte slice, or None if out of bounds.
+fn u32_le(b: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(offset..offset + 4)?.try_into().ok()?))
 }
 
 /// `account_name` for a raw wire string, via the same parser.

@@ -990,9 +990,10 @@ async fn handle_session_setup(
     let guest_allowed = state.config.guest_access
         && state.config.signing != crate::config::SigningPolicy::Required;
     let provider: Box<dyn rssmb_auth::AuthProvider> =
-        Box::new(rssmb_auth::NtlmAuthProvider::with_identity_store(
+        Box::new(rssmb_auth::NtlmAuthProvider::with_identity_store_and_flags(
             state.identities.clone(),
             guest_allowed,
+            state.config.ntlm_require_timestamp,
         ));
 
     // Extract the security buffer from the session setup request

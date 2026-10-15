@@ -95,6 +95,12 @@ pub struct ServerConfig {
     #[serde(default = "default_auth_max_failures_per_conn")]
     pub auth_max_failures_per_conn: u32,
 
+    /// Whether to require MsvAvTimestamp in the NTLMv2 blob (anti-replay).
+    /// When true, AUTHENTICATE messages without a timestamp AV_PAIR are
+    /// rejected. Does not affect guest/anonymous auth.
+    #[serde(default)]
+    pub ntlm_require_timestamp: bool,
+
     /// Server name (for SrvSvc NetrServerGetInfo). Defaults to "rssmb" if empty.
     #[serde(default)]
     pub server_name: String,
@@ -325,6 +331,7 @@ impl ServerConfig {
             auth_delay_max_ms: 5000,
             auth_cooldown_secs: 60,
             auth_max_failures_per_conn: 10,
+            ntlm_require_timestamp: false,
             server_name: "rssmb".to_string(),
             users: vec![],
         }
