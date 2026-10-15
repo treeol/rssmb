@@ -39,6 +39,10 @@ read_only = false
 browseable = true
 guest_ok = false
 valid_users = ["alice"]
+# Optional: restrict read access to specific users (empty = all valid_users).
+# read_users = ["alice", "bob"]
+# Optional: restrict write access to specific users (empty = all valid_users).
+# write_users = ["alice"]
 
 # ── Authentication ─────────────────────────────────────────────────────
 # User accounts for NTLM authentication.

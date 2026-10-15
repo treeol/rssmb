@@ -320,6 +320,10 @@ pub struct TreeEntry {
     pub session_id: u64,
     /// Whether this share is read-only (enforced at WRITE/SET_INFO).
     pub read_only: bool,
+    /// Whether the connected user has write access on this share.
+    /// False if `read_only` is true, or if `write_users` is non-empty
+    /// and the user is not in the list.
+    pub write_access: bool,
     /// Whether this share requires encryption (per-share encrypt_data).
     pub encrypt_data: bool,
     /// Whether this tree is an IPC$ pipe share (named-pipe dispatch).
@@ -1648,6 +1652,7 @@ async fn handle_tree_connect(
                 vfs: Arc::new(rssmb_vfs::memoryfs::MemoryFs::new()) as Arc<dyn rssmb_vfs::Vfs>,
                 session_id,
                 read_only: false,
+                write_access: true,
                 encrypt_data: false,
                 is_ipc: true,
             },
@@ -1681,7 +1686,11 @@ async fn handle_tree_connect(
     // 1. Guest users can only connect if the share allows guest access.
     // 2. If valid_users is non-empty, the user must be in the list
     //    (guests are also subject to this check if valid_users is set).
-    // 3. MaximalAccess reflects read_only policy.
+    // 3. If read_users is non-empty, the user must be in the list to
+    //    get any access (read or write).
+    // 4. If write_users is non-empty, only users in the list get write
+    //    access; others get read-only access on a read-write share.
+    // 5. MaximalAccess reflects read_only and write_access policy.
     if identity.is_guest && !share_config.guest_ok {
         debug!(conn_id = conn_state.conn_id, share = %share_name, "guest denied on non-guest share");
         return error_response_for(Command::TreeConnect, NtStatus::AccessDenied, &req.header);
@@ -1698,13 +1707,38 @@ async fn handle_tree_connect(
         }
     }
 
-    // Derive MaximalAccess from share read_only policy.
-    // Read-only: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE = 0x001200a9
-    // Read-write: FILE_ALL_ACCESS = 0x001f01ff
-    let maximal_access = if share_config.read_only {
-        0x0012_00a9
-    } else {
+    if !share_config.read_users.is_empty() {
+        let user_can_read = share_config
+            .read_users
+            .iter()
+            .any(|u| u.eq_ignore_ascii_case(&identity.username));
+        if !user_can_read {
+            debug!(conn_id = conn_state.conn_id, share = %share_name, user = %identity.username, "user not in read_users");
+            return error_response_for(Command::TreeConnect, NtStatus::AccessDenied, &req.header);
+        }
+    }
+
+    // Determine write access: read_only share → no write. Otherwise,
+    // write_users non-empty → only listed users get write. Empty
+    // write_users → all users with access get write.
+    let write_access = !share_config.read_only && {
+        if share_config.write_users.is_empty() {
+            true
+        } else {
+            share_config
+                .write_users
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(&identity.username))
+        }
+    };
+
+    // Derive MaximalAccess from access policy.
+    // Read-only or no-write-access: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE = 0x001200a9
+    // Full read-write: FILE_ALL_ACCESS = 0x001f01ff
+    let maximal_access = if write_access {
         0x001f_01ff
+    } else {
+        0x0012_00a9
     };
 
     // Create VFS backend: LocalFs for real shares, MemoryFs for unnamed/test
@@ -1730,6 +1764,7 @@ async fn handle_tree_connect(
         vfs: vfs.clone(),
         session_id,
         read_only: share_config.read_only,
+        write_access,
         encrypt_data: tree_encrypt_data,
         is_ipc: false,
     });
@@ -2083,6 +2118,23 @@ async fn handle_create(
             );
         }
 
+        // Enforce write access: if the original open had write access,
+        // the reconnecting tree must also grant write access. A read-only
+        // or no-write-access tree cannot receive a writable durable handle.
+        let da = &peeked.desired_access;
+        let durable_has_write = da.write || da.generic_write || da.generic_all;
+        if !tree_entry.write_access && durable_has_write {
+            debug!(
+                conn_id = conn_state.conn_id,
+                "DH2C: reconnect denied — tree has no write access for writable handle"
+            );
+            return error_response_for(
+                Command::Create,
+                NtStatus::AccessDenied,
+                &req.header,
+            );
+        }
+
         // All validations passed — take the entry from the durable table.
         let durable_entry = match state.durable_table.take(&dh2c.create_guid).await {
             Ok(entry) => entry,
@@ -2220,11 +2272,12 @@ async fn handle_create(
         return FramedResponse::Plain(response);
     }
 
-    // Read-only share: refuse any open that could mutate. This covers
-    // requested rights (write/append/EA/attrs/delete/DACL/owner, generic
-    // write/all, MAXIMUM_ALLOWED is narrowed by the advertised MaximalAccess),
-    // delete-on-close, and dispositions that create, overwrite or supersede.
-    if tree_entry.read_only {
+    // Read-only share or no-write-access user: refuse any open that could
+    // mutate. This covers requested rights (write/append/EA/attrs/delete/
+    // DACL/owner, generic write/all, MAXIMUM_ALLOWED is narrowed by the
+    // advertised MaximalAccess), delete-on-close, and dispositions that
+    // create, overwrite or supersede.
+    if tree_entry.read_only || !tree_entry.write_access {
         let a = &create_req.desired_access;
         let wants_write = a.file_write_data() || a.file_append_data() || a.file_write_ea()
             || a.file_write_attributes() || a.file_delete_child() || a.delete()
@@ -2234,7 +2287,7 @@ async fn handle_create(
             rssmb_proto::create::CreateDisposition::Open
         );
         if wants_write || mutating_disposition || create_req.create_options.delete_on_close() {
-            debug!(conn_id = conn_state.conn_id, tree_id, "create denied: read-only share");
+            debug!(conn_id = conn_state.conn_id, tree_id, "create denied: read-only share or no write access");
             return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
     }
@@ -2748,12 +2801,12 @@ async fn handle_write(
         return FramedResponse::Plain(response);
     }
 
-    // Enforce read-only share policy using the tree entry's stored policy.
+    // Enforce read-only / no-write-access policy using the tree entry.
     {
         let trees = conn_state.trees.read().await;
         if let Some(tree_entry) = trees.get(&tree_id) {
-            if tree_entry.read_only {
-                debug!(conn_id = conn_state.conn_id, share = %tree_entry.share_name, "write denied: share is read-only");
+            if tree_entry.read_only || !tree_entry.write_access {
+                debug!(conn_id = conn_state.conn_id, share = %tree_entry.share_name, "write denied: read-only or no write access");
                 return error_response_for(Command::Write, NtStatus::AccessDenied, &req.header);
             }
         }
@@ -3192,9 +3245,10 @@ async fn handle_set_info(
     let raw_data = si_req.data.data().to_vec();
 
     // Every handled file SET_INFO class mutates (timestamps, size, rename,
-    // delete). On a read-only share, refuse them all — except clearing
-    // delete-pending, which is harmless but also pointless, so refuse too.
-    if tree_read_only(conn_state, tree_id).await {
+    // delete). On a read-only share or for a user without write access,
+    // refuse them all — except clearing delete-pending, which is harmless
+    // but also pointless, so refuse too.
+    if tree_read_only(conn_state, tree_id).await || !tree_write_access(conn_state, tree_id).await {
         return error_response_for(Command::SetInfo, NtStatus::AccessDenied, &req.header);
     }
 
@@ -4003,6 +4057,18 @@ async fn tree_read_only(conn_state: &ConnState, tree_id: u32) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the connected user has write access on this tree. Unknown trees
+/// count as no-write (fail closed).
+async fn tree_write_access(conn_state: &ConnState, tree_id: u32) -> bool {
+    conn_state
+        .trees
+        .read()
+        .await
+        .get(&tree_id)
+        .map(|t| t.write_access)
+        .unwrap_or(false)
+}
+
 /// Build a share snapshot for the RPC context (Step 8.3 simplified — full
 /// visibility filtering comes in Step 8.5). Returns all configured shares
 /// that the session can see, sorted by name, plus a synthetic IPC$ entry.
@@ -4025,7 +4091,14 @@ fn visible_shares_for_ctx(
                 return false;
             }
             if !sc.valid_users.is_empty() {
-                return sc.valid_users.iter().any(|u| u.eq_ignore_ascii_case(username));
+                if !sc.valid_users.iter().any(|u| u.eq_ignore_ascii_case(username)) {
+                    return false;
+                }
+            }
+            if !sc.read_users.is_empty() {
+                if !sc.read_users.iter().any(|u| u.eq_ignore_ascii_case(username)) {
+                    return false;
+                }
             }
             true
         })
@@ -4115,6 +4188,7 @@ fn current_filetime() -> FileTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ShareConfig;
 
     fn make_test_state() -> Arc<ServerState> {
         Arc::new(ServerState::new(crate::config::ServerConfig::for_testing()))
@@ -4789,6 +4863,78 @@ mod tests {
         assert_ne!(0, id2, "SessionId must be non-zero");
         // Random — extremely unlikely to collide.
         assert_ne!(id1, id2, "SessionId should be random (collision is astronomically unlikely)");
+    }
+
+    // --- Phase 4 Option C: per-share read_users/write_users tests ---
+
+    fn make_test_state_with_shares(shares: Vec<(&str, ShareConfig)>) -> Arc<ServerState> {
+        let mut config = crate::config::ServerConfig::for_testing();
+        for (key, sc) in shares {
+            config.shares.insert(key.to_string(), sc);
+        }
+        Arc::new(ServerState::new(config))
+    }
+
+    fn make_share_config(name: &str, read_only: bool, read_users: Vec<String>, write_users: Vec<String>) -> ShareConfig {
+        ShareConfig {
+            name: name.to_string(),
+            path: String::new(), // MemoryFs
+            comment: String::new(),
+            read_only,
+            browseable: true,
+            guest_ok: false,
+            valid_users: vec![],
+            read_users,
+            write_users,
+            encrypt_data: false,
+            follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
+        }
+    }
+
+    #[test]
+    fn test_visible_shares_filters_by_read_users() {
+        let config = {
+            let mut c = crate::config::ServerConfig::for_testing();
+            c.shares.insert("alpha".to_string(), make_share_config("alpha", false, vec!["alice".to_string()], vec![]));
+            c.shares.insert("beta".to_string(), make_share_config("beta", false, vec!["bob".to_string()], vec![]));
+            c.shares.remove("test");
+            c
+        };
+
+        // Alice can see alpha but not beta.
+        let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
+        let visible = visible_shares_for_ctx(&config, Some(&alice));
+        let names: Vec<&str> = visible.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "alice should see alpha");
+        assert!(!names.contains(&"beta"), "alice should not see beta");
+    }
+
+    #[test]
+    fn test_visible_shares_empty_read_users_means_all() {
+        let config = {
+            let mut c = crate::config::ServerConfig::for_testing();
+            c.shares.insert("open".to_string(), make_share_config("open", false, vec![], vec![]));
+            c.shares.remove("test");
+            c
+        };
+        let bob = rssmb_auth::Identity { username: "bob".to_string(), domain: String::new(), is_guest: false };
+        let visible = visible_shares_for_ctx(&config, Some(&bob));
+        assert!(visible.iter().any(|s| s.name == "open"), "bob should see open share (empty read_users)");
+    }
+
+    #[test]
+    fn test_visible_shares_read_users_case_insensitive() {
+        let config = {
+            let mut c = crate::config::ServerConfig::for_testing();
+            c.shares.insert("alpha".to_string(), make_share_config("alpha", false, vec!["Alice".to_string()], vec![]));
+            c.shares.remove("test");
+            c
+        };
+        let alice = rssmb_auth::Identity { username: "alice".to_string(), domain: String::new(), is_guest: false };
+        let visible = visible_shares_for_ctx(&config, Some(&alice));
+        assert!(visible.iter().any(|s| s.name == "alpha"), "case-insensitive read_users match should work");
     }
 }
 

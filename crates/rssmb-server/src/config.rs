@@ -247,6 +247,19 @@ pub struct ShareConfig {
     #[serde(default)]
     pub valid_users: Vec<String>,
 
+    /// Users with read access (empty = all authenticated users in
+    /// `valid_users` may read). When non-empty, only users listed here
+    /// (and in `valid_users`) may open files for reading.
+    #[serde(default)]
+    pub read_users: Vec<String>,
+
+    /// Users with write access (empty = all authenticated users in
+    /// `valid_users` may write, unless `read_only = true`). When
+    /// non-empty, only users listed here may open files for writing;
+    /// all others get read-only access on a read-write share.
+    #[serde(default)]
+    pub write_users: Vec<String>,
+
     /// Require encryption for all traffic on this share (SMB 3.x).
     /// Only effective for 3.x dialects; ignored for 2.x.
     #[serde(default)]
@@ -314,6 +327,17 @@ impl ServerConfig {
                 return Err("auth_cooldown_secs must be > 0 when auth_max_failures > 0".to_string());
             }
         }
+        // Share access-list validation: `write_users` on a `read_only = true`
+        // share is contradictory — read_only already denies all writes.
+        for share in self.shares.values() {
+            if share.read_only && !share.write_users.is_empty() {
+                return Err(format!(
+                    "share '{}' has read_only = true but write_users is non-empty \
+                     — read-only shares deny all writes regardless of write_users",
+                    share.name
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -328,6 +352,8 @@ impl ServerConfig {
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
             strict_sync: true,
@@ -497,6 +523,8 @@ disabled = false
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: true,
             follow_symlinks: FollowSymlinks::Never,
             strict_sync: true,
@@ -517,6 +545,8 @@ disabled = false
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: true,
             follow_symlinks: FollowSymlinks::Never,
             strict_sync: true,
@@ -536,6 +566,8 @@ disabled = false
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
             strict_sync: true,
@@ -555,11 +587,55 @@ disabled = false
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
         });
         assert!(config.validate().is_err(), "ipc$ share name must be rejected (case-insensitive)");
+    }
+
+    #[test]
+    fn test_validate_rejects_write_users_on_read_only_share() {
+        let mut config = ServerConfig::for_testing();
+        config.shares.insert("ro_share".to_string(), ShareConfig {
+            name: "ro_share".to_string(),
+            path: "/tmp/ro".to_string(),
+            comment: String::new(),
+            read_only: true,
+            browseable: true,
+            guest_ok: false,
+            valid_users: vec![],
+            read_users: vec![],
+            write_users: vec!["alice".to_string()],
+            encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
+        });
+        assert!(config.validate().is_err(), "write_users on read_only share must be rejected");
+    }
+
+    #[test]
+    fn test_validate_ok_write_users_on_read_write_share() {
+        let mut config = ServerConfig::for_testing();
+        config.shares.insert("rw_share".to_string(), ShareConfig {
+            name: "rw_share".to_string(),
+            path: "/tmp/rw".to_string(),
+            comment: String::new(),
+            read_only: false,
+            browseable: true,
+            guest_ok: false,
+            valid_users: vec![],
+            read_users: vec![],
+            write_users: vec!["alice".to_string()],
+            encrypt_data: false,
+            follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
+        });
+        assert!(config.validate().is_ok(), "write_users on read-write share should be accepted");
     }
 }

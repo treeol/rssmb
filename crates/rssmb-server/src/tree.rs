@@ -226,6 +226,8 @@ mod tests {
             browseable: true,
             guest_ok: false,
             valid_users: vec![],
+            read_users: vec![],
+            write_users: vec![],
             encrypt_data: false,
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,

@@ -113,7 +113,10 @@ See `config/rssmb.example.toml` for production-safe defaults, or
   SMB 3.1.1 AES-128-GCM encryption. `required` denies sessions without a cipher.
 - `guest_access` — allow anonymous logons as guest (only for shares with `guest_ok`)
 - `health_port` — HTTP health/metrics endpoint (default: `8080`)
-- `[shares.<name>]` — `path`, `read_only`, `guest_ok`, `valid_users`
+- `[shares.<name>]` — `path`, `read_only`, `guest_ok`, `valid_users`, `read_users`, `write_users`
+  - `valid_users` — restrict access to named users (empty = all authenticated users)
+  - `read_users` — restrict read access to named users (empty = all `valid_users`)
+  - `write_users` — restrict write access to named users (empty = all `valid_users`; on a `read_only` share this is redundant and rejected by `rssmb check-config`)
 - `[[users]]` — `username`, `password` (plaintext) or `nt_hash` (hex NT hash,
   preferred), `disabled`. Generate hashes with `rssmb hash-password <password>`.
   The config file should be `chmod 600` — it contains password-equivalent secrets.
