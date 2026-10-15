@@ -14,6 +14,12 @@ guest_access = false
 health_port = 8080
 max_credits = 1024
 
+# Durable handle timeout (seconds). When a client opens a file with a DH2Q
+# create context and the connection drops, the server keeps the open alive for
+# this long so the client can reconnect and re-attach. 0 = disabled.
+# Default: 900 (15 min).
+# durable_timeout_secs = 900
+
 # Share definitions
 # =================
 # Each share is defined under [shares.<name>]

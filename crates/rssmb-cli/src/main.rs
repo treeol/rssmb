@@ -192,6 +192,28 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Create server state
     let state = Arc::new(ServerState::new(config.clone()));
 
+    // Start the durable handle sweeper — periodically cleans up expired
+    // durable opens whose VFS handles need to be closed.
+    let sweeper_state = state.clone();
+    let sweeper_interval = if config.durable_timeout_secs > 0 {
+        std::time::Duration::from_secs(config.durable_timeout_secs.min(60))
+    } else {
+        std::time::Duration::from_secs(60)
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(sweeper_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = sweeper_state.shutdown.notified() => break,
+            }
+            let swept = sweeper_state.durable_table.sweep().await;
+            if swept > 0 {
+                tracing::info!(expired = swept, "durable handle sweeper: cleaned up expired entries");
+            }
+        }
+    });
+
     // Start health endpoint
     let health_state = state.clone();
     let health_port = config.health_port;

@@ -30,11 +30,11 @@ use crate::ServerState;
 use crate::config::DialectConfig;
 use crate::opens;
 
-/// Negotiated MaxTransact/MaxRead/MaxWriteSize. Kept at 64 KiB: larger sizes
-/// need multi-credit accounting (CreditCharge = ceil(len/64K) validated
-/// against the payload size) and a MessageId window, neither of which exists
-/// yet. The credit balance itself is enforced in `handle_plain`.
-const MAX_IO_SIZE: u32 = 65536;
+/// Negotiated MaxTransact/MaxRead/MaxWriteSize. Now 1 MiB: multi-credit
+/// accounting (CreditCharge = ceil(len/64K) validated against the MessageId
+/// window) was added in Phase 1.5, so larger I/O sizes are safe. The credit
+/// window itself is enforced in `charge_credits` via `CreditManager`.
+const MAX_IO_SIZE: u32 = 1024 * 1024;
 
 /// A per-connection open handle entry.
 #[derive(Clone)]
@@ -55,6 +55,10 @@ pub struct OpenEntry {
     pub is_pipe: bool,
     /// RPC pipe state, shared by clones of this entry. `None` for disk opens.
     pub pipe_state: Option<Arc<std::sync::Mutex<rssmb_rpc_server::PipeState>>>,
+    /// Create GUID for durable handle tracking. `None` for non-durable opens.
+    /// Set when a DH2Q create context was present at create time. Used by
+    /// `handle_close` and `cleanup` to remove the durable entry.
+    pub durable_guid: Option<[u8; 16]>,
 }
 
 /// Per-open directory enumeration cursor (MS-SMB2 3.3.5.18).
@@ -794,7 +798,7 @@ async fn handle_plain(
         Command::Logoff => Some(handle_logoff(state, conn_state, &req.header).await),
         Command::TreeConnect => Some(handle_tree_connect(state, conn_state, req).await),
         Command::TreeDisconnect => Some(handle_tree_disconnect(state, conn_state, &req.header).await),
-        Command::Create => Some(handle_create(state, conn_state, req).await),
+        Command::Create => Some(handle_create(state, conn_state, req, raw_frame).await),
         Command::Close => Some(handle_close(state, conn_state, req).await),
         Command::Read => Some(handle_read(state, conn_state, req).await),
         Command::Write => Some(handle_write(state, conn_state, req, raw_frame).await),
@@ -1825,11 +1829,147 @@ async fn handle_tree_disconnect(
     FramedResponse::Plain(response)
 }
 
+// ── Durable handle create contexts (MS-SMB2 2.2.13.2.11/2.2.13.2.12) ─────
+
+/// DH2Q create context name (durable handle v2 request).
+const DH2Q_NAME: &[u8; 4] = b"DH2Q";
+/// DH2C create context name (durable handle v2 reconnect).
+const DH2C_NAME: &[u8; 4] = b"DH2C";
+
+/// Parsed DH2Q create context data (32 bytes).
+#[derive(Debug)]
+struct Dh2qContext {
+    /// Timeout in milliseconds the server should keep the handle alive.
+    #[allow(dead_code)]
+    timeout: u32,
+    /// Flags (bit 1 = persistent handle).
+    _flags: u32,
+    /// The client-supplied GUID identifying this durable open.
+    create_guid: [u8; 16],
+}
+
+/// Parsed DH2C create context data (36 bytes).
+#[derive(Debug)]
+struct Dh2cContext {
+    /// The file ID for the open being re-established.
+    #[allow(dead_code)]
+    file_id: rssmb_proto::create::FileId,
+    /// The create GUID from the original DH2Q open.
+    create_guid: [u8; 16],
+    /// Flags (bit 1 = persistent handle).
+    _flags: u32,
+}
+
+/// Parse create contexts from the raw frame after the CreateRequest body.
+///
+/// Returns `Ok((dh2q, dh2c))` where each is `Option` — `Some` if the
+/// respective context was found, `None` if not. A malformed context is
+/// logged and skipped (the open proceeds without durable).
+///
+/// The create context chain follows the name in the CreateRequest. Each
+/// context starts with:
+/// - NextOffset (u32 LE): offset from this context's start to the next,
+///   or 0 if this is the last context.
+/// - NameOffset (u16 LE): offset from this context's start to the name.
+/// - NameLength (u16 LE): length of the name.
+/// - Reserved (u16 LE).
+/// - DataOffset (u16 LE): offset from this context's start to the data.
+/// - DataLength (u32 LE): length of the data.
+///
+/// The `contexts_offset` is the byte offset in `raw_frame` where the
+/// context chain begins (the CreateRequest's CreateContextsOffset field).
+fn parse_create_contexts(
+    raw_frame: &[u8],
+    contexts_offset: u32,
+    contexts_length: u32,
+) -> (Option<Dh2qContext>, Option<Dh2cContext>) {
+    let mut dh2q = None;
+    let mut dh2c = None;
+
+    let start = match usize::try_from(contexts_offset) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let end = match contexts_offset.checked_add(contexts_length) {
+        Some(e) => match usize::try_from(e) {
+            Ok(u) => u,
+            Err(_) => return (None, None),
+        },
+        None => return (None, None),
+    };
+
+    if start >= raw_frame.len() || end > raw_frame.len() || start > end {
+        return (None, None);
+    }
+
+    let chain = &raw_frame[start..end];
+    let mut pos = 0usize;
+
+    loop {
+        // Each context starts with a 16-byte header.
+        if pos + 16 > chain.len() {
+            break;
+        }
+        let next_offset = u32::from_le_bytes(chain[pos..pos + 4].try_into().unwrap_or([0; 4])) as usize;
+        let name_offset = u16::from_le_bytes(chain[pos + 4..pos + 6].try_into().unwrap_or([0; 2])) as usize;
+        let name_length = u16::from_le_bytes(chain[pos + 6..pos + 8].try_into().unwrap_or([0; 2])) as usize;
+        let data_offset = u16::from_le_bytes(chain[pos + 10..pos + 12].try_into().unwrap_or([0; 2])) as usize;
+        let data_length = u32::from_le_bytes(chain[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as usize;
+
+        // Name and data offsets are relative to the start of THIS context
+        // (i.e. relative to `pos` in the chain), not the start of the chain.
+        let ctx_start = pos;
+
+        // Read the name.
+        if name_offset >= 16
+            && ctx_start + name_offset + name_length <= chain.len()
+            && name_length == 4
+        {
+            let name = &chain[ctx_start + name_offset..ctx_start + name_offset + 4];
+            // Read the data.
+            if data_offset >= 16
+                && ctx_start + data_offset + data_length <= chain.len()
+            {
+                let data = &chain[ctx_start + data_offset..ctx_start + data_offset + data_length];
+                if name == DH2Q_NAME && data_length >= 32 {
+                    let timeout = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                    let mut create_guid = [0u8; 16];
+                    create_guid.copy_from_slice(&data[16..32]);
+                    dh2q = Some(Dh2qContext { timeout, _flags: flags, create_guid });
+                } else if name == DH2C_NAME && data_length >= 36 {
+                    let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+                    let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+                    let mut create_guid = [0u8; 16];
+                    create_guid.copy_from_slice(&data[16..32]);
+                    let flags = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+                    dh2c = Some(Dh2cContext {
+                        file_id: rssmb_proto::create::FileId { persistent, volatile },
+                        create_guid,
+                        _flags: flags,
+                    });
+                }
+            }
+        }
+
+        if next_offset == 0 {
+            break;
+        }
+        pos += next_offset;
+        if pos >= chain.len() {
+            break;
+        }
+    }
+
+    (dh2q, dh2c)
+}
+
 /// CREATE — open or create a file.
 async fn handle_create(
     state: &ServerState,
     conn_state: &ConnState,
     req: rssmb_proto::plain::PlainRequest,
+    raw_frame: &[u8],
 ) -> FramedResponse {
     let create_req = match &req.content {
         RequestContent::Create(c) => c,
@@ -1857,6 +1997,184 @@ async fn handle_create(
     }
     let vfs = tree_entry.vfs.clone();
 
+    // Parse create contexts for durable handle support (DH2Q/DH2C).
+    // The CreateContextsOffset (u32 at body+48) and CreateContextsLength
+    // (u32 at body+52) are relative to the start of the SMB2 header.
+    // The SMB2 header is 64 bytes, so body starts at offset 64.
+    let (dh2q, dh2c) = {
+        let ctx_offset = if raw_frame.len() >= 64 + 52 + 4 {
+            u32::from_le_bytes(
+                raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]),
+            )
+        } else {
+            0
+        };
+        let ctx_length = if raw_frame.len() >= 64 + 56 {
+            u32::from_le_bytes(
+                raw_frame[64 + 52..64 + 56].try_into().unwrap_or([0; 4]),
+            )
+        } else {
+            0
+        };
+        if ctx_offset > 0 && ctx_length > 0 {
+            parse_create_contexts(raw_frame, ctx_offset, ctx_length)
+        } else {
+            (None, None)
+        }
+    };
+
+    // DH2C reconnect: look up the durable open and re-attach it.
+    if let Some(dh2c) = &dh2c {
+        let durable_timeout = state.config.durable_timeout_secs;
+        if durable_timeout == 0 {
+            debug!(conn_id = conn_state.conn_id, "DH2C: durable handles disabled");
+            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
+            // STATUS_OBJECTID_NOT_FOUND = 0xC00000F4
+        }
+
+        // Peek first — validate identity and share without removing the
+        // entry. Only take (remove) if all checks pass, so a failed
+        // reconnect doesn't destroy the durable open.
+        let peeked = match state.durable_table.peek(&dh2c.create_guid).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle not found or expired");
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::Other(0xC000_00F4),
+                    &req.header,
+                );
+            }
+        };
+
+        // Validate that the reconnecting session matches the original
+        // session's user (MS-SMB2 3.3.5.15.11).
+        let identity = lookup_session_identity(conn_state, session_id).await;
+        let reconnect_user = identity
+            .as_ref()
+            .map(|i| i.username.as_str())
+            .unwrap_or("");
+        if reconnect_user != peeked.username {
+            debug!(
+                conn_id = conn_state.conn_id,
+                original_user = %peeked.username,
+                reconnect_user,
+                "DH2C: session user mismatch — rejecting reconnect"
+            );
+            return error_response_for(
+                Command::Create,
+                NtStatus::AccessDenied,
+                &req.header,
+            );
+        }
+
+        // Validate tree matches the original share.
+        if tree_entry.share_name != peeked.share_name {
+            debug!(
+                conn_id = conn_state.conn_id,
+                original_share = %peeked.share_name,
+                reconnect_share = %tree_entry.share_name,
+                "DH2C: share mismatch — rejecting reconnect"
+            );
+            return error_response_for(
+                Command::Create,
+                NtStatus::Other(0xC000_00F4),
+                &req.header,
+            );
+        }
+
+        // All validations passed — take the entry from the durable table.
+        let durable_entry = match state.durable_table.take(&dh2c.create_guid).await {
+            Ok(entry) => entry,
+            Err(err) => {
+                // Race: the entry was taken by another reconnect or expired
+                // between peek and take.
+                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle lost between peek and take");
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::Other(0xC000_00F4),
+                    &req.header,
+                );
+            }
+        };
+
+        // Re-attach: insert into the per-connection open table.
+        let file_id = next_file_id(conn_state);
+        conn_state.opens.write().await.insert(
+            file_id.volatile,
+            OpenEntry {
+                session_id,
+                tree_id,
+                open_id: durable_entry.open_id,
+                vfs: durable_entry.vfs.clone(),
+                file_id: durable_entry.file_id,
+                dir_cursor: Default::default(),
+                path: durable_entry.path.clone(),
+                is_pipe: false,
+                pipe_state: None,
+                durable_guid: None,
+            },
+        );
+
+        // The durable entry was already removed from the OpenTable
+        // when it was made durable (on disconnect). Re-add it so
+        // share-mode tracking continues.
+        if let Some(fid) = durable_entry.file_id {
+            let ot_entry = opens::OpenEntry {
+                open_id: durable_entry.open_id,
+                session_id,
+                tree_id,
+                share_access: durable_entry.share_access,
+                desired_access: durable_entry.desired_access,
+                delete_on_close: false,
+            };
+            if let Err(_conflict) = state.open_table.check_and_add(fid, ot_entry).await {
+                debug!(conn_id = conn_state.conn_id, "DH2C: share conflict on reconnect");
+                // Close the VFS handle we just re-attached.
+                let _ = durable_entry.vfs.close(durable_entry.open_id).await;
+                conn_state.opens.write().await.remove(&file_id.volatile);
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::SharingViolation,
+                    &req.header,
+                );
+            }
+        }
+
+        // Query file info for the response.
+        let info = durable_entry.vfs
+            .query_info(durable_entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
+            .await
+            .unwrap_or(rssmb_vfs::FileInfo {
+                file_id: rssmb_vfs::FileId(0),
+                attributes: rssmb_vfs::FileAttributes::default(),
+                size: 0,
+                allocation_size: 0,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                file_name: durable_entry.path.clone(),
+            });
+
+        let create_response = rssmb_proto::create::CreateResponse {
+            oplock_level: rssmb_proto::oplock::OplockLevel::None,
+            flags: Default::default(),
+            create_action: rssmb_proto::create::CreateAction::Opened,
+            creation_time: FileTime::from(info.creation_time),
+            last_access_time: FileTime::from(info.last_access_time),
+            last_write_time: FileTime::from(info.last_write_time),
+            change_time: FileTime::from(info.change_time),
+            allocation_size: info.allocation_size,
+            endof_file: info.size,
+            file_attributes: crate::fsinfo::file_attributes_to_fscc(&info.attributes),
+            file_id,
+        };
+        let response = build_response(&req.header, ResponseContent::Create(create_response));
+        debug!(conn_id = conn_state.conn_id, "DH2C: durable handle re-attached");
+        return FramedResponse::Plain(response);
+    }
+
     // Extract file path from request
     let file_path = create_req.name.to_string();
 
@@ -1882,6 +2200,7 @@ async fn handle_create(
                 pipe_state: Some(Arc::new(std::sync::Mutex::new(
                     rssmb_rpc_server::PipeState::new(),
                 ))),
+                durable_guid: None,
             },
         );
         let create_response = rssmb_proto::create::CreateResponse {
@@ -2006,6 +2325,16 @@ async fn handle_create(
 
             let file_id = next_file_id(conn_state);
 
+            // DH2Q: if a durable handle request was present and durable
+            // handles are enabled, record the open in the durable table
+            // so it can survive a disconnect.
+            let durable_timeout = state.config.durable_timeout_secs;
+            let durable_guid = if dh2q.is_some() && durable_timeout > 0 {
+                dh2q.as_ref().map(|q| q.create_guid)
+            } else {
+                None
+            };
+
             // Store the open in the per-connection open table
             conn_state.opens.write().await.insert(
                 file_id.volatile,
@@ -2019,8 +2348,34 @@ async fn handle_create(
                     path: file_path.clone(),
                     is_pipe: false,
                     pipe_state: None,
+                    durable_guid,
                 },
             );
+
+            if let Some(dh2q) = &dh2q {
+                if durable_timeout > 0 {
+                    let identity = lookup_session_identity(conn_state, session_id).await;
+                    let username = identity
+                        .as_ref()
+                        .map(|i| i.username.clone())
+                        .unwrap_or_default();
+                    let durable_entry = crate::durable::DurableEntry {
+                        vfs: vfs.clone(),
+                        open_id,
+                        file_id: vfs_file_id,
+                        session_id,
+                        tree_id,
+                        share_name: tree_entry.share_name.clone(),
+                        username,
+                        share_access,
+                        desired_access,
+                        path: file_path.clone(),
+                        deadline: crate::durable::deadline_from_timeout(durable_timeout),
+                    };
+                    state.durable_table.insert(dh2q.create_guid, durable_entry).await;
+                    debug!(conn_id = conn_state.conn_id, "DH2Q: durable handle recorded");
+                }
+            }
 
             // Query file info for the response
             let info = vfs.query_info(open_id, rssmb_vfs::InfoClass::FileStandardInfo).await
@@ -2165,6 +2520,13 @@ async fn handle_close(
                     }
                     // Release all byte-range locks held by this open.
                     state.open_table.release_all_locks_for_open(entry.open_id).await;
+                }
+
+                // If this was a durable open, remove it from the durable
+                // table. The VFS handle is closed below — `forget` does not
+                // close it, avoiding a double-close.
+                if let Some(guid) = entry.durable_guid {
+                    state.durable_table.forget(&guid).await;
                 }
 
                 if let Err(e) = entry.vfs.close(entry.open_id).await {
@@ -3928,7 +4290,7 @@ mod tests {
                 match plain.content {
                     ResponseContent::Negotiate(neg) => {
                         assert_eq!(neg.dialect_revision, NegotiateDialect::Smb021);
-                        assert_eq!(neg.max_transact_size, 65536);
+                        assert_eq!(neg.max_transact_size, 1024 * 1024);
                         assert!(neg.capabilities.large_mtu());
                         assert!(!neg.capabilities.leasing());
                         assert!(!neg.capabilities.encryption());

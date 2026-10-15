@@ -8,6 +8,7 @@
 
 pub mod auth_limiter;
 pub mod connection;
+pub mod durable;
 pub mod session;
 pub mod tree;
 pub mod opens;
@@ -62,6 +63,8 @@ pub struct ServerState {
     pub conn_limiter: Arc<crate::connection::ConnectionLimiter>,
     /// Auth failure limiter (per-IP token bucket with growing delay + cooldown).
     pub auth_limiter: Arc<crate::auth_limiter::AuthLimiter>,
+    /// Durable handle table for SMB 3.x reconnect (DH2Q/DH2C).
+    pub durable_table: Arc<crate::durable::DurableTable>,
     /// Shutdown signal.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Stable server GUID (generated once, used for all negotiate responses).
@@ -107,6 +110,7 @@ impl ServerState {
             identities,
             conn_limiter,
             auth_limiter,
+            durable_table: Arc::new(crate::durable::DurableTable::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             server_guid: guid,
         }

@@ -13,7 +13,7 @@ use binrw::{Endian, prelude::*};
 // MS-DTYP §2.3.4: 16-byte GUID, little-endian (u32, u16, u16, [u8;8]).
 
 /// A 16-byte GUID, wire-encoded little-endian.
-#[derive(BinRead, BinWrite, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(BinRead, BinWrite, Clone, Copy, PartialEq, Eq, Default, Hash)]
 #[brw(little)]
 pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
 

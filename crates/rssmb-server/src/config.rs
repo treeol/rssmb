@@ -101,6 +101,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub ntlm_require_timestamp: bool,
 
+    /// Durable handle timeout in seconds. When a client opens a file with a
+    /// DH2Q (durable handle v2) create context and the connection drops, the
+    /// server keeps the open alive for this many seconds so the client can
+    /// reconnect (DH2C) and re-attach without a "network path lost" error.
+    /// Default: 900 (15 min). 0 = durable handles disabled.
+    #[serde(default = "default_durable_timeout_secs")]
+    pub durable_timeout_secs: u64,
+
     /// Server name (for SrvSvc NetrServerGetInfo). Defaults to "rssmb" if empty.
     #[serde(default)]
     pub server_name: String,
@@ -155,6 +163,7 @@ fn default_auth_window_secs() -> u64 { 60 }
 fn default_auth_delay_max_ms() -> u64 { 5000 }
 fn default_auth_cooldown_secs() -> u64 { 60 }
 fn default_auth_max_failures_per_conn() -> u32 { 10 }
+fn default_durable_timeout_secs() -> u64 { 900 }
 fn default_max_dialect() -> DialectConfig { DialectConfig::Smb311 }
 fn default_idle_timeout() -> u64 { 900 }
 fn default_health_bind_addr() -> String { "127.0.0.1".to_string() }
@@ -347,6 +356,7 @@ impl ServerConfig {
             auth_cooldown_secs: 60,
             auth_max_failures_per_conn: 10,
             ntlm_require_timestamp: false,
+            durable_timeout_secs: 900,
             server_name: "rssmb".to_string(),
             users: vec![],
         }

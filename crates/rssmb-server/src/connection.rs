@@ -929,6 +929,18 @@ impl Connection {
             if let Some(fid) = entry.file_id {
                 state.open_table.remove(fid, entry.open_id).await;
             }
+            // Durable opens: leave the VFS handle alive in the durable
+            // table for reconnect. The OpenTable entry was removed above so
+            // new opens during the durable window don't conflict with the
+            // disconnected client.
+            if entry.durable_guid.is_some() {
+                debug!(
+                    conn_id,
+                    open_id = ?entry.open_id,
+                    "cleanup: skipping VFS close for durable open (left in durable table)"
+                );
+                continue;
+            }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {
@@ -1298,6 +1310,7 @@ mod tests {
             path: "f.txt".into(),
             is_pipe: false,
             pipe_state: None,
+            durable_guid: None,
         });
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         conn_state.pending_async.lock().await.insert(9, crate::dispatch::AsyncOp {
