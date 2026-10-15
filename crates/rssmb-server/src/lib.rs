@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod fsinfo;
 pub mod negotiate_ctx;
+pub mod notify;
 pub mod signing;
 
 pub use config::{ServerConfig, ShareConfig};

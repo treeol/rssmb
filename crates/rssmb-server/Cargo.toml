@@ -28,3 +28,4 @@ aes-gcm = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 sspi = { workspace = true }
+notify = { workspace = true }

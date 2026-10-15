@@ -71,6 +71,7 @@ impl From<u8> for QueryFileInfoClass {
             9 => Self::FileNameInformation,
             10 => Self::NormalizedNameInformation,
             18 => Self::AllInformation,
+            22 => Self::StreamInformation,
             34 => Self::NetworkOpenInformation,
             35 => Self::AttributeTagInformation,
             _ => Self::default(),

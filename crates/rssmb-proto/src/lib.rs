@@ -35,6 +35,7 @@ pub use fscc::{
     FileAttributes, FileBasicInformation, FileEndOfFileInformation,
     FileDispositionInformation, FileRenameInformation,
     FileFsSectorSizeInformation, SectorSizeInfoFlags,
+    FileStreamInformation, StreamType,
 };
 pub use header::{Header, Command, HeaderFlags};
 pub use echo::{EchoRequest, EchoResponse};

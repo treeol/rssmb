@@ -427,6 +427,31 @@ impl Vfs for MemoryFs {
             _ => Err(VfsError::NotSupported),
         }
     }
+
+    async fn fs_stats(&self, _open: OpenId) -> Result<FsStats, VfsError> {
+        // In-memory filesystem: report a small fixed capacity.
+        Ok(FsStats {
+            total_blocks: 1_000_000,
+            available_blocks: 500_000,
+            free_blocks: 500_000,
+            block_size: 512,
+            sector_size: 512,
+        })
+    }
+
+    async fn query_security(&self, open: OpenId) -> Result<SecurityInfo, VfsError> {
+        let opens = self.opens.lock().await;
+        let file_open = opens.get(&open).ok_or(VfsError::InvalidHandle)?;
+        let files = self.files.lock().await;
+        let file = files
+            .get(&file_open.file_key)
+            .ok_or(VfsError::NotFound)?;
+        Ok(SecurityInfo {
+            uid: 0,
+            gid: 0,
+            mode: if file.attributes.read_only { 0o444 } else { 0o644 },
+        })
+    }
 }
 
 /// Simple wildcard pattern matching (* and ?).

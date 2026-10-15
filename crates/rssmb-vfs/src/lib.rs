@@ -172,6 +172,32 @@ pub struct LockRange {
     pub length: u64,
 }
 
+/// Filesystem statistics (from statvfs/fstatvfs).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsStats {
+    /// Total blocks in the filesystem.
+    pub total_blocks: u64,
+    /// Available blocks (free, not reserved for root).
+    pub available_blocks: u64,
+    /// Free blocks (including reserved).
+    pub free_blocks: u64,
+    /// Block size (allocation unit).
+    pub block_size: u64,
+    /// Logical sector size.
+    pub sector_size: u64,
+}
+
+/// Security descriptor info synthesized from POSIX mode bits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SecurityInfo {
+    /// Unix UID of the file owner.
+    pub uid: u32,
+    /// Unix GID of the file group.
+    pub gid: u32,
+    /// Unix mode bits (st_mode).
+    pub mode: u32,
+}
+
 /// Directory information class for QUERY_DIRECTORY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirInfoClass {
@@ -383,6 +409,14 @@ pub trait Vfs: Send + Sync {
         ctl: FsCtlCode,
         input: &[u8],
     ) -> Result<Vec<u8>, VfsError>;
+
+    /// Query filesystem statistics for the share backing this handle.
+    /// Used for FileFsSizeInformation / FileFsFullSizeInformation.
+    async fn fs_stats(&self, open: OpenId) -> Result<FsStats, VfsError>;
+
+    /// Query security info (POSIX uid/gid/mode) for an open handle.
+    /// Used to synthesize a minimal self-relative security descriptor.
+    async fn query_security(&self, open: OpenId) -> Result<SecurityInfo, VfsError>;
 }
 
 #[cfg(test)]

@@ -865,6 +865,60 @@ impl Vfs for LocalFs {
     ) -> Result<Vec<u8>, VfsError> {
         Err(VfsError::NotSupported)
     }
+
+    async fn fs_stats(&self, _open: OpenId) -> Result<FsStats, VfsError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.dir.as_raw_fd();
+            let mut statvfs_buf: libc::statvfs = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::fstatvfs(fd, &mut statvfs_buf) };
+            if ret != 0 {
+                return Err(VfsError::Io(format!("fstatvfs: errno {ret}")));
+            }
+            Ok(FsStats {
+                total_blocks: statvfs_buf.f_blocks as u64,
+                available_blocks: statvfs_buf.f_bavail as u64,
+                free_blocks: statvfs_buf.f_bfree as u64,
+                block_size: statvfs_buf.f_bsize as u64,
+                sector_size: statvfs_buf.f_bsize as u64,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(VfsError::NotSupported)
+        }
+    }
+
+    async fn query_security(&self, open: OpenId) -> Result<SecurityInfo, VfsError> {
+        let handle = {
+            let opens = self.opens.read().await;
+            opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let handle = handle.lock().await;
+        let meta = handle
+            .file
+            .metadata()
+            .await
+            .map_err(|e| VfsError::Io(format!("metadata for security: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(SecurityInfo {
+                uid: meta.uid(),
+                gid: meta.gid(),
+                mode: meta.mode(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(SecurityInfo {
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            })
+        }
+    }
 }
 
 /// Simple wildcard pattern matching (`*` and `?`), case-insensitive.

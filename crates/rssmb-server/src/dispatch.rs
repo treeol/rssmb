@@ -303,6 +303,9 @@ pub struct AsyncOp {
     pub tree_id: u32,
     /// Sender to deliver the completion response to the write task.
     pub cancel: tokio::sync::oneshot::Sender<()>,
+    /// Optional directory watch handle for CHANGE_NOTIFY. Dropping this
+    /// stops the background watcher task.
+    pub notify_handle: Option<crate::notify::NotifyHandle>,
 }
 
 /// A tree connection entry tracking the owning session and VFS backend.
@@ -1538,6 +1541,9 @@ async fn handle_logoff(state: &ServerState, conn_state: &ConnState, req_header: 
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
                 let _ = op.cancel.send(());
+                if let Some(handle) = op.notify_handle {
+                    handle.cancel();
+                }
             }
         }
     }
@@ -1802,6 +1808,9 @@ async fn handle_tree_disconnect(
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
                 let _ = op.cancel.send(());
+                if let Some(handle) = op.notify_handle {
+                    handle.cancel();
+                }
             }
         }
     }
@@ -2163,11 +2172,9 @@ async fn handle_close(
                 }
             }
 
-            // Complete any pending CHANGE_NOTIFY for this handle with
-            // STATUS_NOTIFY_CLEANUP (MS-SMB2 3.3.5.10). Since our dispatch
-            // is serial, the pending op was already returned as PENDING —
-            // we just remove it from tracking so CANCEL can't target it.
-            // In a truly async model we'd send a NotifyCleanup response.
+            // Complete any pending CHANGE_NOTIFY for this tree with
+            // STATUS_NOTIFY_CLEANUP (MS-SMB2 3.3.5.10). Cancel the
+            // directory watcher and remove from pending_async.
             {
                 let mut pending = conn_state.pending_async.lock().await;
                 let to_remove: Vec<u64> = pending
@@ -2178,6 +2185,10 @@ async fn handle_close(
                 for key in to_remove {
                     if let Some(op) = pending.remove(&key) {
                         let _ = op.cancel.send(());
+                        // Cancel the notify watcher if present.
+                        if let Some(handle) = op.notify_handle {
+                            handle.cancel();
+                        }
                     }
                 }
             }
@@ -2585,6 +2596,7 @@ async fn handle_query_info(
                     let access = if ro { 0x0012_00a9 } else { 0x001f_01ff };
                     crate::fsinfo::file_all_info(&info, &entry.path, access)
                 }
+                22 => crate::fsinfo::file_stream_info(&info),    // FileStreamInformation
                 34 => crate::fsinfo::file_network_open_info(&info), // FileNetworkOpenInformation
                 35 => crate::fsinfo::file_attribute_tag_info(&info), // FileAttributeTagInformation
                 _ => {
@@ -2595,22 +2607,50 @@ async fn handle_query_info(
         }
         // InfoType::FileSystem (0x02)
         0x02 => {
+            let stats = match entry.vfs.fs_stats(entry.open_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(conn_id = conn_state.conn_id, error = %e, "fs_stats VFS failed");
+                    return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header);
+                }
+            };
+            let share_name = {
+                let trees = conn_state.trees.read().await;
+                trees.get(&tree_id).map(|t| t.share_name.clone()).unwrap_or_default()
+            };
             match info_class_byte {
-                1 => crate::fsinfo::fs_volume_info(),       // FileFsVolumeInformation
-                3 => crate::fsinfo::fs_size_info(),         // FileFsSizeInformation
-                4 => crate::fsinfo::fs_device_info(),       // FileFsDeviceInformation
-                5 => crate::fsinfo::fs_attribute_info(),    // FileFsAttributeInformation
-                7 => crate::fsinfo::fs_full_size_info(),    // FileFsFullSizeInformation
-                11 => crate::fsinfo::fs_sector_size_info(), // FileFsSectorSizeInformation
+                1 => crate::fsinfo::fs_volume_info(&share_name),   // FileFsVolumeInformation
+                3 => crate::fsinfo::fs_size_info(&stats),         // FileFsSizeInformation
+                4 => crate::fsinfo::fs_device_info(),              // FileFsDeviceInformation
+                5 => crate::fsinfo::fs_attribute_info(),           // FileFsAttributeInformation
+                7 => crate::fsinfo::fs_full_size_info(&stats),     // FileFsFullSizeInformation
+                11 => crate::fsinfo::fs_sector_size_info(&stats),  // FileFsSectorSizeInformation
                 _ => {
                     debug!(conn_id = conn_state.conn_id, class = info_class_byte, "unsupported filesystem info class");
                     return error_response_for(Command::QueryInfo, NtStatus::InvalidInfoClass, &req.header);
                 }
             }
         }
-        // InfoType::Security (0x03) — return a minimal SD or ACCESS_DENIED
+        // InfoType::Security (0x03) — synthesize a minimal SD from POSIX mode.
         0x03 => {
-            return error_response_for(Command::QueryInfo, NtStatus::AccessDenied, &req.header);
+            // Only DACL/OWNER/GROUP are supported. SACL requests require
+            // ACCESS_SYSTEM_SECURITY which we don't grant.
+            let additional_info = u32::from_le_bytes(qi_req.additional_info.into_bytes());
+            let sec_info = match entry.vfs
+                .query_security(entry.open_id)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(conn_id = conn_state.conn_id, error = %e, "query_security VFS failed");
+                    return error_response_for(Command::QueryInfo, NtStatus::InvalidParameter, &req.header);
+                }
+            };
+            let sd = crate::fsinfo::synthesize_security_descriptor(&sec_info, additional_info);
+            if sd.is_empty() {
+                return error_response_for(Command::QueryInfo, NtStatus::Other(0xC000_0001), &req.header);
+            }
+            sd
         }
         // InfoType::Quota (0x04)
         0x04 => {
@@ -2767,9 +2807,22 @@ async fn handle_set_info(
 
     // Only File-type SET_INFO is supported for now.
     // InfoType::File = 0x01 is the only supported type for SET_INFO.
+    // InfoType::Security (0x03) is accepted and ignored (the SD is not
+    // persisted — documented as unsupported in the README/plan).
     let is_file_type = si_req.info_type == InfoType::File;
-    if !is_file_type {
+    let is_security_type = si_req.info_type == InfoType::Security;
+    if !is_file_type && !is_security_type {
         return error_response_for(Command::SetInfo, NtStatus::NotSupported, &req.header);
+    }
+    if is_security_type {
+        // Security SET_INFO: accept and succeed without persisting.
+        // This is a documented compatibility behavior — the SD is not
+        // mapped back to POSIX mode bits. A strict mode would return
+        // ACCESS_DENIED here.
+        debug!(conn_id = conn_state.conn_id, "set_info security: accepted (not persisted)");
+        return FramedResponse::Plain(build_response(&req.header, ResponseContent::SetInfo(
+            rssmb_proto::info::SetInfoResponse::default(),
+        )));
     }
 
     // Get the info class and raw data.
@@ -2952,9 +3005,14 @@ async fn handle_set_info(
     }
 }
 
-/// CHANGE_NOTIFY — register a directory watch. For MVP, immediately return
-/// STATUS_PENDING so the client doesn't block. On CLOSE of the handle or
-/// TREE_DISCONNECT, complete with STATUS_NOTIFY_CLEANUP.
+/// CHANGE_NOTIFY — register a directory watch.
+///
+/// Returns STATUS_PENDING immediately. A background task watches the
+/// directory using the `notify` crate (inotify on Linux) and sends
+/// FILE_NOTIFY_INFORMATION as an async completion when changes occur.
+///
+/// On CLOSE, CANCEL, tree-disconnect, or logoff, the watch is cancelled
+/// and the async op is removed from `pending_async`.
 async fn handle_change_notify(
     _state: &ServerState,
     conn_state: &ConnState,
@@ -2970,27 +3028,115 @@ async fn handle_change_notify(
     let tree_id = req.header.tree_id.unwrap_or(0);
 
     // Validate the handle belongs to this session.
-    match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-        Ok(_) => {},
+    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+        Ok(e) => e,
         Err(status) => return error_response_for(Command::ChangeNotify, status, &req.header),
     };
 
-    // For MVP: return STATUS_PENDING with the output buffer empty.
-    // The client will keep this request outstanding and wait for a response.
-    // We don't actually monitor for changes — we just don't complete the
-    // response until CLOSE/CANCEL/TREE_DISCONNECT.
-    //
-    // Since our dispatch model is serial (we must return a FramedResponse
-    // from the handler), we can't truly hold this request open. Instead we
-    // return PENDING immediately and track it in pending_async so that
-    // CANCEL or CLOSE can complete it.
+    // CHANGE_NOTIFY requires a directory handle.
+    if !entry.is_pipe {
+        let info = entry.vfs
+            .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
+            .await
+            .unwrap_or(rssmb_vfs::FileInfo {
+                file_id: rssmb_vfs::FileId(0),
+                attributes: rssmb_vfs::FileAttributes::default(),
+                size: 0,
+                allocation_size: 0,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                file_name: String::new(),
+            });
+        if !info.attributes.directory {
+            debug!(conn_id = conn_state.conn_id, "change_notify: handle is not a directory");
+            return error_response_for(Command::ChangeNotify, NtStatus::InvalidParameter, &req.header);
+        }
+    }
+
     let message_id = req.header.message_id;
+    let watch_tree = cn_req.flags.watch_tree();
+
+    // Build the CompletionFilter from the request.
+    let filter = crate::notify::CompletionFilter {
+        file_name: cn_req.completion_filter.file_name(),
+        dir_name: cn_req.completion_filter.dir_name(),
+        attributes: cn_req.completion_filter.attributes(),
+        size: cn_req.completion_filter.size(),
+        last_write: cn_req.completion_filter.last_write(),
+        last_access: cn_req.completion_filter.last_access(),
+        creation: cn_req.completion_filter.creation(),
+        ea: cn_req.completion_filter.ea(),
+        security: cn_req.completion_filter.security(),
+        stream_name: cn_req.completion_filter.stream_name(),
+        stream_size: cn_req.completion_filter.stream_size(),
+        stream_write: cn_req.completion_filter.stream_write(),
+    };
+
+    // Start the directory watch. The path is the share root joined with
+    // the handle's relative path. For the share root itself (entry.path
+    // is ""), the watch is on the share root.
+    // We use the share root path from the VFS — but we don't have access
+    // to the actual filesystem path from the VFS trait. The notify
+    // watcher needs a real filesystem path, so we reconstruct it from
+    // the share config path + the entry's relative path.
+    let dir_path = {
+        let trees = conn_state.trees.read().await;
+        let share_name = trees.get(&tree_id).map(|t| t.share_name.clone()).unwrap_or_default();
+        // Look up the share path from config.
+        let share_path = _state.config.shares
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&share_name))
+            .map(|(_, v)| v.path.clone())
+            .unwrap_or_default();
+        if share_path.is_empty() {
+            debug!(conn_id = conn_state.conn_id, "change_notify: no share path — using stub");
+            // No real path — fall back to the stub (no real watching).
+            let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            conn_state.pending_async.lock().await.insert(message_id, AsyncOp {
+                command: Command::ChangeNotify,
+                session_id,
+                tree_id,
+                cancel: cancel_tx,
+                notify_handle: None,
+            });
+            let mut response = build_response(&req.header, ResponseContent::ChangeNotify(
+                rssmb_proto::notify::ChangeNotifyResponse { buffer: Default::default() },
+            ));
+            response.header.status = NtStatus::Pending.to_u32();
+            response.header.to_async(message_id);
+            return FramedResponse::Plain(response);
+        }
+        // Join the share path with the entry's relative path.
+        let mut path = std::path::PathBuf::from(share_path);
+        if !entry.path.is_empty() {
+            // The entry path is share-relative (e.g. "subdir/file.txt").
+            // Join it with the share root.
+            path.push(&entry.path);
+        }
+        path
+    };
+
+    // Start the real watch.
+    let notify_handle = crate::notify::start_watch(
+        conn_state,
+        message_id,
+        session_id,
+        tree_id,
+        dir_path,
+        watch_tree,
+        filter,
+    );
+
+    // Register the async op with the notify handle for cleanup.
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
     conn_state.pending_async.lock().await.insert(message_id, AsyncOp {
         command: Command::ChangeNotify,
         session_id,
         tree_id,
         cancel: cancel_tx,
+        notify_handle: Some(notify_handle),
     });
 
     // Build a PENDING response with async header.
@@ -3000,8 +3146,6 @@ async fn handle_change_notify(
         },
     ));
     response.header.status = NtStatus::Pending.to_u32();
-    // Convert to async header — sets async_command flag, clears tree_id,
-    // sets async_id.
     response.header.to_async(message_id);
     FramedResponse::Plain(response)
 }
@@ -3331,6 +3475,10 @@ async fn handle_cancel(
         return None;
     };
     let _ = op.cancel.send(());
+    // Cancel the notify watcher if present.
+    if let Some(handle) = op.notify_handle {
+        handle.cancel();
+    }
     debug!(conn_id = conn_state.conn_id, target, "cancelled async op");
 
     let mut header = Header {
@@ -3572,7 +3720,7 @@ fn error_response_for(command: Command, status: NtStatus, req_header: &Header) -
 }
 
 /// Construct a PlainResponse mirroring the request header.
-fn build_response(req_header: &Header, content: ResponseContent) -> PlainResponse {
+pub(crate) fn build_response(req_header: &Header, content: ResponseContent) -> PlainResponse {
     let command = content.associated_cmd();
     PlainResponse {
         header: Header {

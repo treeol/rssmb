@@ -94,7 +94,7 @@ impl Tree {
 mod tests {
     use super::*;
     use rssmb_vfs::{OpenId, Vfs, VfsError, CreateArgs, FileInfo, InfoClass,
-        DirInfoClass, DirEntry, FileId, LockRange, FsCtlCode};
+        DirInfoClass, DirEntry, FileId, LockRange, FsCtlCode, FsStats, SecurityInfo};
     use bytes::Bytes;
     use async_trait::async_trait;
 
@@ -207,6 +207,12 @@ mod tests {
             _ctl: FsCtlCode,
             _input: &[u8],
         ) -> Result<Vec<u8>, VfsError> {
+            Err(VfsError::NotSupported)
+        }
+        async fn fs_stats(&self, _open: OpenId) -> Result<FsStats, VfsError> {
+            Err(VfsError::NotSupported)
+        }
+        async fn query_security(&self, _open: OpenId) -> Result<SecurityInfo, VfsError> {
             Err(VfsError::NotSupported)
         }
     }

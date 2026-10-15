@@ -13,10 +13,11 @@ use rssmb_proto::fscc::{
     FileFsVolumeInformation, FileFsSizeInformation, FileFsAttributeInformation,
     FileFsDeviceInformation, FileFsFullSizeInformation, FsDeviceType, FsDeviceCharacteristics,
     FileSystemAttributes, ChainedItemList, ReparseTag,
+    FileStreamInformation,
 };
 use rssmb_proto::Boolean;
 
-use rssmb_vfs::{FileInfo, DirEntry, FileId as VfsFileId};
+use rssmb_vfs::{FileInfo, DirEntry, FileId as VfsFileId, FsStats, SecurityInfo};
 
 /// Serialize a value with BinWrite into a Vec<u8>. Returns empty on failure
 /// (the caller should check and return STATUS_INTERNAL_ERROR).
@@ -145,33 +146,59 @@ pub fn file_attribute_tag_info(info: &FileInfo) -> Vec<u8> {
     })
 }
 
+/// FileStreamInformation (class 22, MS-FSCC §2.4.63).
+/// Reports the unnamed data stream (`::$DATA`) only.
+/// Returns an empty buffer for directories (directories have no streams).
+pub fn file_stream_info(info: &FileInfo) -> Vec<u8> {
+    if info.attributes.directory {
+        // Directories don't have a $DATA stream. Return empty buffer.
+        return Vec::new();
+    }
+    let stream = FileStreamInformation {
+        stream_size: info.size,
+        stream_allocation_size: info.allocation_size,
+        stream_name: "::$DATA".into(),
+    };
+    serialize(&stream)
+}
+
 // ── Filesystem information classes ───────────────────────────────────────
 
-pub fn fs_volume_info() -> Vec<u8> {
+pub fn fs_volume_info(share_name: &str) -> Vec<u8> {
+    // Stable volume serial: hash of the share name. This is stable across
+    // restarts and unique per share (deterministic).
+    let serial = {
+        let mut hash: u32 = 0x811c9dc5; // FNV-1a offset basis
+        for b in share_name.as_bytes() {
+            hash ^= *b as u32;
+            hash = hash.wrapping_mul(0x0100_0193); // FNV-1a prime
+        }
+        hash
+    };
     serialize(&FileFsVolumeInformation {
         volume_creation_time: FileTime::ZERO,
-        volume_serial_number: 0x12345678,
+        volume_serial_number: serial,
         supports_objects: Boolean::from(false),
         volume_label: "".into(),
     })
 }
 
-pub fn fs_size_info() -> Vec<u8> {
+pub fn fs_size_info(stats: &FsStats) -> Vec<u8> {
     serialize(&FileFsSizeInformation {
-        total_allocation_units: 1_000_000,
-        available_allocation_units: 500_000,
-        sectors_per_allocation_unit: 1,
-        bytes_per_sector: 512,
+        total_allocation_units: stats.total_blocks,
+        available_allocation_units: stats.available_blocks,
+        sectors_per_allocation_unit: (stats.block_size / stats.sector_size) as u32,
+        bytes_per_sector: stats.sector_size as u32,
     })
 }
 
-pub fn fs_full_size_info() -> Vec<u8> {
+pub fn fs_full_size_info(stats: &FsStats) -> Vec<u8> {
     serialize(&FileFsFullSizeInformation {
-        total_allocation_units: 1_000_000,
-        caller_available_allocation_units: 500_000,
-        actual_available_allocation_units: 500_000,
-        sectors_per_allocation_unit: 1,
-        bytes_per_sector: 512,
+        total_allocation_units: stats.total_blocks,
+        caller_available_allocation_units: stats.available_blocks,
+        actual_available_allocation_units: stats.free_blocks,
+        sectors_per_allocation_unit: (stats.block_size / stats.sector_size) as u32,
+        bytes_per_sector: stats.sector_size as u32,
     })
 }
 
@@ -192,16 +219,256 @@ pub fn fs_device_info() -> Vec<u8> {
     })
 }
 
-pub fn fs_sector_size_info() -> Vec<u8> {
+pub fn fs_sector_size_info(stats: &FsStats) -> Vec<u8> {
     serialize(&rssmb_proto::fscc::FileFsSectorSizeInformation {
-        logical_bytes_per_sector: 512,
-        physical_bytes_per_sector: 512,
-        physical_bytes_per_sector_for_performance: 512,
-        effective_physical_bytes_per_sector_for_atomicity: 512,
+        logical_bytes_per_sector: stats.sector_size as u32,
+        physical_bytes_per_sector: stats.sector_size as u32,
+        physical_bytes_per_sector_for_performance: stats.sector_size as u32,
+        effective_physical_bytes_per_sector_for_atomicity: stats.sector_size as u32,
         flags: rssmb_proto::fscc::SectorSizeInfoFlags::new(),
         byte_offset_for_sector_alignment: 0xFFFFFFFF,
         byte_offset_for_partition_alignment: 0xFFFFFFFF,
     })
+}
+
+// ── Security descriptor synthesis ───────────────────────────────────────
+
+/// SECURITY_INFORMATION flags (MS-SMB2 2.2.37 AdditionalInfo).
+/// We honor OWNER (1), GROUP (2), DACL (4) and ignore SACL (8), LABEL,
+/// ATTRIBUTE, SCOPE, BACKUP — returning what we can.
+const SECURITY_OWNER: u32 = 0x00000001;
+const SECURITY_GROUP: u32 = 0x00000002;
+const SECURITY_DACL: u32 = 0x00000004;
+const _SECURITY_SACL: u32 = 0x00000008;
+
+/// Build a minimal self-relative security descriptor from POSIX mode bits.
+///
+/// Layout (self-relative SD, MS-DTYP §2.4.6):
+/// ```text
+/// offset  size  field
+///      0     1  Revision (1)
+///      1     1  Sbz1 (0)
+///      2     2  Control (SE_SELF_RELATIVE = 0x8000)
+///      4     4  Offset to Owner SID (0 if none)
+///      8     4  Offset to Group SID (0 if none)
+///     12     4  Offset to DACL (0 if none)
+///     16     4  Offset to SACL (0 if none)
+/// ```
+/// Followed by the SID and ACL structures.
+///
+/// Owner SID: `S-1-22-1-<uid>` (Samba "Unix Users" convention).
+/// Group SID: `S-1-22-2-<gid>` (Samba "Unix Groups" convention).
+/// DACL: ACCESS_ALLOWED_ACE for owner, group, and Everyone, mapping the
+/// POSIX rwx bits to FILE_GENERIC_READ/WRITE/EXECUTE rights.
+pub fn synthesize_security_descriptor(sec_info: &SecurityInfo, additional_info: u32) -> Vec<u8> {
+    let want_owner = additional_info & SECURITY_OWNER != 0;
+    let want_group = additional_info & SECURITY_GROUP != 0;
+    let want_dacl = additional_info & SECURITY_DACL != 0;
+
+    // Build the SIDs.
+    let owner_sid = build_sid_unix_user(sec_info.uid);
+    let group_sid = build_sid_unix_group(sec_info.gid);
+
+    // Build the DACL with ACEs mapping POSIX mode bits.
+    // Use owner/group SIDs for per-class ACEs, not Everyone for all.
+    let dacl = if want_dacl {
+        Some(build_dacl(sec_info.mode, sec_info.uid, sec_info.gid))
+    } else {
+        None
+    };
+
+    // SD header is 20 bytes. Field order per MS-DTYP §2.4.6:
+    // Revision(1), Sbz1(1), Control(2), OwnerOffset(4), GroupOffset(4),
+    // SaclOffset(4), DaclOffset(4).
+    let mut offset = 20u32;
+
+    let owner_offset = if want_owner {
+        let off = offset;
+        offset += owner_sid.len() as u32;
+        off
+    } else {
+        0
+    };
+
+    let group_offset = if want_group {
+        let off = offset;
+        offset += group_sid.len() as u32;
+        off
+    } else {
+        0
+    };
+
+    // SACL is never present (offset 0).
+    let sacl_offset = 0u32;
+
+    let dacl_offset = if dacl.is_some() {
+        let off = offset;
+        offset += dacl.as_ref().unwrap().len() as u32;
+        off
+    } else {
+        0
+    };
+
+    // Control flags: SE_SELF_RELATIVE (0x8000) | SE_DACL_PRESENT (0x0004).
+    let control: u16 = if want_dacl { 0x8004 } else { 0x8000 };
+
+    // Assemble the SD.
+    let mut buf = Vec::with_capacity(offset as usize);
+
+    // ── SD header (20 bytes) ──
+    buf.push(1); // Revision
+    buf.push(0); // Sbz1
+    buf.extend_from_slice(&control.to_le_bytes()); // Control
+    buf.extend_from_slice(&owner_offset.to_le_bytes()); // Owner offset
+    buf.extend_from_slice(&group_offset.to_le_bytes()); // Group offset
+    buf.extend_from_slice(&sacl_offset.to_le_bytes()); // SACL offset
+    buf.extend_from_slice(&dacl_offset.to_le_bytes()); // DACL offset
+
+    // ── Owner SID ──
+    if want_owner {
+        buf.extend_from_slice(&owner_sid);
+    }
+    // ── Group SID ──
+    if want_group {
+        buf.extend_from_slice(&group_sid);
+    }
+    // ── DACL ──
+    if let Some(dacl_bytes) = &dacl {
+        buf.extend_from_slice(dacl_bytes);
+    }
+
+    buf
+}
+
+/// Build a SID: `S-1-<id_auth>-<sub_authorities...>`.
+///
+/// SID layout (MS-DTYP §2.4.2):
+/// - Revision (1 byte): 1
+/// - SubAuthorityCount (1 byte)
+/// - IdentifierAuthority (6 bytes, big-endian)
+/// - SubAuthority[] (4 bytes each, LE)
+fn build_sid(identifier_authority: u64, sub_authorities: &[u32]) -> Vec<u8> {
+    let mut sid = Vec::new();
+    sid.push(1); // Revision
+    sid.push(sub_authorities.len() as u8);
+    sid.extend_from_slice(&identifier_authority.to_be_bytes()[2..]); // 6 bytes
+    for &sa in sub_authorities {
+        sid.extend_from_slice(&sa.to_le_bytes());
+    }
+    sid
+}
+
+/// `S-1-22-1-<uid>` — Samba "Unix Users" convention.
+fn build_sid_unix_user(uid: u32) -> Vec<u8> {
+    // IdentifierAuthority = 22 (Unix), SubAuthorities = [1, uid]
+    build_sid(22, &[1, uid])
+}
+
+/// `S-1-22-2-<gid>` — Samba "Unix Groups" convention.
+fn build_sid_unix_group(gid: u32) -> Vec<u8> {
+    build_sid(22, &[2, gid])
+}
+
+/// `S-1-1-0` — Everyone (World).
+fn build_sid_everyone() -> Vec<u8> {
+    // S-1-1-0: IdentifierAuthority=1, SubAuthorities=[0]
+    build_sid(1, &[0])
+}
+
+/// Build a minimal DACL mapping POSIX mode bits to ACCESS_ALLOWED ACEs.
+///
+/// POSIX rwx → Windows rights:
+/// - owner r → FILE_GENERIC_READ, owner w → FILE_GENERIC_WRITE, owner x → FILE_GENERIC_EXECUTE
+/// - group r/w/x → same mapping
+/// - other r/w/x → same mapping (Everyone SID)
+///
+/// **Note:** This is a documented approximate compatibility projection,
+/// not an exact POSIX-mode-to-ACL translation. Windows allow ACEs accumulate,
+/// while POSIX selects the applicable permission class. The SD is metadata
+/// for the client (Explorer Properties dialog); actual authorization is
+/// enforced by the server layer, not by this DACL.
+///
+/// ACL layout (MS-DTYP §2.4.3):
+/// - AclRevision (1 byte): 2
+/// - Sbz1 (1 byte): 0
+/// - AclSize (2 bytes): total ACL size including header
+/// - AceCount (2 bytes): number of ACEs
+/// - Sbz2 (2 bytes): 0
+/// - ACEs...
+fn build_dacl(mode: u32, uid: u32, gid: u32) -> Vec<u8> {
+    let owner_rwx = (mode >> 6) & 0o7;
+    let group_rwx = (mode >> 3) & 0o7;
+    let other_rwx = mode & 0o7;
+
+    let owner_sid = build_sid_unix_user(uid);
+    let group_sid = build_sid_unix_group(gid);
+    let everyone_sid = build_sid_everyone();
+
+    let mut aces: Vec<Vec<u8>> = Vec::new();
+
+    // Owner ACE
+    let owner_mask = rwx_to_mask(owner_rwx);
+    if owner_mask != 0 {
+        aces.push(build_ace_allowed(owner_mask, &owner_sid));
+    }
+
+    // Group ACE
+    let group_mask = rwx_to_mask(group_rwx);
+    if group_mask != 0 {
+        aces.push(build_ace_allowed(group_mask, &group_sid));
+    }
+
+    // Other (Everyone) ACE
+    let other_mask = rwx_to_mask(other_rwx);
+    if other_mask != 0 {
+        aces.push(build_ace_allowed(other_mask, &everyone_sid));
+    }
+
+    // ACL header is 8 bytes: Revision(1) + Sbz1(1) + AclSize(2) + AceCount(2) + Sbz2(2)
+    let acl_size = 8 + aces.iter().map(|a| a.len()).sum::<usize>();
+    let ace_count = aces.len() as u16;
+    let mut acl = Vec::with_capacity(acl_size);
+    acl.push(2); // AclRevision
+    acl.push(0); // Sbz1
+    acl.extend_from_slice(&(acl_size as u16).to_le_bytes());
+    acl.extend_from_slice(&ace_count.to_le_bytes());
+    acl.extend_from_slice(&0u16.to_le_bytes()); // Sbz2
+    for ace in &aces {
+        acl.extend_from_slice(ace);
+    }
+
+    acl
+}
+
+/// Map POSIX rwx bits (3-bit) to a Windows access mask.
+///
+/// FILE_GENERIC_READ = 0x00120089
+/// FILE_GENERIC_WRITE = 0x00120116
+/// FILE_GENERIC_EXECUTE = 0x001200a0
+fn rwx_to_mask(rwx: u32) -> u32 {
+    let mut mask = 0u32;
+    if rwx & 0o4 != 0 {
+        mask |= 0x0012_0089; // FILE_GENERIC_READ
+    }
+    if rwx & 0o2 != 0 {
+        mask |= 0x0012_0116; // FILE_GENERIC_WRITE
+    }
+    if rwx & 0o1 != 0 {
+        mask |= 0x0012_00a0; // FILE_GENERIC_EXECUTE
+    }
+    mask
+}
+
+/// Build an ACCESS_ALLOWED_ACE (MS-DTYP §2.4.4.3).
+fn build_ace_allowed(mask: u32, sid: &[u8]) -> Vec<u8> {
+    let ace_size = 4 + 4 + sid.len(); // header + mask + sid
+    let mut ace = Vec::with_capacity(ace_size);
+    ace.push(0); // AceType = ACCESS_ALLOWED
+    ace.push(0); // AceFlags
+    ace.extend_from_slice(&(ace_size as u16).to_le_bytes()); // AceSize
+    ace.extend_from_slice(&mask.to_le_bytes()); // Mask
+    ace.extend_from_slice(sid); // SID
+    ace
 }
 
 // ── Directory enumeration ────────────────────────────────────────────────
@@ -683,7 +950,14 @@ mod tests {
 
     #[test]
     fn test_fs_size_info_golden_bytes() {
-        let buf = fs_size_info();
+        let stats = FsStats {
+            total_blocks: 1_000_000,
+            available_blocks: 500_000,
+            free_blocks: 500_000,
+            block_size: 512,
+            sector_size: 512,
+        };
+        let buf = fs_size_info(&stats);
         // FileFsSizeInformation: TotalAllocUnits(8) + AvailableAllocUnits(8) + SectorsPerAlloc(4) + BytesPerSector(4) = 24
         assert_eq!(buf.len(), 24);
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 1_000_000);
@@ -703,11 +977,92 @@ mod tests {
 
     #[test]
     fn test_fs_full_size_info_golden_bytes() {
-        let buf = fs_full_size_info();
+        let stats = FsStats {
+            total_blocks: 1_000_000,
+            available_blocks: 500_000,
+            free_blocks: 500_000,
+            block_size: 512,
+            sector_size: 512,
+        };
+        let buf = fs_full_size_info(&stats);
         // FileFsFullSizeInformation: Total(8) + Caller(8) + Actual(8) + SectorsPerAlloc(4) + BytesPerSector(4) = 32
         assert_eq!(buf.len(), 32);
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 1_000_000);
         assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 500_000);
         assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 500_000);
+    }
+
+    #[test]
+    fn test_fs_volume_info_stable_serial() {
+        let buf1 = fs_volume_info("testshare");
+        let buf2 = fs_volume_info("testshare");
+        let buf3 = fs_volume_info("othershare");
+        // Serial is at offset 8 (after 8-byte creation time).
+        let serial1 = u32::from_le_bytes(buf1[8..12].try_into().unwrap());
+        let serial2 = u32::from_le_bytes(buf2[8..12].try_into().unwrap());
+        let serial3 = u32::from_le_bytes(buf3[8..12].try_into().unwrap());
+        assert_eq!(serial1, serial2, "same share → same serial");
+        assert_ne!(serial1, serial3, "different share → different serial");
+        assert_ne!(serial1, 0, "serial should not be zero");
+    }
+
+    // --- Security descriptor synthesis tests ---
+
+    #[test]
+    fn test_sd_synthesis_basic() {
+        let sec = SecurityInfo { uid: 1000, gid: 1000, mode: 0o755 };
+        let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
+        // Header is 20 bytes, must be at least that.
+        assert!(sd.len() > 20);
+        // Revision = 1
+        assert_eq!(sd[0], 1);
+        // Control: SE_SELF_RELATIVE (0x8000) | SE_DACL_PRESENT (0x0004)
+        let control = u16::from_le_bytes(sd[2..4].try_into().unwrap());
+        assert_eq!(control, 0x8004);
+    }
+
+    #[test]
+    fn test_sd_synthesis_no_dacl() {
+        let sec = SecurityInfo { uid: 0, gid: 0, mode: 0o644 };
+        let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP);
+        // Without DACL: header(20) + owner SID + group SID
+        // S-1-22-1-0: revision(1) + count(1) + auth(6) + 2×subauth(4+4) = 16 bytes
+        // S-1-22-2-0: same = 16 bytes
+        assert_eq!(sd.len(), 20 + 16 + 16);
+        // SD header: Owner(4..8), Group(8..12), SACL(12..16), DACL(16..20).
+        // DACL offset at bytes 16..20 should be 0 (no DACL).
+        let dacl_off = u32::from_le_bytes(sd[16..20].try_into().unwrap());
+        assert_eq!(dacl_off, 0);
+        // SACL offset at bytes 12..16 should be 0 (no SACL).
+        let sacl_off = u32::from_le_bytes(sd[12..16].try_into().unwrap());
+        assert_eq!(sacl_off, 0);
+        // Control at bytes 2..4: SE_SELF_RELATIVE (0x8000) without DACL.
+        let control = u16::from_le_bytes(sd[2..4].try_into().unwrap());
+        assert_eq!(control, 0x8000);
+    }
+
+    #[test]
+    fn test_sd_synthesis_owner_offset() {
+        let sec = SecurityInfo { uid: 42, gid: 42, mode: 0o700 };
+        let sd = synthesize_security_descriptor(&sec, SECURITY_OWNER | SECURITY_GROUP | SECURITY_DACL);
+        // Owner offset at bytes 4..8
+        let owner_off = u32::from_le_bytes(sd[4..8].try_into().unwrap());
+        assert_eq!(owner_off, 20); // right after header
+        // Group offset at bytes 8..12
+        let group_off = u32::from_le_bytes(sd[8..12].try_into().unwrap());
+        // S-1-22-1-42 = 16 bytes, so group is at 20+16 = 36
+        assert_eq!(group_off, 36);
+        // The SID at owner_off should start with revision=1
+        assert_eq!(sd[owner_off as usize], 1); // revision
+        // SubAuthorityCount at offset+1
+        let sub_auth_count = sd[owner_off as usize + 1];
+        assert_eq!(sub_auth_count, 2); // [1, uid]
+        // IdentifierAuthority is 6 bytes big-endian at offset+2
+        // For authority 22: bytes are [0,0,0,0,0,22]
+        let auth_byte = sd[owner_off as usize + 2 + 5]; // last byte of authority
+        assert_eq!(auth_byte, 22);
+        // Control: SE_SELF_RELATIVE | SE_DACL_PRESENT = 0x8004
+        let control = u16::from_le_bytes(sd[2..4].try_into().unwrap());
+        assert_eq!(control, 0x8004);
     }
 }

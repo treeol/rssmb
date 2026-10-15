@@ -949,6 +949,9 @@ impl Connection {
             for key in keys {
                 if let Some(op) = pending.remove(&key) {
                     let _ = op.cancel.send(());
+                    if let Some(handle) = op.notify_handle {
+                        handle.cancel();
+                    }
                     cancelled.push(key);
                 }
             }
@@ -1302,6 +1305,7 @@ mod tests {
             session_id: 5,
             tree_id: 3,
             cancel: cancel_tx,
+            notify_handle: None,
         });
 
         Connection::cleanup(&state, 77, &conn_state).await;

@@ -223,6 +223,42 @@ pub struct FileAttributeTagInformation {
     pub reparse_tag: ReparseTag,
 }
 
+/// FileStreamInformation (MS-FSCC §2.4.63).
+///
+/// Information class 22. Reports named streams on a file.
+/// Our server reports only the unnamed data stream (`::$DATA`).
+///
+/// Layout: NextEntryOffset(4) + StreamNameLength(4) + StreamSize(8) +
+/// StreamAllocationSize(8) + StreamName(UTF-16LE, variable).
+/// Last entry has NextEntryOffset = 0.
+#[binrw::binrw]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[brw(little)]
+pub struct FileStreamInformation {
+    /// Offset to the next entry; 0 for the last entry.
+    #[bw(calc = 0u32)]
+    #[br(temp)]
+    _next_entry_offset: u32,
+    /// Length of StreamName in bytes (UTF-16LE).
+    #[bw(try_calc = stream_name.size().try_into())]
+    #[br(temp)]
+    _stream_name_length: u32,
+    pub stream_size: u64,
+    pub stream_allocation_size: u64,
+    #[br(args { size: SizedStringSize::Bytes(_stream_name_length) })]
+    pub stream_name: SizedWideString,
+}
+
+/// Stream type for FileStreamInformation (MS-FSCC §2.4.63).
+/// Not used in the wire struct — the stream type is encoded in the stream
+/// name (e.g. `::$DATA`). Kept for documentation.
+#[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[brw(repr(u32))]
+pub enum StreamType {
+    #[default]
+    DataStream = 1,
+}
+
 // ── Directory enumeration types (MS-FSCC §2.4) ────────────────────
 
 /// FileDirectoryInformation (MS-FSCC §2.4.10).
