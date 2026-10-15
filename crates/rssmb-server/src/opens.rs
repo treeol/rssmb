@@ -15,11 +15,11 @@
 //! granted the corresponding share-access flag. If any existing open did not
 //! share the requested access, the new open is denied with [`OpenConflict`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use tokio::sync::RwLock;
 
-use rssmb_vfs::{FileId, OpenId, ShareAccess};
+use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
 
 use thiserror::Error;
 use tracing::{debug, instrument};
@@ -66,7 +66,8 @@ impl OpenConflict {
 ///
 /// Each entry records enough context to attribute a conflict (for logging and
 /// diagnostics) and to enforce the share-mode contract: the share-access flags
-/// declared when the open was created, and the delete-on-close disposition.
+/// declared when the open was created, the desired access it requested, and
+/// the delete-on-close disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenEntry {
     /// The opaque open handle returned to the client / tracked by the VFS.
@@ -75,8 +76,10 @@ pub struct OpenEntry {
     pub session_id: u64,
     /// Tree id on which the open was issued.
     pub tree_id: u32,
-    /// Share-access flags declared by this open — what it requires and shares.
+    /// Share-access flags declared by this open — what it shares with others.
     pub share_access: ShareAccess,
+    /// Desired access requested by this open — what it needs.
+    pub desired_access: DesiredAccess,
     /// Whether this open requested delete-on-close disposition.
     pub delete_on_close: bool,
 }
@@ -97,15 +100,34 @@ impl fmt::Display for OpenEntry {
     }
 }
 
+/// Result of removing an open from the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveResult {
+    /// Whether the open was found and removed.
+    pub found: bool,
+    /// Whether this was the last open for the file (no remaining opens).
+    pub was_last: bool,
+    /// Whether any open for this file (including the one being removed)
+    /// had `delete_on_close` set. Only meaningful when `found` is true.
+    pub any_delete_on_close: bool,
+}
+
 /// Global open table tracking every outstanding file open keyed by file
 /// identity, used to enforce share-mode conflicts across sessions.
 ///
 /// All mutating and querying methods take an async lock on the inner map.
 /// The write lock is held for the duration of a `check_and_add` so that the
 /// check-then-add step is atomic with respect to concurrent openers.
+///
+/// A `delete_pending` set tracks files with an outstanding delete-on-close
+/// disposition. This persists beyond the removal of the entry that set it,
+/// so the caller can determine at last-close whether to unlink the file.
 #[derive(Debug)]
 pub struct OpenTable {
     opens: RwLock<HashMap<FileId, Vec<OpenEntry>>>,
+    /// Files with at least one open that has delete_on_close = true.
+    /// Survives entry removal until the last close clears it.
+    delete_pending: RwLock<HashSet<FileId>>,
 }
 
 impl OpenTable {
@@ -113,18 +135,17 @@ impl OpenTable {
     pub fn new() -> Self {
         Self {
             opens: RwLock::new(HashMap::new()),
+            delete_pending: RwLock::new(HashSet::new()),
         }
     }
 
     /// Check whether `entry` conflicts with existing opens of the same file,
     /// and if not, atomically add it to the table.
     ///
-    /// The new open's requested access is taken from `entry.share_access`:
-    /// each set flag (read/write/delete) is an access the new open requires.
-    /// For the open to succeed, **every** existing open of the file must have
-    /// granted the corresponding share-access flag. If any existing open did
-    /// not share a requested access, an [`OpenConflict`] is returned and the
-    /// open is **not** added.
+    /// Per MS-SMB2 3.3.5.15, sharing is bidirectional: for each existing
+    /// open, (a) the existing open must share the new open's desired access,
+    /// and (b) the new open must share the existing open's desired access.
+    /// A conflict in either direction denies the open with [`OpenConflict`].
     #[instrument(skip(self, file_id, entry), fields(file_id = ?file_id, open_id = ?entry.open_id, session = entry.session_id))]
     pub async fn check_and_add(
         &self,
@@ -133,9 +154,14 @@ impl OpenTable {
     ) -> Result<(), OpenConflict> {
         let mut map = self.opens.write().await;
         if let Some(existing) = map.get(&file_id) {
+            // Categorize the new open's desired access into read/write/delete.
+            let new_wants_read = entry.desired_access.read || entry.desired_access.generic_read || entry.desired_access.generic_all;
+            let new_wants_write = entry.desired_access.write || entry.desired_access.generic_write || entry.desired_access.generic_all;
+            let new_wants_delete = entry.desired_access.delete || entry.desired_access.generic_all;
+
             for ex in existing {
-                // New open wants READ: all existing opens must share read.
-                if entry.share_access.read && !ex.share_access.read {
+                // (a) Existing must share what the new open wants.
+                if new_wants_read && !ex.share_access.read {
                     debug!(
                         file_id = ?file_id,
                         new_open_id = ?entry.open_id,
@@ -148,8 +174,7 @@ impl OpenTable {
                         existing_session_id: ex.session_id,
                     });
                 }
-                // New open wants WRITE: all existing opens must share write.
-                if entry.share_access.write && !ex.share_access.write {
+                if new_wants_write && !ex.share_access.write {
                     debug!(
                         file_id = ?file_id,
                         new_open_id = ?entry.open_id,
@@ -162,8 +187,7 @@ impl OpenTable {
                         existing_session_id: ex.session_id,
                     });
                 }
-                // New open wants DELETE: all existing opens must share delete.
-                if entry.share_access.delete && !ex.share_access.delete {
+                if new_wants_delete && !ex.share_access.delete {
                     debug!(
                         file_id = ?file_id,
                         new_open_id = ?entry.open_id,
@@ -176,24 +200,147 @@ impl OpenTable {
                         existing_session_id: ex.session_id,
                     });
                 }
+
+                // (b) New must share what the existing open wants.
+                let ex_wants_read = ex.desired_access.read || ex.desired_access.generic_read || ex.desired_access.generic_all;
+                let ex_wants_write = ex.desired_access.write || ex.desired_access.generic_write || ex.desired_access.generic_all;
+                let ex_wants_delete = ex.desired_access.delete || ex.desired_access.generic_all;
+
+                if ex_wants_read && !entry.share_access.read {
+                    debug!(
+                        file_id = ?file_id,
+                        new_open_id = ?entry.open_id,
+                        existing_open_id = ?ex.open_id,
+                        "sharing conflict: new open does not share existing READ"
+                    );
+                    return Err(OpenConflict::ReadNotShared {
+                        file_id,
+                        existing_open_id: ex.open_id,
+                        existing_session_id: ex.session_id,
+                    });
+                }
+                if ex_wants_write && !entry.share_access.write {
+                    debug!(
+                        file_id = ?file_id,
+                        new_open_id = ?entry.open_id,
+                        existing_open_id = ?ex.open_id,
+                        "sharing conflict: new open does not share existing WRITE"
+                    );
+                    return Err(OpenConflict::WriteNotShared {
+                        file_id,
+                        existing_open_id: ex.open_id,
+                        existing_session_id: ex.session_id,
+                    });
+                }
+                if ex_wants_delete && !entry.share_access.delete {
+                    debug!(
+                        file_id = ?file_id,
+                        new_open_id = ?entry.open_id,
+                        existing_open_id = ?ex.open_id,
+                        "sharing conflict: new open does not share existing DELETE"
+                    );
+                    return Err(OpenConflict::DeleteNotShared {
+                        file_id,
+                        existing_open_id: ex.open_id,
+                        existing_session_id: ex.session_id,
+                    });
+                }
             }
         }
         // No conflict: insert the new open.
-        map.entry(file_id).or_default().push(entry);
+        map.entry(file_id).or_default().push(entry.clone());
+        // Track delete-pending state.
+        if entry.delete_on_close {
+            drop(map);
+            self.delete_pending.write().await.insert(file_id);
+        }
         Ok(())
     }
 
     /// Remove an open (by `open_id`) from the file's open list.
     ///
+    /// Returns a [`RemoveResult`] indicating whether the open was found,
+    /// whether it was the last open for the file, and whether the file has
+    /// a delete-on-close disposition pending (from any open, including ones
+    /// already removed).
+    ///
     /// If the removed entry was the last for a file, the file key is pruned
-    /// from the map to keep the table compact.
-    #[instrument(skip(self, file_id))]
-    pub async fn remove(&self, file_id: FileId, open_id: OpenId) {
+    /// from the opens map. The `delete_pending` set is cleared when the
+    /// last open is removed, so the caller can check `any_delete_on_close`
+    /// to decide whether to unlink.
+    #[instrument(skip(self, file_id), fields(was_last, any_doc))]
+    pub async fn remove(&self, file_id: FileId, open_id: OpenId) -> RemoveResult {
         let mut map = self.opens.write().await;
         if let Some(vec) = map.get_mut(&file_id) {
+            // Check if the open_id is actually present before removing.
+            let was_present = vec.iter().any(|e| e.open_id == open_id);
+            if !was_present {
+                return RemoveResult {
+                    found: false,
+                    was_last: false,
+                    any_delete_on_close: false,
+                };
+            }
+            // Check the delete_pending set — this persists across entries.
+            let any_doc = self.delete_pending.read().await.contains(&file_id);
             vec.retain(|e| e.open_id != open_id);
-            if vec.is_empty() {
+            let was_last = vec.is_empty();
+            if was_last {
                 map.remove(&file_id);
+                // Clear delete_pending for this file — the caller will
+                // handle the actual delete based on any_delete_on_close.
+                drop(map);
+                self.delete_pending.write().await.remove(&file_id);
+            } else {
+                // If no remaining entries have doc, clear the pending flag.
+                let any_remaining_doc = vec.iter().any(|e| e.delete_on_close);
+                if !any_remaining_doc {
+                    drop(map);
+                    self.delete_pending.write().await.remove(&file_id);
+                }
+            }
+            tracing::Span::current().record("was_last", was_last);
+            tracing::Span::current().record("any_doc", any_doc);
+            RemoveResult {
+                found: true,
+                was_last,
+                any_delete_on_close: any_doc,
+            }
+        } else {
+            RemoveResult {
+                found: false,
+                was_last: false,
+                any_delete_on_close: false,
+            }
+        }
+    }
+
+    /// Update the `delete_on_close` flag for an existing open entry.
+    ///
+    /// Called when a SET_INFO FileDispositionInformation sets or clears
+    /// the delete-on-close disposition. If the open is not found, this is
+    /// a no-op (the caller may have already closed it).
+    #[instrument(skip(self, file_id))]
+    pub async fn update_delete_on_close(
+        &self,
+        file_id: FileId,
+        open_id: OpenId,
+        delete: bool,
+    ) {
+        let mut map = self.opens.write().await;
+        if let Some(vec) = map.get_mut(&file_id) {
+            if let Some(entry) = vec.iter_mut().find(|e| e.open_id == open_id) {
+                entry.delete_on_close = delete;
+            }
+            // Update the delete_pending set: if any entry has doc, add;
+            // if none have doc, remove.
+            let any_doc = vec.iter().any(|e| e.delete_on_close);
+            drop(map);
+            let mut dp = self.delete_pending.write().await;
+            if any_doc {
+                dp.insert(file_id);
+            } else {
+                dp.remove(&file_id);
             }
         }
     }
@@ -204,10 +351,7 @@ impl OpenTable {
     /// delete (and is used by the create path to honor the disposition).
     #[instrument(skip(self, file_id))]
     pub async fn is_delete_pending(&self, file_id: FileId) -> bool {
-        let map = self.opens.read().await;
-        map.get(&file_id)
-            .map(|vec| vec.iter().any(|e| e.delete_on_close))
-            .unwrap_or(false)
+        self.delete_pending.read().await.contains(&file_id)
     }
 
     /// Number of outstanding opens for a file identity.
@@ -227,7 +371,7 @@ impl Default for OpenTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rssmb_vfs::{FileId, OpenId, ShareAccess};
+    use rssmb_vfs::{FileId, OpenId, ShareAccess, DesiredAccess};
 
     fn fid(n: u64) -> FileId {
         FileId(n)
@@ -236,11 +380,34 @@ mod tests {
         OpenId(n)
     }
     fn entry(open_id: u64, session_id: u64, share: ShareAccess) -> OpenEntry {
+        // Test helper: desired_access mirrors share_access so that the
+        // bidirectional check tests both directions. An open that declares
+        // share_access.read = true also "wants" read.
+        let desired = DesiredAccess {
+            read: share.read,
+            write: share.write,
+            delete: share.delete,
+            ..Default::default()
+        };
         OpenEntry {
             open_id: oid(open_id),
             session_id,
             tree_id: 1,
             share_access: share,
+            desired_access: desired,
+            delete_on_close: false,
+        }
+    }
+
+    /// Like `entry` but with explicit desired access (for tests that need
+    /// share and desired to differ).
+    fn entry_da(open_id: u64, session_id: u64, share: ShareAccess, desired: DesiredAccess) -> OpenEntry {
+        OpenEntry {
+            open_id: oid(open_id),
+            session_id,
+            tree_id: 1,
+            share_access: share,
+            desired_access: desired,
             delete_on_close: false,
         }
     }
@@ -261,11 +428,18 @@ mod tests {
             .check_and_add(fid(1), entry(1, 100, ShareAccess::all()))
             .await
             .unwrap();
-        // Second open wants read; existing shares read -> ok.
+        // Second open shares everything, wants only read.
+        // Bidirectional: existing wants read → new shares read (yes).
+        // New wants read → existing shares read (yes). OK.
+        let new_entry = entry_da(
+            2, 200,
+            ShareAccess::all(),
+            DesiredAccess { read: true, ..Default::default() },
+        );
         table
-            .check_and_add(fid(1), entry(2, 200, ShareAccess { read: true, write: false, delete: false }))
+            .check_and_add(fid(1), new_entry)
             .await
-            .expect("read on read-shared should succeed");
+            .expect("compatible opens should succeed");
         assert_eq!(table.count(fid(1)).await, 2);
     }
 
@@ -342,7 +516,9 @@ mod tests {
             .check_and_add(fid(4), entry(1, 100, ShareAccess::none()))
             .await
             .unwrap();
-        table.remove(fid(4), oid(1)).await;
+        let res = table.remove(fid(4), oid(1)).await;
+        assert!(res.found);
+        assert!(res.was_last);
         assert_eq!(table.count(fid(4)).await, 0);
         table
             .check_and_add(fid(4), entry(2, 200, ShareAccess::all()))
@@ -363,6 +539,10 @@ mod tests {
             .unwrap();
         table.remove(fid(5), oid(1)).await;
         assert_eq!(table.count(fid(5)).await, 1);
+        // The remaining open is not the last; remove returns was_last=false.
+        let res = table.remove(fid(5), oid(2)).await;
+        assert!(res.found);
+        assert!(res.was_last);
     }
 
     #[tokio::test]
@@ -381,7 +561,9 @@ mod tests {
         // Still pending because the first open is doc.
         assert!(table.is_delete_pending(fid(6)).await);
         // Remove the delete-on-close open.
-        table.remove(fid(6), oid(1)).await;
+        let res = table.remove(fid(6), oid(1)).await;
+        assert!(res.found);
+        assert!(res.any_delete_on_close);
         assert!(!table.is_delete_pending(fid(6)).await);
     }
 
@@ -412,22 +594,25 @@ mod tests {
     #[tokio::test]
     async fn any_existing_non_shared_blocks() {
         let table = OpenTable::new();
-        // First open shares everything.
-        table
-            .check_and_add(fid(8), entry(1, 100, ShareAccess::all()))
-            .await
-            .unwrap();
-        // Second open shares everything except read.
-        table
-            .check_and_add(
-                fid(8),
-                entry(2, 200, ShareAccess { read: false, write: true, delete: true }),
-            )
-            .await
-            .unwrap();
-        // New read open conflicts because open 2 does not share read.
+        // First open: shares everything, wants nothing (just holds the file).
+        let first = entry_da(1, 100, ShareAccess::all(), DesiredAccess::default());
+        table.check_and_add(fid(8), first).await.unwrap();
+        // Second open: shares everything except read, wants nothing.
+        let second = entry_da(
+            2, 200,
+            ShareAccess { read: false, write: true, delete: true },
+            DesiredAccess::default(),
+        );
+        table.check_and_add(fid(8), second).await.unwrap();
+        // New open: shares all, wants only read. (a): new wants read,
+        // open 2 doesn't share read → conflict.
+        let new_entry = entry_da(
+            3, 300,
+            ShareAccess::all(),
+            DesiredAccess { read: true, ..Default::default() },
+        );
         let err = table
-            .check_and_add(fid(8), entry(3, 300, ShareAccess { read: true, write: false, delete: false }))
+            .check_and_add(fid(8), new_entry)
             .await
             .expect_err("should conflict with open 2");
         match err {
@@ -474,8 +659,15 @@ mod tests {
         e.delete_on_close = true;
         table.check_and_add(fid(10), e).await.unwrap();
         assert!(table.is_delete_pending(fid(10)).await);
+        // New open: shares all, wants only read. Existing shares all → (a) OK.
+        // Existing wants R/W/D → new shares all → (b) OK.
+        let new_entry = entry_da(
+            2, 200,
+            ShareAccess::all(),
+            DesiredAccess { read: true, ..Default::default() },
+        );
         table
-            .check_and_add(fid(10), entry(2, 200, ShareAccess { read: true, write: false, delete: false }))
+            .check_and_add(fid(10), new_entry)
             .await
             .expect("existing shares all, so read open succeeds");
     }
@@ -483,22 +675,25 @@ mod tests {
     #[tokio::test]
     async fn write_blocked_by_one_of_two_existing_opens() {
         let table = OpenTable::new();
-        // First open shares all.
-        table
-            .check_and_add(fid(11), entry(1, 100, ShareAccess::all()))
-            .await
-            .unwrap();
-        // Second open shares read+delete but NOT write.
-        table
-            .check_and_add(
-                fid(11),
-                entry(2, 200, ShareAccess { read: true, write: false, delete: true }),
-            )
-            .await
-            .unwrap();
-        // New open wants write; blocked by open 2.
+        // First open: shares all, wants nothing.
+        let first = entry_da(1, 100, ShareAccess::all(), DesiredAccess::default());
+        table.check_and_add(fid(11), first).await.unwrap();
+        // Second open: shares read+delete but NOT write, wants nothing.
+        let second = entry_da(
+            2, 200,
+            ShareAccess { read: true, write: false, delete: true },
+            DesiredAccess::default(),
+        );
+        table.check_and_add(fid(11), second).await.unwrap();
+        // New open: shares all, wants only write. (b) checks pass (new
+        // shares all). (a): new wants write, open 2 doesn't share write.
+        let new_entry = entry_da(
+            3, 300,
+            ShareAccess::all(),
+            DesiredAccess { write: true, ..Default::default() },
+        );
         let err = table
-            .check_and_add(fid(11), entry(3, 300, ShareAccess { read: false, write: true, delete: false }))
+            .check_and_add(fid(11), new_entry)
             .await
             .expect_err("write should be blocked by open 2");
         match err {
@@ -529,5 +724,149 @@ mod tests {
         // Remove one; count drops.
         table.remove(fid(12), oid(2)).await;
         assert_eq!(table.count(fid(12)).await, 2);
+    }
+
+    #[tokio::test]
+    async fn remove_returns_any_delete_on_close() {
+        let table = OpenTable::new();
+        // First open: delete_on_close = true, shares all.
+        let mut e1 = entry(1, 100, ShareAccess::all());
+        e1.delete_on_close = true;
+        table.check_and_add(fid(20), e1).await.unwrap();
+        // Second open: no delete_on_close, shares all.
+        table
+            .check_and_add(fid(20), entry(2, 200, ShareAccess::all()))
+            .await
+            .unwrap();
+        // Remove the first (doc) open — not the last, any_doc should be true.
+        let res = table.remove(fid(20), oid(1)).await;
+        assert!(res.found);
+        assert!(!res.was_last);
+        assert!(res.any_delete_on_close);
+        // Remove the second — last open, any_doc should be false now (the doc
+        // entry was already removed).
+        let res = table.remove(fid(20), oid(2)).await;
+        assert!(res.found);
+        assert!(res.was_last);
+        assert!(!res.any_delete_on_close);
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_returns_not_found() {
+        let table = OpenTable::new();
+        let res = table.remove(fid(99), oid(99)).await;
+        assert!(!res.found);
+        assert!(!res.was_last);
+        assert!(!res.any_delete_on_close);
+    }
+
+    #[tokio::test]
+    async fn update_delete_on_close_sets_and_clears() {
+        let table = OpenTable::new();
+        table
+            .check_and_add(fid(30), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        assert!(!table.is_delete_pending(fid(30)).await);
+        // Set delete_on_close on the open.
+        table.update_delete_on_close(fid(30), oid(1), true).await;
+        assert!(table.is_delete_pending(fid(30)).await);
+        // Clear it.
+        table.update_delete_on_close(fid(30), oid(1), false).await;
+        assert!(!table.is_delete_pending(fid(30)).await);
+    }
+
+    #[tokio::test]
+    async fn update_delete_on_close_nonexistent_is_noop() {
+        let table = OpenTable::new();
+        // Should not panic for a nonexistent file/open.
+        table.update_delete_on_close(fid(99), oid(99), true).await;
+        assert!(!table.is_delete_pending(fid(99)).await);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_check_existing_wants_read_new_doesnt_share() {
+        let table = OpenTable::new();
+        // Existing open: wants read (desired.read=true), shares all.
+        let existing = OpenEntry {
+            open_id: oid(1),
+            session_id: 100,
+            tree_id: 1,
+            share_access: ShareAccess::all(),
+            desired_access: DesiredAccess { read: true, ..Default::default() },
+            delete_on_close: false,
+        };
+        table.check_and_add(fid(40), existing).await.unwrap();
+        // New open: shares nothing, wants nothing.
+        let new_entry = OpenEntry {
+            open_id: oid(2),
+            session_id: 200,
+            tree_id: 1,
+            share_access: ShareAccess::none(),
+            desired_access: DesiredAccess::default(),
+            delete_on_close: false,
+        };
+        let err = table
+            .check_and_add(fid(40), new_entry)
+            .await
+            .expect_err("new open doesn't share existing's read");
+        assert!(matches!(err, OpenConflict::ReadNotShared { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_open_id_not_in_existing_bucket_returns_not_found() {
+        let table = OpenTable::new();
+        table
+            .check_and_add(fid(50), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        // Remove a different open_id from the same file bucket.
+        let res = table.remove(fid(50), oid(99)).await;
+        assert!(!res.found);
+        // The original open is still there.
+        assert_eq!(table.count(fid(50)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_on_close_survives_intermediate_close() {
+        // Open A (doc) and B (no doc). Close A (not last). Close B (last).
+        // The last close must report any_delete_on_close correctly.
+        let table = OpenTable::new();
+        let mut a = entry(1, 100, ShareAccess::all());
+        a.delete_on_close = true;
+        table.check_and_add(fid(60), a).await.unwrap();
+        table
+            .check_and_add(fid(60), entry(2, 200, ShareAccess::all()))
+            .await
+            .unwrap();
+        assert!(table.is_delete_pending(fid(60)).await);
+        // Close A (doc) — not the last.
+        let res_a = table.remove(fid(60), oid(1)).await;
+        assert!(res_a.found);
+        assert!(!res_a.was_last);
+        assert!(res_a.any_delete_on_close);
+        // is_delete_pending should be false now (no remaining doc opens).
+        assert!(!table.is_delete_pending(fid(60)).await);
+        // Close B — last close. any_doc should be false because the doc
+        // open was already removed and no remaining opens have doc.
+        let res_b = table.remove(fid(60), oid(2)).await;
+        assert!(res_b.found);
+        assert!(res_b.was_last);
+        assert!(!res_b.any_delete_on_close);
+    }
+
+    #[tokio::test]
+    async fn delete_on_close_at_last_close_with_doc_still_set() {
+        // Open A (doc) only. Close A (last). any_doc must be true.
+        let table = OpenTable::new();
+        let mut a = entry(1, 100, ShareAccess::all());
+        a.delete_on_close = true;
+        table.check_and_add(fid(70), a).await.unwrap();
+        assert!(table.is_delete_pending(fid(70)).await);
+        let res = table.remove(fid(70), oid(1)).await;
+        assert!(res.found);
+        assert!(res.was_last);
+        assert!(res.any_delete_on_close);
+        assert!(!table.is_delete_pending(fid(70)).await);
     }
 }

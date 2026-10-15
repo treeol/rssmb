@@ -167,6 +167,8 @@ fn make_config() -> (ServerConfig, tempfile::TempDir) {
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         },
     );
 

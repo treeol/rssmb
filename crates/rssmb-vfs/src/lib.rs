@@ -73,7 +73,7 @@ impl ShareAccess {
 }
 
 /// Desired access mask (subset of FILE_ACCESS_MASK).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DesiredAccess {
     pub read: bool,
     pub write: bool,

@@ -217,6 +217,8 @@ mod tests {
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         };
         let tree = Arc::new(Tree::new(1, 1, "test".to_string(), share, vfs));
         session.add_tree(1, tree.clone()).await;
@@ -241,6 +243,8 @@ mod tests {
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         };
         let tree = Arc::new(Tree::new(1, 1, "share".to_string(), share, vfs));
         session.add_tree(1, tree).await;
@@ -255,6 +259,8 @@ mod tests {
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         };
         session.add_tree(2, Arc::new(Tree::new(2, 1, "other".to_string(), share2, vfs2))).await;
         assert_eq!(session.trees.read().await.len(), 2);

@@ -490,6 +490,43 @@ impl Vfs for LocalFs {
             );
         }
 
+        // Apply DOS attributes — only when the info class is FileBasicInfo.
+        // Other SET_INFO classes (EOF, Disposition) should not touch attrs.
+        // - READONLY ↔ remove owner write bit (Unix mode bit)
+        // - HIDDEN/SYSTEM/ARCHIVE: stored in xattr user.DOSATTRIB
+        //   (Samba-compatible format). Requires the xattr crate on Unix.
+        //   For now, only READONLY is applied; the rest are accepted but
+        //   not persisted (Phase 2.8 partial).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use cap_std::fs::PermissionsExt as CapPermissionsExt;
+            let readonly = info.attributes.read_only;
+            // Only apply attribute changes when the caller is setting
+            // FileBasicInfo (class 4). For other classes, skip to avoid
+            // accidentally clearing READONLY on an EOF truncate.
+            let is_basic_info = matches!(_class, InfoClass::FileBasicInfo);
+            if is_basic_info {
+                let meta = handle
+                    .file
+                    .metadata()
+                    .await
+                    .map_err(|e| VfsError::Io(format!("metadata for attrs: {e}")))?;
+                let mode = meta.permissions().mode();
+                let new_mode = if readonly {
+                    mode & !0o200
+                } else {
+                    mode | 0o200
+                };
+                let perms = CapPermissionsExt::from_mode(new_mode);
+                let rel = handle.rel_path.clone();
+                drop(opens);
+                if let Err(e) = self.dir.set_permissions(&rel, perms) {
+                    return Err(VfsError::Io(format!("set_permissions: {e}")));
+                }
+            }
+        }
+
         Ok(())
     }
 

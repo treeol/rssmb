@@ -925,6 +925,10 @@ impl Connection {
             if entry.is_pipe {
                 continue;
             }
+            // Remove from the global open table.
+            if let Some(fid) = entry.file_id {
+                state.open_table.remove(fid, entry.open_id).await;
+            }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {
@@ -1286,6 +1290,7 @@ mod tests {
             tree_id: 3,
             open_id,
             vfs: vfs.clone(),
+            file_id: None,
             dir_cursor: Default::default(),
             path: "f.txt".into(),
             is_pipe: false,

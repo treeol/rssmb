@@ -248,9 +248,22 @@ pub struct ShareConfig {
     /// - `within`: follow symlinks only if their target is within the share root
     #[serde(default)]
     pub follow_symlinks: FollowSymlinks,
+
+    /// Whether to fsync on FLUSH and close (default: true). When false, FLUSH
+    /// returns success without syncing to disk — faster but less durable.
+    /// Samba has the same knob (`strict sync`).
+    #[serde(default = "default_true")]
+    pub strict_sync: bool,
+
+    /// Whether file name lookup is case-sensitive (default: false).
+    /// Windows and macOS clients expect case-insensitive lookup. Set to
+    /// true only if all clients are cifs.ko on a case-sensitive filesystem.
+    #[serde(default = "default_false")]
+    pub case_sensitive: bool,
 }
 
 fn default_true() -> bool { true }
+fn default_false() -> bool { false }
 
 impl ServerConfig {
     /// Load from TOML string.
@@ -308,6 +321,8 @@ impl ServerConfig {
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         });
 
         Self {
@@ -474,6 +489,8 @@ disabled = false
             valid_users: vec![],
             encrypt_data: true,
             follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         });
         assert!(config.validate().is_err(), "encrypt_data under disabled must be rejected");
     }
@@ -492,6 +509,8 @@ disabled = false
             valid_users: vec![],
             encrypt_data: true,
             follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         });
         assert!(config.validate().is_ok());
     }
@@ -509,6 +528,8 @@ disabled = false
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         });
         assert!(config.validate().is_err(), "IPC$ share name must be rejected");
     }
@@ -526,6 +547,8 @@ disabled = false
             valid_users: vec![],
             encrypt_data: false,
             follow_symlinks: FollowSymlinks::Never,
+            strict_sync: true,
+            case_sensitive: false,
         });
         assert!(config.validate().is_err(), "ipc$ share name must be rejected (case-insensitive)");
     }
