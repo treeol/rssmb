@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::fs::OpenOptions as CapOpenOptions;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -100,23 +101,28 @@ pub struct LocalFs {
     dir: cap_std::fs::Dir,
     /// Symlink policy.
     follow_symlinks: FollowSymlinks,
+    /// Whether file name lookup is case-sensitive.
+    case_sensitive: bool,
     opens: Mutex<HashMap<OpenId, FileHandle>>,
     next_open_id: Mutex<u64>,
 }
 
 impl LocalFs {
-    /// Construct a `LocalFs` rooted at `root` with the given symlink policy.
-    /// The root is opened via `cap_std::fs::Dir::open_ambient_dir` at
-    /// construction time; all subsequent operations are confined beneath it.
+    /// Construct a `LocalFs` rooted at `root` with the given symlink and
+    /// case-sensitivity policies. The root is opened via
+    /// `cap_std::fs::Dir::open_ambient_dir` at construction time; all
+    /// subsequent operations are confined beneath it.
     pub fn new(
         root: impl AsRef<Path>,
         follow_symlinks: FollowSymlinks,
+        case_sensitive: bool,
     ) -> Result<Self, VfsError> {
         let dir = cap_std::fs::Dir::open_ambient_dir(root.as_ref(), cap_std::ambient_authority())
             .map_err(|e| VfsError::Io(format!("open share root: {e}")))?;
         Ok(Self {
             dir,
             follow_symlinks,
+            case_sensitive,
             opens: Mutex::new(HashMap::new()),
             next_open_id: Mutex::new(1),
         })
@@ -152,6 +158,66 @@ impl LocalFs {
         // resolution. A symlink targeting outside the share root is
         // refused by the kernel. No extra check needed.
         Ok(())
+    }
+
+    /// On a case-insensitive share, resolve a path that doesn't exist exactly
+    /// to a case-insensitive match in the parent directory.
+    ///
+    /// Returns `Some(resolved_path)` if a single case-insensitive match is
+    /// found, or `None` if no match or the share is case-sensitive.
+    ///
+    /// If multiple names match case-insensitively (ambiguity), returns the
+    /// exact match if one exists, otherwise `None` (the caller will get
+    /// `NotFound` — which is safer than silently picking one).
+    fn resolve_case_insensitive(&self, rel: &Path) -> Option<PathBuf> {
+        if self.case_sensitive {
+            return None;
+        }
+
+        let file_name = rel.file_name()?.to_str()?;
+        let parent = rel.parent()?;
+
+        // Open the parent directory (or use root for top-level).
+        let parent_dir = if parent.as_os_str().is_empty() || parent == Path::new(".") {
+            self.dir.entries().ok()?
+        } else {
+            self.dir.open_dir(parent).ok()?.entries().ok()?
+        };
+
+        let mut exact_match = false;
+        let mut ci_match: Option<OsString> = None;
+        let lower = file_name.to_lowercase();
+
+        for entry in parent_dir {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name_str = name.to_str()?;
+            if name_str == file_name {
+                exact_match = true;
+                break;
+            }
+            if name_str.to_lowercase() == lower {
+                if ci_match.is_some() {
+                    // Ambiguity: two case-insensitive matches. Don't resolve.
+                    return None;
+                }
+                ci_match = Some(name);
+            }
+        }
+
+        if exact_match {
+            // The exact name exists but symlink_metadata said it doesn't —
+            // this shouldn't happen, but if it does, use the exact path.
+            return None;
+        }
+
+        if let Some(matched) = ci_match {
+            let mut resolved = parent.to_path_buf();
+            resolved.push(matched);
+            Some(resolved)
+        } else {
+            None
+        }
     }
 
     /// Extract the file name from a relative path.
@@ -197,9 +263,24 @@ impl Vfs for LocalFs {
         // Check if the target exists (using symlink_metadata to detect
         // symlinks without following them — cap-std's exists() uses
         // openat2 which refuses symlink-escaped paths, returning false).
-        let exists = self.dir.symlink_metadata(&rel).is_ok();
+        let mut exists = self.dir.symlink_metadata(&rel).is_ok();
         if exists {
             self.check_symlink_policy(&rel)?;
+        }
+
+        // Case-insensitive lookup: if the exact path doesn't exist and the
+        // share is case-insensitive, scan the parent directory for a match.
+        // This lets Windows/macOS clients access files when the case doesn't
+        // match exactly.
+        let mut effective_rel = rel.clone();
+        if !exists && !self.case_sensitive {
+            if let Some(ci_rel) = self.resolve_case_insensitive(&rel) {
+                if self.dir.symlink_metadata(&ci_rel).is_ok() {
+                    effective_rel = ci_rel;
+                    exists = true;
+                    self.check_symlink_policy(&effective_rel)?;
+                }
+            }
         }
 
         let is_dir = args.create_options.directory;
@@ -208,7 +289,7 @@ impl Vfs for LocalFs {
 
         // Determine target type if it exists.
         let target_is_dir = if exists {
-            self.is_dir_rel(&rel).unwrap_or(wants_dir)
+            self.is_dir_rel(&effective_rel).unwrap_or(wants_dir)
         } else {
             wants_dir
         };
@@ -231,7 +312,7 @@ impl Vfs for LocalFs {
             CreateDisposition::OpenIf => {}
             CreateDisposition::Supersede => {
                 if exists && !target_is_dir {
-                    let _ = self.dir.remove_file(&rel);
+                    let _ = self.dir.remove_file(&effective_rel);
                     needs_create = true;
                 }
             }
@@ -246,7 +327,7 @@ impl Vfs for LocalFs {
 
         if wants_dir && !exists {
             self.dir
-                .create_dir(&rel)
+                .create_dir(&effective_rel)
                 .map_err(|e| VfsError::Io(format!("create_dir: {e}")))?;
         } else if wants_file && exists && target_is_dir {
             return Err(VfsError::IsDirectory);
@@ -284,15 +365,15 @@ impl Vfs for LocalFs {
         }
 
         // Open via cap-std — confined to the share root by openat2.
-        // For the root directory (rel == "."), we open the Dir itself
-        // and convert to a File for handle tracking.
-        let cap_file = if rel == Path::new(".") {
+        // For the root directory (effective_rel == "."), we open the Dir
+        // itself and convert to a File for handle tracking.
+        let cap_file = if effective_rel == Path::new(".") {
             self.dir
                 .open_dir(".")
                 .map(|d| cap_std::fs::File::from_std(d.into_std_file()))
                 .map_err(|e| VfsError::Io(format!("open root dir: {e}")))?
         } else {
-            self.dir.open_with(&rel, &opts).map_err(|e| {
+            self.dir.open_with(&effective_rel, &opts).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     VfsError::NotFound
                 } else if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -307,7 +388,7 @@ impl Vfs for LocalFs {
         // confined open; the tokio File wraps the same fd.
         let file = TokioFile::from_std(cap_file.into_std());
 
-        let file_name = Self::file_name_from_rel(&rel);
+        let file_name = Self::file_name_from_rel(&effective_rel);
 
         let open_id = self.next_open_id().await;
         let mut opens = self.opens.lock().await;
@@ -315,7 +396,7 @@ impl Vfs for LocalFs {
             open_id,
             FileHandle {
                 file,
-                rel_path: rel,
+                rel_path: effective_rel,
                 file_name,
                 is_directory: target_is_dir,
                 delete_on_close: args.create_options.delete_on_close,
@@ -378,14 +459,24 @@ impl Vfs for LocalFs {
         let mut opens = self.opens.lock().await;
         let handle = opens.remove(&open).ok_or(VfsError::InvalidHandle)?;
         if handle.delete_on_close {
-            if handle.is_directory {
-                let _ = self.dir.remove_dir(&handle.rel_path);
+            let rel = handle.rel_path.clone();
+            let is_dir = handle.is_directory;
+            // TokioFile is dropped here, closing the fd.
+            drop(handle);
+            drop(opens);
+            if is_dir {
+                self.dir
+                    .remove_dir(&rel)
+                    .map_err(|e| VfsError::Io(format!("close delete_on_close remove_dir: {e}")))?;
             } else {
-                let _ = self.dir.remove_file(&handle.rel_path);
+                self.dir
+                    .remove_file(&rel)
+                    .map_err(|e| VfsError::Io(format!("close delete_on_close remove_file: {e}")))?;
             }
+        } else {
+            // TokioFile is dropped here, closing the fd.
+            drop(handle);
         }
-        // TokioFile is dropped here, closing the fd.
-        drop(handle);
         Ok(())
     }
 
@@ -805,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_write_read_close() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
 
         let args = CreateArgs {
             disposition: CreateDisposition::Create,
@@ -828,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_existing() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
 
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
@@ -856,15 +947,67 @@ mod tests {
     #[tokio::test]
     async fn test_open_missing_fails() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let result = fs.create("", "nope.txt", &CreateArgs::open_readonly()).await;
+        assert!(matches!(result, Err(VfsError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_open() {
+        let dir = tmp_root();
+        // case_sensitive = false → case-insensitive lookup
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+
+        // Create a file with exact case.
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                read_attributes: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open = fs.create("", "MyFile.txt", &create).await.unwrap();
+        fs.close(open).await.unwrap();
+
+        // Open with different case — should succeed.
+        let open2 = fs
+            .create("", "myfile.txt", &CreateArgs::open_readonly())
+            .await
+            .expect("case-insensitive open should succeed");
+        fs.close(open2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_case_sensitive_open_misses() {
+        let dir = tmp_root();
+        // case_sensitive = true → exact match only
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, true).unwrap();
+
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                read_attributes: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open = fs.create("", "MyFile.txt", &create).await.unwrap();
+        fs.close(open).await.unwrap();
+
+        // Open with different case — should fail with NotFound.
+        let result = fs.create("", "myfile.txt", &CreateArgs::open_readonly()).await;
         assert!(matches!(result, Err(VfsError::NotFound)));
     }
 
     #[tokio::test]
     async fn test_create_existing_fails() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
@@ -878,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_traversal_rejected() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let result = fs
             .create("", "..\\..\\escape.txt", &CreateArgs::open_readonly())
             .await;
@@ -888,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_name_rejected() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let result = fs
             .create("", "file\x00.txt", &CreateArgs::open_readonly())
             .await;
@@ -898,7 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_info() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             desired_access: DesiredAccess {
@@ -924,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_id() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
@@ -938,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_query_dir() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
 
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
@@ -979,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             desired_access: DesiredAccess {
@@ -1000,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn test_rename() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             desired_access: DesiredAccess {
@@ -1028,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_on_close() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let mut args = CreateArgs {
             disposition: CreateDisposition::Create,
             desired_access: DesiredAccess {
@@ -1049,7 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn test_ioctl_not_supported() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
@@ -1063,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             desired_access: DesiredAccess {
@@ -1083,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn test_lock_unlock() {
         let dir = tmp_root();
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let create = CreateArgs {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
@@ -1132,7 +1275,7 @@ mod tests {
         // Create a symlink inside the share pointing outside.
         symlink(&outside_target, dir.path().join("link.txt")).unwrap();
 
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let result = fs
             .create("", "link.txt", &CreateArgs::open_readonly())
             .await;
@@ -1151,7 +1294,7 @@ mod tests {
         std::fs::write(dir.path().join("real.txt"), b"content").unwrap();
         symlink("real.txt", dir.path().join("link.txt")).unwrap();
 
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::WithinShare).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::WithinShare, false).unwrap();
         let open = fs
             .create("", "link.txt", &CreateArgs::open_readonly())
             .await
@@ -1172,7 +1315,7 @@ mod tests {
 
         symlink(&outside_target, dir.path().join("link.txt")).unwrap();
 
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::WithinShare).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::WithinShare, false).unwrap();
         let result = fs
             .create("", "link.txt", &CreateArgs::open_readonly())
             .await;
@@ -1190,7 +1333,7 @@ mod tests {
         std::fs::write(dir.path().join("real.txt"), b"content").unwrap();
         symlink("real.txt", dir.path().join("link.txt")).unwrap();
 
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
         let dir_args = CreateArgs {
             disposition: CreateDisposition::Open,
             create_options: CreateOptions {
@@ -1221,7 +1364,7 @@ mod tests {
         let dir = tmp_root();
         std::fs::create_dir_all(dir.path().join("subdir")).unwrap();
 
-        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never).unwrap();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dir_path = dir.path().to_path_buf();

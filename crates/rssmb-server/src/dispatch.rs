@@ -1692,7 +1692,7 @@ async fn handle_tree_connect(
     let vfs: Arc<dyn rssmb_vfs::Vfs> = if share_config.path.is_empty() {
         Arc::new(rssmb_vfs::memoryfs::MemoryFs::new())
     } else {
-        match rssmb_vfs::localfs::LocalFs::new(&share_config.path, share_config.follow_symlinks) {
+        match rssmb_vfs::localfs::LocalFs::new(&share_config.path, share_config.follow_symlinks, share_config.case_sensitive) {
             Ok(fs) => Arc::new(fs),
             Err(e) => {
                 tracing::warn!(share = %share_name, path = %share_config.path, error = %e, "failed to create LocalFs");
