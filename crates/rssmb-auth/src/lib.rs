@@ -465,7 +465,7 @@ impl AuthProvider for NtlmAuthProvider {
             // If the client's MsvAvFlags has the MIC-present bit set, the
             // AUTHENTICATE message carries a MIC at offset 72 computed over
             // NEGOTIATE || CHALLENGE || AUTHENTICATE (with the MIC field
-            // zeroed). We verify it with the SessionBaseKey.
+            // zeroed). We verify it with the ExportedSessionKey.
             if ntlmv2::has_mic_flag(&fields.nt_response) {
                 let neg = state.negotiate_message.as_deref().unwrap_or(&[]);
                 let chal = state.challenge_message.as_deref().unwrap_or(&[]);

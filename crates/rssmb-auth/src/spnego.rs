@@ -124,7 +124,7 @@ pub fn extract_ntlm_token(input: &[u8]) -> Result<Vec<u8>, String> {
     //   [0] (0xA0) negTokenInit
     //     SEQUENCE (0x30)
     //       [0] (0xA0) mechTypes
-    //       [1] (0xA1) mechToken  ← OCTET STRING with NTLMSSP
+    //       [2] (0xA2) mechToken  ← OCTET STRING with NTLMSSP
     if input[0] == 0x60 {
         return extract_from_neg_token_init(input);
     }

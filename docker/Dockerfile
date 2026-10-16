@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/rssmb /usr/local/bin/rssmb
 
+# Create the config directory so bind-mounting a config file works
+# (Docker creates a directory if the parent doesn't exist).
+RUN mkdir -p /etc/rssmb
+
 # Config is NOT baked in — mount it as a volume (see docker/compose.yml).
 # The server will fail fast if /etc/rssmb/rssmb.toml is missing.
 
