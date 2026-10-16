@@ -349,6 +349,25 @@ impl ServerConfig {
                 self.port, self.health_port
             ));
         }
+        // Validate bind addresses when non-empty and not "localhost".
+        if !self.listen_addr.is_empty()
+            && self.listen_addr != "localhost"
+            && self.listen_addr.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(format!(
+                "listen_addr '{}' is not a valid IP address",
+                self.listen_addr
+            ));
+        }
+        if !self.health_bind_addr.is_empty()
+            && self.health_bind_addr != "localhost"
+            && self.health_bind_addr.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(format!(
+                "health_bind_addr '{}' is not a valid IP address",
+                self.health_bind_addr
+            ));
+        }
         // Frame size: at least 64 KiB (SMB2 minimum).
         if self.max_frame_size < 65536 {
             return Err(format!(

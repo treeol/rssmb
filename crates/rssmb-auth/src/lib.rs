@@ -201,10 +201,11 @@ pub struct NtlmAuthProvider {
 }
 
 impl NtlmAuthProvider {
+    #[deprecated(note = "Use NtlmAuthProvider::with_identity_store instead")]
     #[allow(deprecated)]
-    pub fn from_store(_store: &CredentialStore) -> Self {
+    pub fn from_store(store: &CredentialStore) -> Self {
         Self {
-            identities: Arc::new(IdentityStore::empty()),
+            identities: Arc::new(store.to_identity_store()),
             guest_access: false,
             require_timestamp: false,
         }
@@ -272,6 +273,30 @@ impl AuthProvider for NtlmAuthProvider {
             let session_key = state.session_key.clone().ok_or_else(|| {
                 AuthError::LogonFailure("internal state error: session key missing".into())
             })?;
+
+            // If the client sends a mechListMIC in a follow-up round, verify it.
+            if !identity.is_guest
+                && state.uses_spnego()
+                && ntlm_mic::supported(state.ntlm_neg_flags)
+            {
+                if let Some(client_mic) = spnego::extract_mech_list_mic(input_token) {
+                    let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
+                    if !ntlm_mic::verify_client(
+                        &session_key,
+                        state.ntlm_neg_flags,
+                        mech_types,
+                        &client_mic,
+                    ) {
+                        tracing::warn!("mechListMIC verification failed on follow-up leg");
+                        state.auth_completed = false;
+                        state.proof_verified = false;
+                        state.session_key = None;
+                        state.completed_identity = None;
+                        return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
+                    }
+                    tracing::debug!("mechListMIC verified on follow-up leg");
+                }
+            }
 
             return Ok(AuthStep::Complete {
                 output_token: vec![],
@@ -343,10 +368,16 @@ impl AuthProvider for NtlmAuthProvider {
                     domain: String::new(),
                     is_guest: true,
                 };
+                state.session_key = Some(vec![]);
                 state.auth_completed = true;
                 state.completed_identity = Some(identity.clone());
+                let output_token = if state.uses_spnego() {
+                    spnego::wrap_accept_completed(None)
+                } else {
+                    vec![]
+                };
                 return Ok(AuthStep::Complete {
-                    output_token: vec![],
+                    output_token,
                     session_key: vec![],
                     identity,
                 });
@@ -557,15 +588,10 @@ impl AuthProvider for NtlmAuthProvider {
                     is_guest: false,
                 };
 
-                state.session_key = Some(session_key.clone());
-                state.auth_completed = true;
-                state.completed_identity = Some(identity.clone());
-
                 // Verify the client's mechListMIC if it accompanies the
-                // AUTHENTICATE token (RFC 4178 §5). Some clients send the
-                // MIC in the same negTokenResp as the AUTHENTICATE; others
-                // send it in a separate follow-up round that lands in the
-                // auth_completed branch. Verify when present.
+                // AUTHENTICATE token (RFC 4178 §5) BEFORE committing
+                // auth_completed to state, so a failed MIC check does not
+                // leave AuthState marked completed for subsequent step() calls.
                 if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
                     if let Some(client_mic) = spnego::extract_mech_list_mic(input_token) {
                         let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
@@ -576,6 +602,8 @@ impl AuthProvider for NtlmAuthProvider {
                             &client_mic,
                         ) {
                             tracing::warn!("mechListMIC verification failed on AUTHENTICATE leg");
+                            state.proof_verified = false;
+                            state.session_key = None;
                             return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
                         }
                         tracing::debug!("mechListMIC verified on AUTHENTICATE leg");
@@ -583,6 +611,10 @@ impl AuthProvider for NtlmAuthProvider {
                     // If no MIC is present, the dispatch layer handles any
                     // follow-up round (session already exists → success).
                 }
+
+                state.session_key = Some(session_key.clone());
+                state.auth_completed = true;
+                state.completed_identity = Some(identity.clone());
 
                 // NTLM's final leg has no server token. For SPNEGO clients
                 // that negotiated NTLMSSP signing (Samba/Windows), the final

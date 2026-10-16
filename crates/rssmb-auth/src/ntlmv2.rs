@@ -115,6 +115,9 @@ pub fn verify_with_nt_hash(
 /// where NTOWFv2 = HMAC_MD5(NTHash, UTF16LE(UPPER(user) || domain))
 /// and NTProofStr = NTResponse[0..16].
 pub fn compute_session_key(nt_hash: &[u8], fields: &AuthenticateFields) -> Vec<u8> {
+    if fields.nt_response.len() < 16 {
+        return Vec::new();
+    }
     let user_upper = utf16le_to_string(&fields.user_utf16).to_uppercase();
     let mut ident = string_to_utf16le(&user_upper);
     ident.extend_from_slice(&fields.domain_utf16);
@@ -144,9 +147,12 @@ pub fn compute_exported_session_key(
     neg_flags: u32,
     encrypted_random_session_key: &[u8],
 ) -> Result<Vec<u8>, &'static str> {
+    if session_base_key.len() != 16 {
+        return Err("SessionBaseKey must be 16 bytes");
+    }
     if neg_flags & FLAG_KEY_EXCH != 0 {
-        if encrypted_random_session_key.is_empty() {
-            return Err("KEY_EXCH negotiated but EncryptedRandomSessionKey is empty");
+        if encrypted_random_session_key.len() != 16 {
+            return Err("KEY_EXCH negotiated but EncryptedRandomSessionKey is not 16 bytes");
         }
         Ok(rc4_decrypt(session_base_key, encrypted_random_session_key))
     } else {
@@ -156,6 +162,9 @@ pub fn compute_exported_session_key(
 
 /// Minimal RC4 decryption (same algorithm as ntlm_mic::Rc4 but standalone).
 fn rc4_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    if key.is_empty() {
+        return Vec::new();
+    }
     let mut state = [0u8; 256];
     for (i, v) in state.iter_mut().enumerate() {
         *v = i as u8;
@@ -250,14 +259,14 @@ pub fn has_timestamp(nt_response: &[u8]) -> bool {
 /// Verify the AUTHENTICATE message MIC (MS-NLMP 3.2.5.1.2).
 ///
 /// The MIC is at offset 72 in the AUTHENTICATE message. It is computed as
-/// `HMAC_MD5(SessionBaseKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)` where
+/// `HMAC_MD5(ExportedSessionKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)` where
 /// the AUTHENTICATE's MIC field is zeroed before hashing. The client
 /// signals its presence via the MsvAvFlags MIC-present bit.
 ///
 /// Returns `false` if the AUTHENTICATE is too short, the MIC is all-zero
 /// (not actually set), or the computed value does not match.
 pub fn verify_authenticate_mic(
-    session_key: &[u8],
+    exported_session_key: &[u8],
     negotiate_msg: &[u8],
     challenge_msg: &[u8],
     authenticate_msg: &[u8],
@@ -272,7 +281,7 @@ pub fn verify_authenticate_mic(
     }
     let mut auth_zeroed = authenticate_msg.to_vec();
     auth_zeroed[AUTHENTICATE_MIC_OFFSET..AUTHENTICATE_MIC_OFFSET + AUTHENTICATE_MIC_LEN].fill(0);
-    let mut mac = match <HmacMd5 as Mac>::new_from_slice(session_key) {
+    let mut mac = match <HmacMd5 as Mac>::new_from_slice(exported_session_key) {
         Ok(m) => m,
         Err(_) => return false,
     };

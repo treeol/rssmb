@@ -206,14 +206,36 @@ impl CredentialStore {
             .cloned()
     }
 
+    /// Convert a deprecated [`CredentialStore`] into an [`IdentityStore`]
+    /// synchronously (for compatibility with `NtlmAuthProvider::from_store`).
+    pub fn to_identity_store(&self) -> IdentityStore {
+        let mut map = HashMap::new();
+        if let Ok(guard) = self.credentials.try_read() {
+            for (k, v) in guard.iter() {
+                if !v.disabled {
+                    map.insert(
+                        k.clone(),
+                        StoredIdentity {
+                            username: v.username.clone(),
+                            nt_hash: v.nt_hash,
+                        },
+                    );
+                }
+            }
+        }
+        IdentityStore {
+            identities: Arc::new(map),
+        }
+    }
+
     pub async fn verify(&self, username: &str, _nt_proof: &[u8]) -> bool {
         if let Some(cred) = self.lookup(username).await {
             if cred.disabled {
                 return false;
             }
-            // For MVP: we don't implement the full NTLMv2 proof verification here.
-            // That's handled by the sspi acceptor which has access to the NT hash.
-            // This method is a placeholder for credential lookup validation.
+            // Deprecated legacy method: check that the user exists and is not
+            // disabled. Actual NTLMv2 proof verification is performed by
+            // `ntlmv2::verify_ntlmv2` via `IdentityStore`.
             true
         } else {
             false

@@ -426,18 +426,22 @@ async fn handle_compound(
     // for 3.1.1 (Mashūra plan review §1): in a compound, the response
     // bytes of the first member are not available for hashing before the
     // second member is dispatched.
-    for req in &requests {
-        if req.header.command == Command::Negotiate || req.header.command == Command::SessionSetup {
-            if let Err(boxed) = charge_credits(conn_state, &req.header) {
-                if let FramedResponse::Disconnect = *boxed {
-                    return Some(FramedResponse::Disconnect);
+    if let Some(bad_idx) = requests.iter().position(|r| {
+        r.header.command == Command::Negotiate || r.header.command == Command::SessionSetup
+    }) {
+        for req in &requests[..=bad_idx] {
+            if req.header.command != Command::Cancel {
+                if let Err(boxed) = charge_credits(conn_state, &req.header) {
+                    if let FramedResponse::Disconnect = *boxed {
+                        return Some(FramedResponse::Disconnect);
+                    }
                 }
             }
-            return Some(FramedResponse::Plain(error_plain_response(
-                &req.header,
-                NtStatus::InvalidParameter.to_u32(),
-            )));
         }
+        return Some(FramedResponse::Plain(error_plain_response(
+            &requests[bad_idx].header,
+            NtStatus::InvalidParameter.to_u32(),
+        )));
     }
 
     for (i, mut req) in requests.into_iter().enumerate() {
@@ -1749,9 +1753,21 @@ async fn handle_logoff(
                 // Pipe opens have no VFS handle to close; just drop the Arc.
                 continue;
             }
+            let mut should_delete_on_close = false;
+            if let Some(fid) = entry.file_id {
+                let remove_result = state.open_table.remove(fid, entry.open_id).await;
+                should_delete_on_close =
+                    remove_result.was_last && remove_result.any_delete_on_close;
+            }
+            if let Some(guid) = entry.durable_guid {
+                state.durable_table.forget(&guid).await;
+            }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {
+                if should_delete_on_close {
+                    let _ = vfs.set_delete_on_close(open_id, true).await;
+                }
                 if let Err(e) = vfs.close(open_id).await {
                     tracing::warn!(error = %e, "logoff: VFS close failed");
                 }
@@ -2129,13 +2145,22 @@ async fn handle_tree_disconnect(
                 continue;
             }
             // Remove from the global open table.
+            let mut should_delete_on_close = false;
             if let Some(fid) = entry.file_id {
-                state.open_table.remove(fid, entry.open_id).await;
+                let remove_result = state.open_table.remove(fid, entry.open_id).await;
+                should_delete_on_close =
+                    remove_result.was_last && remove_result.any_delete_on_close;
+            }
+            if let Some(guid) = entry.durable_guid {
+                state.durable_table.forget(&guid).await;
             }
             // Close the VFS handle — fire and forget, log on error.
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {
+                if should_delete_on_close {
+                    let _ = vfs.set_delete_on_close(open_id, true).await;
+                }
                 if let Err(e) = vfs.close(open_id).await {
                     tracing::warn!(error = %e, "tree_disconnect: VFS close failed");
                 }
@@ -2820,11 +2845,12 @@ async fn handle_create(
                 rssmb_vfs::VfsError::IsDirectory => NtStatus::FileIsADirectory,
                 rssmb_vfs::VfsError::NotDirectory => NtStatus::NotADirectory,
                 rssmb_vfs::VfsError::DirectoryNotEmpty => NtStatus::DirectoryNotEmpty,
+                rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
+                rssmb_vfs::VfsError::ResourceExhausted => NtStatus::InsufficientServerResources,
                 rssmb_vfs::VfsError::NotSupported => NtStatus::NotSupported,
                 rssmb_vfs::VfsError::Io(ref msg) => {
-                    // Map common I/O errors to specific NT statuses so clients
-                    // get actionable error codes instead of a generic
-                    // STATUS_INVALID_PARAMETER.
+                    // Fallback string matching for custom VFS backends that
+                    // return VfsError::Io directly without VfsError::from_io.
                     if msg.contains("No space left") {
                         NtStatus::DiskFull
                     } else if msg.contains("Read-only")
@@ -2949,17 +2975,11 @@ async fn handle_close(
                 if let Some(fid) = entry.file_id {
                     let remove_result = state.open_table.remove(fid, entry.open_id).await;
                     if remove_result.was_last && remove_result.any_delete_on_close {
-                        // Last open — perform the actual delete via VFS.
-                        // The VFS close will handle unlinking because the
-                        // handle's delete_on_close flag was set at create time.
-                        // For handles where delete_on_close was set later via
-                        // SET_INFO, we call vfs.delete() here.
-                        //
-                        // LocalFs.close() checks handle.delete_on_close and
-                        // unlinks. But if delete_on_close was set via
-                        // set_delete_on_close (not at create time), the
-                        // handle's flag is already updated. So close() will
-                        // unlink correctly.
+                        // Last open with delete-pending disposition (possibly set
+                        // by an earlier open that has already closed) — ensure
+                        // this VFS handle's delete_on_close flag is set before
+                        // close() unlinks the file.
+                        let _ = entry.vfs.set_delete_on_close(entry.open_id, true).await;
                     }
                     // Release all byte-range locks held by this open.
                     state
@@ -3304,6 +3324,8 @@ async fn handle_write(
                 rssmb_vfs::VfsError::InvalidHandle => NtStatus::InvalidHandle,
                 rssmb_vfs::VfsError::AccessDenied => NtStatus::AccessDenied,
                 rssmb_vfs::VfsError::IsDirectory => NtStatus::FileIsADirectory,
+                rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
+                rssmb_vfs::VfsError::ResourceExhausted => NtStatus::InsufficientServerResources,
                 // An I/O failure is not the client's fault.
                 _ => NtStatus::Other(0xC000_0185), // STATUS_IO_DEVICE_ERROR
             };
@@ -3880,11 +3902,13 @@ async fn handle_set_info(
                         }
                         Err(e) => {
                             debug!(conn_id = conn_state.conn_id, error = %e, "set_info eof failed");
-                            error_response_for(
-                                Command::SetInfo,
-                                NtStatus::InvalidParameter,
-                                &req.header,
-                            )
+                            let status = match e {
+                                rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
+                                rssmb_vfs::VfsError::AccessDenied => NtStatus::AccessDenied,
+                                rssmb_vfs::VfsError::InvalidHandle => NtStatus::InvalidHandle,
+                                _ => NtStatus::InvalidParameter,
+                            };
+                            error_response_for(Command::SetInfo, status, &req.header)
                         }
                     }
                 }
@@ -3935,7 +3959,12 @@ async fn handle_set_info(
                         }
                         Err(rssmb_vfs::VfsError::DirectoryNotEmpty) => error_response_for(
                             Command::SetInfo,
-                            NtStatus::Other(0xC000_0101),
+                            NtStatus::DirectoryNotEmpty,
+                            &req.header,
+                        ),
+                        Err(rssmb_vfs::VfsError::AccessDenied) => error_response_for(
+                            Command::SetInfo,
+                            NtStatus::AccessDenied,
                             &req.header,
                         ),
                         Err(e) => {
@@ -3980,6 +4009,12 @@ async fn handle_set_info(
                             let status = match e {
                                 rssmb_vfs::VfsError::InvalidHandle => NtStatus::InvalidHandle,
                                 rssmb_vfs::VfsError::AlreadyExists => NtStatus::ObjectNameCollision,
+                                rssmb_vfs::VfsError::AccessDenied => NtStatus::AccessDenied,
+                                rssmb_vfs::VfsError::NotFound => NtStatus::ObjectNameNotFound,
+                                rssmb_vfs::VfsError::DirectoryNotEmpty => {
+                                    NtStatus::DirectoryNotEmpty
+                                }
+                                rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
                                 _ => NtStatus::InvalidParameter,
                             };
                             error_response_for(Command::SetInfo, status, &req.header)
@@ -4144,14 +4179,22 @@ async fn handle_change_notify(
         path
     };
 
-    // Start the real watch.
+    // Register the async op before starting the watcher task so an immediate
+    // watcher failure or quick event can remove it cleanly from pending_async.
+    let max_output_length = cn_req.output_buffer_length;
+    let mut pending_guard = conn_state.pending_async.lock().await;
     let notify_handle = crate::notify::start_watch(
-        conn_state, message_id, session_id, tree_id, dir_path, watch_tree, filter,
+        conn_state,
+        message_id,
+        session_id,
+        tree_id,
+        dir_path,
+        watch_tree,
+        filter,
+        max_output_length,
     );
-
-    // Register the async op with the notify handle for cleanup.
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    conn_state.pending_async.lock().await.insert(
+    pending_guard.insert(
         message_id,
         AsyncOp {
             command: Command::ChangeNotify,
@@ -4161,6 +4204,7 @@ async fn handle_change_notify(
             notify_handle: Some(notify_handle),
         },
     );
+    drop(pending_guard);
 
     // Build a PENDING response with async header.
     let mut response = build_response(

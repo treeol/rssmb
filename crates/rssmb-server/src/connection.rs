@@ -1083,6 +1083,7 @@ impl Connection {
             }
             entries
         };
+        let mut close_tasks = Vec::new();
         for (_, entry) in &removed_opens {
             if entry.is_pipe {
                 continue;
@@ -1091,8 +1092,11 @@ impl Connection {
             // locks held by this open. On abrupt disconnect (TCP RST, idle
             // timeout), the normal CLOSE/LOGOFF/TREE_DISCONNECT path doesn't
             // run, so locks would otherwise survive as stale entries.
+            let mut should_delete_on_close = false;
             if let Some(fid) = entry.file_id {
-                state.open_table.remove(fid, entry.open_id).await;
+                let remove_result = state.open_table.remove(fid, entry.open_id).await;
+                should_delete_on_close =
+                    remove_result.was_last && remove_result.any_delete_on_close;
             }
             let released = state
                 .open_table
@@ -1115,17 +1119,23 @@ impl Connection {
             }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
-            tokio::spawn(async move {
+            close_tasks.push(tokio::spawn(async move {
+                if should_delete_on_close {
+                    let _ = vfs.set_delete_on_close(open_id, true).await;
+                }
                 if let Err(e) = vfs.close(open_id).await {
                     tracing::warn!(error = %e, "connection cleanup: VFS close failed");
                 }
-            });
+            }));
+        }
+        for task in close_tasks {
+            let _ = task.await;
         }
         if !removed_opens.is_empty() {
             debug!(
                 conn_id,
                 open_count = removed_opens.len(),
-                "cleanup: scheduled VFS closes"
+                "cleanup: completed VFS closes"
             );
         }
 

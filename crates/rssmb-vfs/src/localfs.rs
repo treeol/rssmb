@@ -225,59 +225,91 @@ impl LocalFs {
     }
 
     /// On a case-insensitive share, resolve a path that doesn't exist exactly
-    /// to a case-insensitive match in the parent directory.
+    /// to a case-insensitive match by walking each component from the share
+    /// root down.
     ///
-    /// Returns `Some(resolved_path)` if a single case-insensitive match is
-    /// found, or `None` if no match or the share is case-sensitive.
+    /// Returns `Some(resolved_path)` if a case-insensitive resolution succeeds
+    /// for existing components (even if the final leaf component is a new file
+    /// to be created inside a case-matched parent directory), or `None` if no
+    /// match or the share is case-sensitive.
     ///
-    /// If multiple names match case-insensitively (ambiguity), returns the
-    /// exact match if one exists, otherwise `None` (the caller will get
-    /// `NotFound` — which is safer than silently picking one).
+    /// If multiple names in any directory match case-insensitively without an
+    /// exact match (ambiguity), returns `None`.
     fn resolve_case_insensitive(&self, rel: &Path) -> Option<PathBuf> {
         if self.case_sensitive {
             return None;
         }
 
-        let file_name = rel.file_name()?.to_str()?;
-        let parent = rel.parent()?;
+        let components: Vec<OsString> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_os_string()),
+                _ => None,
+            })
+            .collect();
 
-        // Open the parent directory (or use root for top-level).
-        let parent_dir = if parent.as_os_str().is_empty() || parent == Path::new(".") {
-            self.dir.entries().ok()?
-        } else {
-            self.dir.open_dir(parent).ok()?.entries().ok()?
-        };
-
-        let mut exact_match = false;
-        let mut ci_match: Option<OsString> = None;
-        let lower = file_name.to_lowercase();
-
-        for entry in parent_dir {
-            let entry = entry.ok()?;
-            let name = entry.file_name();
-            let name_str = name.to_str()?;
-            if name_str == file_name {
-                exact_match = true;
-                break;
-            }
-            if name_str.to_lowercase() == lower {
-                if ci_match.is_some() {
-                    // Ambiguity: two case-insensitive matches. Don't resolve.
-                    return None;
-                }
-                ci_match = Some(name);
-            }
-        }
-
-        if exact_match {
-            // The exact name exists but symlink_metadata said it doesn't —
-            // this shouldn't happen, but if it does, use the exact path.
+        if components.is_empty() {
             return None;
         }
 
-        if let Some(matched) = ci_match {
-            let mut resolved = parent.to_path_buf();
-            resolved.push(matched);
+        let mut resolved = PathBuf::new();
+        let mut changed = false;
+
+        for (idx, comp) in components.iter().enumerate() {
+            let is_last = idx + 1 == components.len();
+            let comp_str = comp.to_str()?;
+
+            // Open the directory accumulated so far (or share root).
+            let entries = if resolved.as_os_str().is_empty() {
+                self.dir.entries().ok()?
+            } else {
+                self.dir.open_dir(&resolved).ok()?.entries().ok()?
+            };
+
+            let mut exact_match: Option<OsString> = None;
+            let mut ci_match: Option<OsString> = None;
+            let mut ambiguous = false;
+            let lower = comp_str.to_lowercase();
+
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if name_str == comp_str {
+                    exact_match = Some(name);
+                    break;
+                }
+                if name_str.to_lowercase() == lower {
+                    if ci_match.is_some() {
+                        ambiguous = true;
+                    } else {
+                        ci_match = Some(name);
+                    }
+                }
+            }
+
+            if let Some(exact) = exact_match {
+                resolved.push(exact);
+            } else if ambiguous {
+                return None;
+            } else if let Some(matched) = ci_match {
+                resolved.push(matched);
+                changed = true;
+            } else if is_last {
+                // Final component does not exist (e.g. creating a new file inside
+                // a case-resolved parent directory). Keep the requested leaf name.
+                resolved.push(comp);
+            } else {
+                // Intermediate directory does not exist at all.
+                return None;
+            }
+        }
+
+        if changed {
             Some(resolved)
         } else {
             None
@@ -325,24 +357,34 @@ impl Vfs for LocalFs {
         // symlinks without following them — cap-std's exists() uses
         // openat2 which refuses symlink-escaped paths, returning false).
         let mut exists = self.dir.symlink_metadata(&rel).is_ok();
-        if exists {
-            self.check_no_symlinks(&rel)?;
-        }
 
         // Case-insensitive lookup: if the exact path doesn't exist and the
-        // share is case-insensitive, scan the parent directory for a match.
-        // This lets Windows/macOS clients access files when the case doesn't
-        // match exactly.
+        // share is case-insensitive, scan from the share root down for a
+        // match. Resolve before running `check_no_symlinks` so that under
+        // `FollowSymlinks::WithinShare` (which opens the parent dir) a
+        // case-mismatched parent directory is resolved to its on-disk case
+        // before `open_dir(parent)` checks confinement.
         let mut effective_rel = rel.clone();
         if !exists && !self.case_sensitive {
             if let Some(ci_rel) = self.resolve_case_insensitive(&rel) {
                 if self.dir.symlink_metadata(&ci_rel).is_ok() {
                     effective_rel = ci_rel;
                     exists = true;
-                    self.check_no_symlinks(&effective_rel)?;
+                } else {
+                    // The parent directory matched case-insensitively even
+                    // though the final component does not exist yet (e.g.
+                    // creating a new file inside a case-mismatched parent dir).
+                    effective_rel = ci_rel;
                 }
             }
         }
+
+        // Check symlink policy on all components of the effective path
+        // (existing or parent components of a new file/dir). For
+        // FollowSymlinks::Never this rejects any intermediate symlink
+        // traversal even when the final target doesn't exist yet; for
+        // WithinShare it verifies the resolved parent is confined.
+        self.check_no_symlinks(&effective_rel)?;
 
         let is_dir = args.create_options.directory;
         let wants_dir = is_dir;
@@ -389,7 +431,7 @@ impl Vfs for LocalFs {
         if wants_dir && !exists {
             self.dir
                 .create_dir(&effective_rel)
-                .map_err(|e| VfsError::Io(format!("create_dir: {e}")))?;
+                .map_err(|e| VfsError::from_io("create_dir", e))?;
             // The directory now exists; the open below must not try to
             // create it again.
             needs_create = false;
@@ -441,17 +483,11 @@ impl Vfs for LocalFs {
             self.dir
                 .open_dir(".")
                 .map(|d| cap_std::fs::File::from_std(d.into_std_file()))
-                .map_err(|e| VfsError::Io(format!("open root dir: {e}")))?
+                .map_err(|e| VfsError::from_io("open root dir", e))?
         } else {
-            self.dir.open_with(&effective_rel, &opts).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    VfsError::NotFound
-                } else if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    VfsError::AlreadyExists
-                } else {
-                    VfsError::Io(format!("open: {e}"))
-                }
-            })?
+            self.dir
+                .open_with(&effective_rel, &opts)
+                .map_err(|e| VfsError::from_io("open", e))?
         };
 
         // Convert to tokio for async I/O. The fd was obtained from a
@@ -488,13 +524,13 @@ impl Vfs for LocalFs {
             .file
             .seek(std::io::SeekFrom::Start(offset))
             .await
-            .map_err(|e| VfsError::Io(format!("seek: {e}")))?;
+            .map_err(|e| VfsError::from_io("seek", e))?;
         let mut buf = vec![0u8; len as usize];
         let n = handle
             .file
             .read(&mut buf)
             .await
-            .map_err(|e| VfsError::Io(format!("read: {e}")))?;
+            .map_err(|e| VfsError::from_io("read", e))?;
         buf.truncate(n);
         Ok(Bytes::from(buf))
     }
@@ -512,12 +548,12 @@ impl Vfs for LocalFs {
             .file
             .seek(std::io::SeekFrom::Start(offset))
             .await
-            .map_err(|e| VfsError::Io(format!("seek: {e}")))?;
+            .map_err(|e| VfsError::from_io("seek", e))?;
         handle
             .file
             .write_all(data)
             .await
-            .map_err(|e| VfsError::Io(format!("write: {e}")))?;
+            .map_err(|e| VfsError::from_io("write", e))?;
         Ok(data.len() as u32)
     }
 
@@ -543,11 +579,11 @@ impl Vfs for LocalFs {
             if is_dir {
                 self.dir
                     .remove_dir(&rel)
-                    .map_err(|e| VfsError::Io(format!("close delete_on_close remove_dir: {e}")))?;
+                    .map_err(|e| VfsError::from_io("close delete_on_close remove_dir", e))?;
             } else {
                 self.dir
                     .remove_file(&rel)
-                    .map_err(|e| VfsError::Io(format!("close delete_on_close remove_file: {e}")))?;
+                    .map_err(|e| VfsError::from_io("close delete_on_close remove_file", e))?;
             }
         }
         Ok(())
@@ -563,7 +599,7 @@ impl Vfs for LocalFs {
             .file
             .sync_data()
             .await
-            .map_err(|e| VfsError::Io(format!("flush: {e}")))
+            .map_err(|e| VfsError::from_io("flush", e))
     }
 
     async fn lock(
@@ -625,17 +661,22 @@ impl Vfs for LocalFs {
         };
         let handle = handle.lock().await;
 
-        if info.size != 0 && !handle.is_directory {
+        let is_size_info = matches!(
+            _class,
+            InfoClass::FileEndOfFileInfo | InfoClass::FileAllocationInfo
+        );
+        if is_size_info && !handle.is_directory {
             handle
                 .file
                 .set_len(info.size)
                 .await
-                .map_err(|e| VfsError::Io(format!("set_len: {e}")))?;
+                .map_err(|e| VfsError::from_io("set_len", e))?;
         }
 
-        // Apply timestamps via the file path (std::fs::File::set_times).
+        // Apply timestamps via the file path (std::fs::File::set_times) when
+        // setting FileBasicInfo.
         #[cfg(unix)]
-        {
+        if matches!(_class, InfoClass::FileBasicInfo) {
             use std::time::Duration;
             // Apply timestamps via fs-set-times (SetTimes for tokio::fs::File).
             use fs_set_times::{SetTimes, SystemTimeSpec};
@@ -964,7 +1005,12 @@ impl Vfs for LocalFs {
                 match renameat_with(old_fd, old_name, new_fd, new_name, RenameFlags::NOREPLACE) {
                     Ok(()) => {}
                     Err(rustix::io::Errno::EXIST) => return Err(VfsError::AlreadyExists),
-                    Err(e) => return Err(VfsError::Io(format!("renameat2(NOREPLACE): {e}"))),
+                    Err(e) => {
+                        return Err(VfsError::from_io(
+                            "renameat2(NOREPLACE)",
+                            std::io::Error::from_raw_os_error(e.raw_os_error()),
+                        ))
+                    }
                 }
             } else {
                 // Use cap-std's Dir::rename from the parent dir with a
@@ -972,18 +1018,18 @@ impl Vfs for LocalFs {
                 match (&old_parent_dir, &new_parent_dir) {
                     (Some(od), Some(nd)) => od
                         .rename(old_name, nd, new_name)
-                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                        .map_err(|e| VfsError::from_io("rename", e)),
                     (Some(od), None) => od
                         .rename(old_name, &self.dir, new_name)
-                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                        .map_err(|e| VfsError::from_io("rename", e)),
                     (None, Some(nd)) => self
                         .dir
                         .rename(old_name, nd, new_name)
-                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                        .map_err(|e| VfsError::from_io("rename", e)),
                     (None, None) => self
                         .dir
                         .rename(old_name, &self.dir, new_name)
-                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                        .map_err(|e| VfsError::from_io("rename", e)),
                 }?;
             }
         }
@@ -995,12 +1041,28 @@ impl Vfs for LocalFs {
             }
             self.dir
                 .rename(&old_rel, &self.dir, &new_rel)
-                .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
+                .map_err(|e| VfsError::from_io("rename", e))?;
         }
 
-        let mut handle_guard = handle.lock().await;
-        handle_guard.rel_path = new_rel.clone();
-        handle_guard.file_name = Self::file_name_from_rel(&new_rel);
+        // Update rel_path on all open handles affected by this rename (the
+        // renamed handle itself, duplicate opens to the same path, and any
+        // child handles when a directory is renamed).
+        let all_handles: Vec<Arc<Mutex<FileHandle>>> = {
+            let opens = self.opens.read().await;
+            opens.values().cloned().collect()
+        };
+        for h_arc in all_handles {
+            let mut h = h_arc.lock().await;
+            if h.rel_path == old_rel {
+                h.rel_path = new_rel.clone();
+                h.file_name = Self::file_name_from_rel(&new_rel);
+            } else if let Ok(suffix) = h.rel_path.strip_prefix(&old_rel) {
+                let mut updated = new_rel.clone();
+                updated.push(suffix);
+                h.file_name = Self::file_name_from_rel(&updated);
+                h.rel_path = updated;
+            }
+        }
         Ok(())
     }
 
@@ -1021,7 +1083,10 @@ impl Vfs for LocalFs {
             let mut statvfs_buf: libc::statvfs = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::fstatvfs(fd, &mut statvfs_buf) };
             if ret != 0 {
-                return Err(VfsError::Io(format!("fstatvfs: errno {ret}")));
+                return Err(VfsError::from_io(
+                    "fstatvfs",
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(FsStats {
                 total_blocks: statvfs_buf.f_blocks as u64,
@@ -1080,44 +1145,34 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
 }
 
 fn matches_pattern_impl(name: &[char], pattern: &[char]) -> bool {
-    let mut ni = 0;
-    let mut pi = 0;
+    let mut ni = 0usize;
+    let mut pi = 0usize;
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
 
-    while pi < pattern.len() {
-        match pattern[pi] {
-            '*' => {
-                pi += 1;
-                if pi >= pattern.len() {
-                    return true; // trailing * matches everything
-                }
-                // Try to match the rest of the pattern at each position.
-                for i in 0..=name.len() {
-                    if matches_pattern_impl(&name[i..], &pattern[pi..]) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            '?' => {
-                if ni >= name.len() {
-                    return false;
-                }
-                ni += 1;
-                pi += 1;
-            }
-            pc => {
-                if ni >= name.len() {
-                    return false;
-                }
-                if !name[ni].eq_ignore_ascii_case(&pc) {
-                    return false;
-                }
-                ni += 1;
-                pi += 1;
-            }
+    while ni < name.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || name[ni].eq_ignore_ascii_case(&pattern[pi]))
+        {
+            ni += 1;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ni;
+            pi += 1;
+        } else if let Some(s) = star_idx {
+            pi = s + 1;
+            match_idx += 1;
+            ni = match_idx;
+        } else {
+            return false;
         }
     }
-    ni >= name.len()
+
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 #[cfg(test)]
@@ -1771,5 +1826,139 @@ mod tests {
         let data = fs.read_at(open, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"content");
         fs.close(open).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_intermediate_symlink_rejected_on_new_create() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_root();
+        std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+        symlink("realdir", dir.path().join("linkdir")).unwrap();
+
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let result = fs.create("", "linkdir\\brand_new.txt", &create).await;
+        assert!(
+            matches!(result, Err(VfsError::AccessDenied)),
+            "creating new file through intermediate symlink under Never must fail: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_info_eof_zero_truncates() {
+        let dir = tmp_root();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open = fs.create("", "nonempty.txt", &create).await.unwrap();
+        fs.write_at(open, 0, b"hello world").await.unwrap();
+        let mut info = fs
+            .query_info(open, InfoClass::FileStandardInfo)
+            .await
+            .unwrap();
+        assert_eq!(info.size, 11);
+
+        // Truncate to 0 bytes via FileEndOfFileInfo.
+        info.size = 0;
+        fs.set_info(open, InfoClass::FileEndOfFileInfo, &info)
+            .await
+            .unwrap();
+        let after = fs
+            .query_info(open, InfoClass::FileStandardInfo)
+            .await
+            .unwrap();
+        assert_eq!(after.size, 0, "FileEndOfFileInfo with size=0 must truncate");
+        fs.close(open).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_nested_dirs_and_new_file() {
+        let dir = tmp_root();
+        std::fs::create_dir_all(dir.path().join("SubDir/Inner")).unwrap();
+        std::fs::write(dir.path().join("SubDir/Inner/Report.TXT"), b"ok").unwrap();
+
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // Open existing file with mismatched intermediate and leaf case.
+        let open = fs
+            .create(
+                "",
+                "subdir\\INNER\\report.txt",
+                &CreateArgs::open_readonly(),
+            )
+            .await
+            .expect("nested case-insensitive open should succeed");
+        let data = fs.read_at(open, 0, 10).await.unwrap();
+        assert_eq!(data.as_ref(), b"ok");
+        fs.close(open).await.unwrap();
+
+        // Create a new file inside case-mismatched parent directory.
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open2 = fs
+            .create("", "SUBDIR\\inner\\Created.txt", &create)
+            .await
+            .expect("creating new file in case-mismatched dir should succeed");
+        fs.close(open2).await.unwrap();
+        assert!(dir.path().join("SubDir/Inner/Created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_updates_other_open_handles() {
+        let dir = tmp_root();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                delete: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open1 = fs.create("", "orig.txt", &create).await.unwrap();
+        let open2 = fs
+            .create("", "orig.txt", &CreateArgs::open_readonly())
+            .await
+            .unwrap();
+
+        // Rename via open1, then set delete_on_close and close via open2.
+        fs.rename(open1, "renamed.txt", false).await.unwrap();
+        fs.close(open1).await.unwrap();
+        fs.set_delete_on_close(open2, true).await.unwrap();
+        fs.close(open2).await.unwrap();
+        assert!(!dir.path().join("renamed.txt").exists());
+    }
+
+    #[test]
+    fn test_wildcard_no_exponential_backtracking() {
+        let long_name = "a".repeat(60) + "c";
+        let pat = "a*a*a*a*a*a*a*a*a*a*a*a*b";
+        assert!(!matches_pattern(&long_name, pat));
+        assert!(matches_pattern(&("a".repeat(60) + "b"), pat));
     }
 }

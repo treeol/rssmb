@@ -131,7 +131,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `signing` | `required` | `required` (reject unsigned + disable guest) · `desired` · `disabled` |
 | `encryption` | `desired` | `required` · `desired` · `disabled` (SMB 3.1.1 AES-128-GCM) |
 | `guest_access` | `false` | Allow anonymous guest logons (only `guest_ok` shares) |
-| `max_connections_per_ip` | `100` | Per-IP connection limit |
+| `max_connections_per_ip` | `0` (`100` in example config) | Per-IP connection limit (`0` = unlimited) |
 | `max_frame_size` | `1048576` | Maximum SMB frame size (1 MiB) |
 | `max_credits` | `1024` | Maximum outstanding credits |
 | `health_port` | `8080` | HTTP health/metrics endpoint |

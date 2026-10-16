@@ -311,9 +311,9 @@ impl OpenTable {
         }
         // No conflict: insert the new open.
         map.entry(file_id).or_default().push(entry);
-        // Track delete-pending state.
+        // Track delete-pending state while holding `opens` write lock (consistent
+        // lock order: opens -> delete_pending).
         if entry.delete_on_close {
-            drop(map);
             self.delete_pending.write().await.insert(file_id);
         }
         Ok(())
@@ -350,10 +350,8 @@ impl OpenTable {
             let was_last = vec.is_empty();
             if was_last {
                 map.remove(&file_id);
-                // Last close: clear delete_pending. The caller uses
-                // any_delete_on_close (snapshotted above) to decide
-                // whether to unlink the file.
-                drop(map);
+                // Last close: clear delete_pending while still holding `opens`
+                // write lock (lock order: opens -> delete_pending).
                 self.delete_pending.write().await.remove(&file_id);
             }
             // When other opens remain, do NOT clear delete_pending.
@@ -395,11 +393,9 @@ impl OpenTable {
             if let Some(entry) = vec.iter_mut().find(|e| e.open_id == open_id) {
                 entry.delete_on_close = delete;
                 // Recompute delete_pending from alive opens (including this one
-                // after the update). Only do this when the open_id was found —
-                // a no-op (not found) must not touch delete_pending, which may
-                // hold a disposition set by an already-closed open.
+                // after the update) while holding `opens` write lock (consistent
+                // lock order: opens -> delete_pending).
                 let any_doc = vec.iter().any(|e| e.delete_on_close);
-                drop(map);
                 let mut dp = self.delete_pending.write().await;
                 if any_doc {
                     dp.insert(file_id);

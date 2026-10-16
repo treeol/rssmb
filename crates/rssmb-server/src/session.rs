@@ -164,11 +164,13 @@ impl Session {
         self.trees.write().await.remove(&tree_id)
     }
 
-    /// Tear down the session: drop all tree connections and clear security
-    /// material.
+    /// Tear down the session: close and drop all tree connections.
     pub async fn close(&self) {
         let mut trees = self.trees.write().await;
         let count = trees.len();
+        for tree in trees.values() {
+            tree.close_all().await;
+        }
         trees.clear();
         info!(session_id = self.id, tree_count = count, "session closed");
     }

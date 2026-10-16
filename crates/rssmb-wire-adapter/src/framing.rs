@@ -26,10 +26,14 @@ pub fn read_netbios_frame(buf: &mut &[u8]) -> Result<Vec<u8>, WireError> {
     len |= (buf.get_u8() as u32) << 8;
     len |= buf.get_u8() as u32;
 
-    // Handle NetBIOS session request (type 0x81) — just read and discard for now
+    if len as usize > MAX_FRAME_SIZE {
+        return Err(WireError::OversizedFrame(len as usize));
+    }
+
+    // Handle NetBIOS session request (type 0x81) — read and return/discard
     if msg_type == 0x81 {
-        if len as usize > MAX_FRAME_SIZE {
-            return Err(WireError::OversizedFrame(len as usize));
+        if buf.remaining() < len as usize {
+            return Err(WireError::IncompleteFrame);
         }
         let data = buf.copy_to_bytes(len as usize);
         // Session request — we could validate the called/calling names here
@@ -40,8 +44,8 @@ pub fn read_netbios_frame(buf: &mut &[u8]) -> Result<Vec<u8>, WireError> {
         // Keep-alive — no payload per spec, but a non-zero length must be
         // consumed to stay aligned in the buffer.
         if len > 0 {
-            if len as usize > MAX_FRAME_SIZE {
-                return Err(WireError::OversizedFrame(len as usize));
+            if buf.remaining() < len as usize {
+                return Err(WireError::IncompleteFrame);
             }
             let _ = buf.copy_to_bytes(len as usize);
         }
@@ -50,10 +54,6 @@ pub fn read_netbios_frame(buf: &mut &[u8]) -> Result<Vec<u8>, WireError> {
 
     if msg_type != 0x00 {
         return Err(WireError::UnknownNetbiosType(msg_type));
-    }
-
-    if len as usize > MAX_FRAME_SIZE {
-        return Err(WireError::OversizedFrame(len as usize));
     }
 
     if buf.remaining() < len as usize {
@@ -632,5 +632,24 @@ mod tests {
         let result = parse_payload(&buf);
         // Should fail because next_command points past end.
         assert!(matches!(result, Err(WireError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_truncated_0x81_and_0x85_return_incomplete_frame() {
+        // 0x81 session request claiming 10 bytes, but only 2 bytes follow.
+        let frame_81 = [0x81u8, 0x00, 0x00, 10, 0xAA, 0xBB];
+        let mut slice_81: &[u8] = &frame_81;
+        assert!(matches!(
+            read_netbios_frame(&mut slice_81),
+            Err(WireError::IncompleteFrame)
+        ));
+
+        // 0x85 keep-alive claiming 8 bytes, but only 1 byte follows.
+        let frame_85 = [0x85u8, 0x00, 0x00, 8, 0xCC];
+        let mut slice_85: &[u8] = &frame_85;
+        assert!(matches!(
+            read_netbios_frame(&mut slice_85),
+            Err(WireError::IncompleteFrame)
+        ));
     }
 }

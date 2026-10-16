@@ -311,11 +311,20 @@ impl Vfs for MemoryFs {
 
         let mut files = self.files.lock().await;
         let file = files.get_mut(&key).ok_or(VfsError::NotFound)?;
-        file.attributes = info.attributes.clone();
-        file.creation_time = info.creation_time;
-        file.last_access_time = info.last_access_time;
-        file.last_write_time = info.last_write_time;
-        file.change_time = info.change_time;
+        if matches!(
+            _class,
+            InfoClass::FileEndOfFileInfo | InfoClass::FileAllocationInfo
+        ) && !file.is_directory
+        {
+            file.data.resize(info.size as usize, 0);
+        }
+        if matches!(_class, InfoClass::FileBasicInfo) {
+            file.attributes = info.attributes.clone();
+            file.creation_time = info.creation_time;
+            file.last_access_time = info.last_access_time;
+            file.last_write_time = info.last_write_time;
+            file.change_time = info.change_time;
+        }
         Ok(())
     }
 
@@ -407,7 +416,17 @@ impl Vfs for MemoryFs {
         if let Some(mut file) = files.remove(&old_key) {
             file.last_write_time = Self::now_filetime();
             file.change_time = file.last_write_time;
-            files.insert(new_key, file);
+            files.insert(new_key.clone(), file);
+            drop(files);
+            let mut opens = self.opens.lock().await;
+            let old_prefix = format!("{}\\", old_key);
+            for open_entry in opens.values_mut() {
+                if open_entry.file_key == old_key {
+                    open_entry.file_key = new_key.clone();
+                } else if let Some(rest) = open_entry.file_key.strip_prefix(&old_prefix) {
+                    open_entry.file_key = format!("{}\\{}", new_key, rest);
+                }
+            }
             Ok(())
         } else {
             Err(VfsError::NotFound)
@@ -466,44 +485,34 @@ fn matches_pattern(name: &str, pattern: &str) -> bool {
 }
 
 fn matches_pattern_impl(name: &[char], pattern: &[char]) -> bool {
-    let mut ni = 0;
-    let mut pi = 0;
+    let mut ni = 0usize;
+    let mut pi = 0usize;
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
 
-    while pi < pattern.len() {
-        match pattern[pi] {
-            '*' => {
-                pi += 1;
-                if pi >= pattern.len() {
-                    return true; // trailing * matches everything
-                }
-                // Try to match the rest of the pattern at each position
-                for i in 0..=name.len() {
-                    if matches_pattern_impl(&name[i..], &pattern[pi..]) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            '?' => {
-                if ni >= name.len() {
-                    return false;
-                }
-                ni += 1;
-                pi += 1;
-            }
-            pc => {
-                if ni >= name.len() {
-                    return false;
-                }
-                if !name[ni].eq_ignore_ascii_case(&pc) {
-                    return false;
-                }
-                ni += 1;
-                pi += 1;
-            }
+    while ni < name.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || name[ni].eq_ignore_ascii_case(&pattern[pi]))
+        {
+            ni += 1;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ni;
+            pi += 1;
+        } else if let Some(s) = star_idx {
+            pi = s + 1;
+            match_idx += 1;
+            ni = match_idx;
+        } else {
+            return false;
         }
     }
-    ni >= name.len()
+
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 #[cfg(test)]

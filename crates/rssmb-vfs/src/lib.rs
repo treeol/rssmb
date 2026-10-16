@@ -314,8 +314,42 @@ pub enum VfsError {
     InvalidName,
     #[error("directory not empty")]
     DirectoryNotEmpty,
+    #[error("disk full")]
+    DiskFull,
+    #[error("resource exhausted")]
+    ResourceExhausted,
     #[error("io error: {0}")]
     Io(String),
+}
+
+impl VfsError {
+    /// Convert a `std::io::Error` into the most specific [`VfsError`] variant
+    /// using OS `ErrorKind` and raw `errno` before falling back to `VfsError::Io`.
+    pub fn from_io(context: &str, err: std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        #[cfg(unix)]
+        if let Some(code) = err.raw_os_error() {
+            match code {
+                libc::ENOSPC | libc::EDQUOT => return VfsError::DiskFull,
+                libc::EROFS | libc::EACCES | libc::EPERM | libc::ELOOP => {
+                    return VfsError::AccessDenied
+                }
+                libc::EMFILE | libc::ENFILE | libc::ENOMEM => return VfsError::ResourceExhausted,
+                libc::EISDIR => return VfsError::IsDirectory,
+                libc::ENOTDIR => return VfsError::NotDirectory,
+                libc::ENOTEMPTY => return VfsError::DirectoryNotEmpty,
+                libc::ENOENT => return VfsError::NotFound,
+                libc::EEXIST => return VfsError::AlreadyExists,
+                _ => {}
+            }
+        }
+        match err.kind() {
+            ErrorKind::NotFound => VfsError::NotFound,
+            ErrorKind::PermissionDenied => VfsError::AccessDenied,
+            ErrorKind::AlreadyExists => VfsError::AlreadyExists,
+            _ => VfsError::Io(format!("{context}: {err}")),
+        }
+    }
 }
 
 /// The VFS trait. All operations are handle-centric.

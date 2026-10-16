@@ -207,7 +207,18 @@ impl NotifyHandle {
 ///    re-submits for subsequent changes)
 ///
 /// The task exits when cancelled (CANCEL, CLOSE, tree-disconnect, logoff)
+/// Start watching `dir_path` for changes matching `filter`.
+///
+/// When a matching event arrives, builds `FILE_NOTIFY_INFORMATION` and
+/// sends an async `ChangeNotifyResponse` via `send_unsolicited`. Also
+/// removes the op from `pending_async` so a concurrent CANCEL doesn't
+/// send a duplicate completion.
+///
+/// The watcher stops after delivering one notification (MS-SMB2: one
+/// completion per CHANGE_NOTIFY request — the client re-submits for
+/// subsequent changes), or when cancelled via `NotifyHandle::cancel()`,
 /// or when the watcher errors.
+#[allow(clippy::too_many_arguments)]
 pub fn start_watch(
     conn_state: &ConnState,
     message_id: u64,
@@ -216,6 +227,7 @@ pub fn start_watch(
     dir_path: PathBuf,
     watch_tree: bool,
     filter: CompletionFilter,
+    max_output_length: u32,
 ) -> NotifyHandle {
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
@@ -234,6 +246,7 @@ pub fn start_watch(
                 Ok(w) => w,
                 Err(e) => {
                     warn!(conn_id, error = %e, "change_notify: failed to create watcher");
+                    pending_async.lock().await.remove(&message_id);
                     return;
                 }
             };
@@ -247,6 +260,7 @@ pub fn start_watch(
 
         if let Err(e) = watcher.watch(&dir_path, mode) {
             warn!(conn_id, path = ?dir_path, error = %e, "change_notify: failed to watch directory");
+            pending_async.lock().await.remove(&message_id);
             return;
         }
 
@@ -290,12 +304,32 @@ pub fn start_watch(
                                     continue;
                                 }
 
-                                let buffer = serialize_notify_buffer(&entries);
+                                // Atomically claim completion from pending_async
+                                // BEFORE sending the unsolicited response, so a
+                                // concurrent CANCEL cannot race and send a second
+                                // completion for the same message_id.
+                                if pending_async.lock().await.remove(&message_id).is_none() {
+                                    debug!(conn_id, message_id, "change_notify: already cancelled before completion");
+                                    break;
+                                }
+
+                                let serialized = serialize_notify_buffer(&entries);
+                                // MS-SMB2 3.3.5.19: if the notification data exceeds
+                                // OutputBufferLength (or OutputBufferLength is 0),
+                                // return STATUS_NOTIFY_ENUM_DIR (0x0000010C) with an
+                                // empty buffer.
+                                let (status, buffer) = if max_output_length == 0
+                                    || serialized.len() > max_output_length as usize
+                                {
+                                    (0x0000_010Cu32, Vec::new())
+                                } else {
+                                    (rssmb_wire_adapter::NtStatus::Success.to_u32(), serialized)
+                                };
 
                                 // Build the async completion response.
                                 let header = rssmb_proto::header::Header {
                                     credit_charge: 0,
-                                    status: rssmb_wire_adapter::NtStatus::Success.to_u32(),
+                                    status,
                                     command: rssmb_proto::header::Command::ChangeNotify,
                                     credit_request: 0,
                                     flags: rssmb_proto::header::HeaderFlags::new()
@@ -316,22 +350,17 @@ pub fn start_watch(
 
                                 let framed = FramedResponse::Plain(resp);
                                 send_unsolicited(&conn_state_clone, &framed, true).await;
-
-                                // Remove the op from pending_async so CANCEL
-                                // can't target it and we don't send
-                                // duplicate completions. MS-SMB2: one
-                                // completion per request; the client
-                                // re-submits for subsequent changes.
-                                pending_async.lock().await.remove(&message_id);
                                 break;
                             }
                         }
                         Some(Err(e)) => {
                             warn!(conn_id, error = %e, "change_notify: watcher error");
+                            pending_async.lock().await.remove(&message_id);
                             break;
                         }
                         None => {
                             debug!(conn_id, "change_notify: watcher closed");
+                            pending_async.lock().await.remove(&message_id);
                             break;
                         }
                     }

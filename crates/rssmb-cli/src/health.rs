@@ -14,7 +14,19 @@ pub async fn serve(
     bind_addr: String,
     port: u16,
 ) -> Result<(), std::io::Error> {
-    let addr: SocketAddr = format!("{}:{}", bind_addr, port).parse().unwrap();
+    let ip: std::net::IpAddr = if bind_addr.is_empty() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else if bind_addr == "localhost" {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        bind_addr.parse().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid health bind address '{}': {}", bind_addr, e),
+            )
+        })?
+    };
+    let addr = SocketAddr::new(ip, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Health endpoint listening on {}", addr);
 
@@ -72,7 +84,7 @@ async fn handle_health_request(
         "/healthz" | "/liveness" => (200, "ok"),
         "/readyz" | "/ready" => {
             // Check if shares are configured
-            if _state.config.shares.is_empty() {
+            if _state.shares_snapshot().is_empty() {
                 (503, "not ready: no shares configured")
             } else {
                 (200, "ready")
