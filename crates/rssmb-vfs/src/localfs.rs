@@ -390,6 +390,9 @@ impl Vfs for LocalFs {
             self.dir
                 .create_dir(&effective_rel)
                 .map_err(|e| VfsError::Io(format!("create_dir: {e}")))?;
+            // The directory now exists; the open below must not try to
+            // create it again.
+            needs_create = false;
         } else if wants_file && exists && target_is_dir {
             return Err(VfsError::IsDirectory);
         }
@@ -397,16 +400,22 @@ impl Vfs for LocalFs {
         // Build cap-std open options.
         let mut opts = CapOpenOptions::new();
         opts.read(true);
-        let wants_write = matches!(
-            args.disposition,
-            CreateDisposition::Supersede
-                | CreateDisposition::Create
-                | CreateDisposition::OverwriteIf
-        ) || args.desired_access.write
-            || args.desired_access.generic_write
-            || args.desired_access.generic_all;
+        // Directories are always opened read-only and without O_CREAT:
+        // Linux rejects O_WRONLY/O_RDWR/O_CREAT on a directory with EISDIR,
+        // which surfaced as STATUS_INVALID_PARAMETER on every mkdir.
+        // Directory "writes" (creating children, rename, delete) go through
+        // the share Dir, not this fd.
+        let wants_write = !target_is_dir
+            && (matches!(
+                args.disposition,
+                CreateDisposition::Supersede
+                    | CreateDisposition::Create
+                    | CreateDisposition::OverwriteIf
+            ) || args.desired_access.write
+                || args.desired_access.generic_write
+                || args.desired_access.generic_all);
         opts.write(wants_write);
-        if needs_create {
+        if needs_create && !target_is_dir {
             opts.create(true);
         }
         if matches!(
@@ -1303,6 +1312,59 @@ mod tests {
         let id = fs.file_id(open).await.unwrap();
         assert_ne!(id, FileId { dev: 0, ino: 0 });
         fs.close(open).await.unwrap();
+    }
+
+    /// mkdir as sent by libsmbclient/GVFS and Windows: disposition Create
+    /// (or OpenIf) with FILE_DIRECTORY_FILE on a path that does not exist.
+    /// Regression: the open after create_dir used O_CREAT|O_WRONLY on the
+    /// new directory → EISDIR → STATUS_INVALID_PARAMETER ("Invalid argument").
+    #[tokio::test]
+    async fn test_mkdir_new_directory() {
+        let dir = tmp_root();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        for (name, disposition) in [
+            ("made_by_create", CreateDisposition::Create),
+            ("made_by_openif", CreateDisposition::OpenIf),
+        ] {
+            let args = CreateArgs {
+                disposition,
+                desired_access: DesiredAccess {
+                    read_attributes: true,
+                    ..Default::default()
+                },
+                create_options: CreateOptions {
+                    directory: true,
+                    ..Default::default()
+                },
+                ..CreateArgs::open_readonly()
+            };
+            let open = fs
+                .create("", name, &args)
+                .await
+                .unwrap_or_else(|e| panic!("mkdir {name} ({disposition:?}) failed: {e}"));
+            fs.close(open).await.unwrap();
+            assert!(
+                dir.path().join(name).is_dir(),
+                "{name} should be a directory"
+            );
+        }
+        // Nested mkdir inside a freshly created directory.
+        let args = CreateArgs {
+            disposition: CreateDisposition::Create,
+            create_options: CreateOptions {
+                directory: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open = fs.create("", "made_by_create/child", &args).await.unwrap();
+        fs.close(open).await.unwrap();
+        assert!(dir.path().join("made_by_create/child").is_dir());
+        // Create on an existing directory must collide, not succeed.
+        assert!(matches!(
+            fs.create("", "made_by_create", &args).await,
+            Err(VfsError::AlreadyExists)
+        ));
     }
 
     #[tokio::test]
