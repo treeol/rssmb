@@ -102,7 +102,7 @@ fn walk_sequence<T>(
 /// Handles three cases:
 /// - Raw NTLMSSP (starts with "NTLMSSP\0") → return as-is
 /// - SPNEGO negTokenInit (0x60) → parse the wrapper and extract the
-///   mechToken OCTET STRING from [0] negTokenInit > SEQUENCE > [1]
+///   mechToken OCTET STRING from [0] negTokenInit > SEQUENCE > [2]
 /// - SPNEGO negTokenResp (0xA1) → parse the wrapper and extract the
 ///   responseToken OCTET STRING from SEQUENCE > [2]
 ///
@@ -165,16 +165,16 @@ fn extract_from_neg_token_init(input: &[u8]) -> Result<Vec<u8>, String> {
     let (seq_content, _) = der_expect(init_content, 0x30)
         .ok_or_else(|| "malformed negTokenInit: missing SEQUENCE".to_string())?;
 
-    // Walk the SEQUENCE looking for [1] (0xA1) mechToken
+    // Walk the SEQUENCE looking for [2] (0xA2) mechToken
     let token = walk_sequence(seq_content, |tag, content| {
-        if tag == 0xA1 {
+        if tag == 0xA2 {
             // mechToken: OCTET STRING containing NTLMSSP
             der_octet_string(content).map(|(octet, _)| octet.to_vec())
         } else {
             None
         }
     })
-    .ok_or_else(|| "negTokenInit: no mechToken ([1]) found".to_string())?;
+    .ok_or_else(|| "negTokenInit: no mechToken ([2]) found".to_string())?;
 
     Ok(token)
 }
@@ -468,9 +468,9 @@ mod tests {
         let ntlm_oid = der_tlv(0x06, NTLMSSP_OID);
         let mech_types_inner = der_tlv(0x30, &ntlm_oid);
         let mech_types = der_tlv(0xA0, &mech_types_inner);
-        // mechToken: [1] OCTET STRING
+        // mechToken: [2] OCTET STRING
         let mech_token_octet = der_tlv(0x04, ntlm_token);
-        let mech_token = der_tlv(0xA1, &mech_token_octet);
+        let mech_token = der_tlv(0xA2, &mech_token_octet);
         // SEQUENCE inside negTokenInit
         let mut seq_inner = mech_types;
         seq_inner.extend_from_slice(&mech_token);
