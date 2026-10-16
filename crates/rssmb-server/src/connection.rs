@@ -131,11 +131,26 @@ where
     use tokio::io::AsyncReadExt;
 
     loop {
-        // Read the 4-byte NetBIOS header.
+        // Read the 4-byte NetBIOS header. Distinguish clean EOF (0 bytes read
+        // — peer closed the connection) from a truncated header (1–3 bytes —
+        // connection was cut mid-frame). Read the first byte separately so
+        // EOF on byte 0 means "clean close" and EOF on bytes 1–3 means
+        // "truncated header".
         let mut hdr = [0u8; 4];
-        match stream.read_exact(&mut hdr).await {
+        match stream.read_exact(&mut hdr[..1]).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        // Read the remaining 3 bytes — EOF here means truncated header.
+        match stream.read_exact(&mut hdr[1..]).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated NetBIOS header — connection closed mid-frame",
+                ));
+            }
             Err(e) => return Err(e),
         }
 
@@ -155,8 +170,19 @@ where
             continue; // loop to read the next frame
         }
 
-        // Keep-alive (0x85): no payload — loop to read the next frame.
+        // Keep-alive (0x85): no payload per spec, but a non-zero length must
+        // still be consumed to stay aligned in the stream.
         if msg_type == 0x85 {
+            if len > 0 {
+                if len > max_frame_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("oversized NetBIOS keep-alive: {len} bytes"),
+                    ));
+                }
+                let mut discard = vec![0u8; len];
+                stream.read_exact(&mut discard).await?;
+            }
             continue;
         }
 
@@ -275,8 +301,14 @@ impl Connection {
         }
 
         // Clean up: remove sessions owned by this connection, close all
-        // remaining VFS handles, and cancel pending async ops.
-        Self::cleanup(&state, conn_id, &conn_state).await;
+        // remaining VFS handles, and cancel pending async ops. Bound the
+        // entire post-read-loop phase (cleanup + write drain) so a stuck
+        // VFS close or a blocked write task can't keep the connection
+        // half-open forever (finding 5: shutdown timeout was after cleanup,
+        // not around it).
+        let cleanup_grace = std::time::Duration::from_secs(state.config.shutdown_grace_secs.max(5));
+        let _ =
+            tokio::time::timeout(cleanup_grace, Self::cleanup(&state, conn_id, &conn_state)).await;
 
         // Close the write channel so the write task drains and exits. Every
         // sender must go: `conn_state` holds a clone, and while it lived the
@@ -287,7 +319,8 @@ impl Connection {
 
         // Wait for the write task to finish (bounded wait to avoid hanging).
         // A timed-out JoinHandle would merely detach the task, keeping the
-        // socket half open — abort it explicitly.
+        // socket half open — abort it explicitly and await to observe
+        // termination (finding 6).
         let mut write_task = write_task;
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut write_task).await {
             Ok(Ok(())) => {}
@@ -298,6 +331,7 @@ impl Connection {
                     "write task did not finish within 5 s — aborting it"
                 );
                 write_task.abort();
+                let _ = write_task.await;
             }
         }
 

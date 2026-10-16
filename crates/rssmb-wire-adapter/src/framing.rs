@@ -37,7 +37,14 @@ pub fn read_netbios_frame(buf: &mut &[u8]) -> Result<Vec<u8>, WireError> {
     }
 
     if msg_type == 0x85 {
-        // Keep-alive — no payload
+        // Keep-alive — no payload per spec, but a non-zero length must be
+        // consumed to stay aligned in the buffer.
+        if len > 0 {
+            if len as usize > MAX_FRAME_SIZE {
+                return Err(WireError::OversizedFrame(len as usize));
+            }
+            let _ = buf.copy_to_bytes(len as usize);
+        }
         return Ok(Vec::new());
     }
 

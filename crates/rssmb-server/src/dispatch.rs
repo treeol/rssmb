@@ -1,9 +1,10 @@
 //! Message dispatcher — receives [`FramedMessage`] from the wire and produces
 //! [`FramedResponse`].
 //!
-//! Phase 1: NEGOTIATE and ECHO are implemented.
-//! Phase 2: SESSION_SETUP with multi-round NTLM auth is implemented.
-//! Other commands return STATUS_NOT_SUPPORTED.
+//! All SMB2 commands are implemented: NEGOTIATE, SESSION_SETUP, TREE_CONNECT,
+//! CREATE, READ, WRITE, CLOSE, FLUSH, LOCK, ECHO, CANCEL, QUERY_DIRECTORY,
+//! QUERY_INFO, SET_INFO, CHANGE_NOTIFY, TREE_DISCONNECT, LOGOFF, and
+//! NEGOTIATE signing/encryption (SMB 2.1–3.1.1).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -286,7 +287,7 @@ pub fn select_dialect(
             continue; // Unknown dialect — ignore, don't crash.
         };
         if !IMPLEMENTED_DIALECTS.contains(&dc) {
-            continue; // Not implemented (e.g. 3.1.1 until Step 7c).
+            continue; // Not implemented by this server.
         }
         if dc < effective_min || dc > effective_max {
             continue; // Outside configured range.
@@ -417,15 +418,15 @@ async fn handle_compound(
     // (WRITE data offsets and signatures are relative to the member's header).
     let ranges = rssmb_wire_adapter::framing::message_ranges(raw_frame);
 
-    for (i, mut req) in requests.into_iter().enumerate() {
-        let is_related = req.header.flags.related_operations();
-
-        // MS-SMB2: NEGOTIATE and SESSION_SETUP MUST NOT be compounded.
-        // A compound containing either is rejected with STATUS_INVALID_PARAMETER.
-        // This also prevents the preauth-hash response-before-encode race
-        // for 3.1.1 (Mashūra plan review §1): in a compound, the response
-        // bytes of the first member are not available for hashing before the
-        // second member is dispatched.
+    // MS-SMB2: NEGOTIATE and SESSION_SETUP MUST NOT be compounded.
+    // Prevalidate the entire compound before dispatching any member — a
+    // mid-loop rejection would leave earlier members' side effects (created
+    // files, acquired locks, opened handles) in place without rollback.
+    // This also prevents the preauth-hash response-before-encode race
+    // for 3.1.1 (Mashūra plan review §1): in a compound, the response
+    // bytes of the first member are not available for hashing before the
+    // second member is dispatched.
+    for req in &requests {
         if req.header.command == Command::Negotiate || req.header.command == Command::SessionSetup {
             if let Err(boxed) = charge_credits(conn_state, &req.header) {
                 if let FramedResponse::Disconnect = *boxed {
@@ -437,6 +438,10 @@ async fn handle_compound(
                 NtStatus::InvalidParameter.to_u32(),
             )));
         }
+    }
+
+    for (i, mut req) in requests.into_iter().enumerate() {
+        let is_related = req.header.flags.related_operations();
 
         let saved_header = req.header.clone();
         let member_bytes = match ranges.get(i) {

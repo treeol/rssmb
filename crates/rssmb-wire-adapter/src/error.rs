@@ -24,7 +24,7 @@ pub enum WireError {
 pub enum NtStatus {
     /// Success (0x00000000)
     Success,
-    /// More processing required (0x00000116) — for multi-round auth
+    /// More processing required (0xC0000016) — for multi-round auth
     MoreProcessingRequired,
     /// Pending (0x00000103) — async response
     Pending,
