@@ -23,7 +23,7 @@ pub use ntlmv2::{compute_exported_session_key, compute_session_key, nt_hash};
 
 use sspi::{
     ntlm::Ntlm, BufferType, DataRepresentation, SecurityBuffer, SecurityStatus, ServerRequestFlags,
-    Sspi, SspiEx, SspiImpl,
+    Sspi, SspiImpl,
 };
 
 /// Authentication state during a multi-round exchange.
@@ -493,15 +493,17 @@ impl AuthProvider for NtlmAuthProvider {
             // Save the negotiate flags for the mechListMIC computation.
             state.ntlm_neg_flags = fields.neg_flags;
 
-            // Still call complete_auth_token so sspi transitions its internal
-            // state, but pass an empty identity list — we've already verified
-            // the proof ourselves.
-            ssp.custom_set_auth_identities(vec![])
-                .map_err(|e| AuthError::SspiError(format!("set_auth_identities: {e}")))?;
-            status = ssp.complete_auth_token(&mut []).map_err(|e| {
-                tracing::debug!("NTLM complete_auth_token: {e}");
-                AuthError::LogonFailure(e.to_string())
-            })?;
+            // We've verified the NTLMv2 proof and computed the session key
+            // ourselves from the NT hash. We do NOT call sspi's
+            // complete_auth_token — it requires credentials with the
+            // plaintext password (we only have the NT hash) and its
+            // custom_set_auth_identities rejects empty identity lists.
+            // Instead, set the status to Ok and let the match below
+            // handle the rest using our own session key and the wire
+            // username from query_context_names (which reads the identity
+            // that read_authenticate already set from the AUTHENTICATE
+            // message's user/domain fields).
+            status = SecurityStatus::Ok;
         }
 
         match status {
