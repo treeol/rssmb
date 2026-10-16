@@ -809,7 +809,10 @@ mod tests {
     #[test]
     fn test_file_internal_info_golden_bytes() {
         let info = FileInfo {
-            file_id: VfsFileId { dev: 0, ino: 0xDEADBEEF },
+            file_id: VfsFileId {
+                dev: 0,
+                ino: 0xDEADBEEF,
+            },
             ..test_file_info()
         };
         let buf = file_internal_info(&info);

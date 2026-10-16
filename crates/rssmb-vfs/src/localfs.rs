@@ -73,7 +73,10 @@ fn attributes_from_metadata(meta: &std::fs::Metadata) -> FileAttributes {
 /// Compute the file identity. On Unix this is the inode number; elsewhere 0.
 #[cfg(unix)]
 fn file_id_from_metadata(meta: &std::fs::Metadata) -> FileId {
-    FileId { dev: meta.dev(), ino: meta.ino() }
+    FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
 }
 
 #[cfg(not(unix))]
@@ -773,7 +776,10 @@ impl Vfs for LocalFs {
             #[cfg(unix)]
             let file_id = {
                 use cap_std::fs::MetadataExt;
-                Some(FileId { dev: meta.dev(), ino: meta.ino() })
+                Some(FileId {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                })
             };
             #[cfg(not(unix))]
             let file_id = None;
@@ -918,19 +924,18 @@ impl Vfs for LocalFs {
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("."));
 
-        let open_parent =
-            |parent: Option<&Path>| -> Result<Option<cap_std::fs::Dir>, VfsError> {
-                match parent {
-                    Some(p) => Ok(Some(self.dir.open_dir(p).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            VfsError::NotFound
-                        } else {
-                            VfsError::AccessDenied
-                        }
-                    })?)),
-                    None => Ok(None),
-                }
-            };
+        let open_parent = |parent: Option<&Path>| -> Result<Option<cap_std::fs::Dir>, VfsError> {
+            match parent {
+                Some(p) => Ok(Some(self.dir.open_dir(p).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        VfsError::NotFound
+                    } else {
+                        VfsError::AccessDenied
+                    }
+                })?)),
+                None => Ok(None),
+            }
+        };
         let old_parent_dir = open_parent(old_parent)?;
         let new_parent_dir = open_parent(new_parent)?;
 

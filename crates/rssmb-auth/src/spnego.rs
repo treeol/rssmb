@@ -79,10 +79,7 @@ fn der_octet_string(data: &[u8]) -> Option<(&[u8], &[u8])> {
 /// Walk the elements of a SEQUENCE content slice, calling `f` for each
 /// element. The slice passed to `f` is the element's content, bounded
 /// within the SEQUENCE. Returns the first non-None result.
-fn walk_sequence<T>(
-    seq_content: &[u8],
-    mut f: impl FnMut(u8, &[u8]) -> Option<T>,
-) -> Option<T> {
+fn walk_sequence<T>(seq_content: &[u8], mut f: impl FnMut(u8, &[u8]) -> Option<T>) -> Option<T> {
     let mut rest = seq_content;
     while !rest.is_empty() {
         let (tag, content, remaining) = der_tlv_split(rest)?;
@@ -515,7 +512,10 @@ mod tests {
         let seq = der_tlv(0x30, &ctx0);
         let outer = der_tlv(0xA1, &seq);
         let result = extract_ntlm_token(&outer);
-        assert!(result.is_err(), "negTokenResp without responseToken should error");
+        assert!(
+            result.is_err(),
+            "negTokenResp without responseToken should error"
+        );
     }
 
     #[test]
@@ -570,7 +570,10 @@ mod tests {
         let seq = der_tlv(0x30, &seq_inner);
         let outer = der_tlv(0xA1, &seq);
         let result = extract_ntlm_token(&outer).unwrap();
-        assert_eq!(result, ntlm_token, "trailing mechListMIC should not be included");
+        assert_eq!(
+            result, ntlm_token,
+            "trailing mechListMIC should not be included"
+        );
     }
 
     // --- extract_mech_list_mic tests ---

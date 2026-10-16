@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use rssmb_auth::{spnego, AuthError, AuthProvider, AuthState, AuthStep, IdentityStore, NtlmAuthProvider};
+use rssmb_auth::{
+    spnego, AuthError, AuthProvider, AuthState, AuthStep, IdentityStore, NtlmAuthProvider,
+};
 use sspi::{
     AuthIdentity, BufferType, ClientRequestFlags, CredentialUse, DataRepresentation, Ntlm,
     SecurityBuffer, SecurityStatus, Sspi, SspiImpl, Username,
@@ -51,12 +53,8 @@ fn neg_token_resp(ntlm: &[u8]) -> Vec<u8> {
 }
 
 fn provider(guest_access: bool) -> NtlmAuthProvider {
-    let store = IdentityStore::from_users([(
-        USER.to_string(),
-        PASSWORD.to_string(),
-        String::new(),
-        false,
-    )]);
+    let store =
+        IdentityStore::from_users([(USER.to_string(), PASSWORD.to_string(), String::new(), false)]);
     NtlmAuthProvider::with_identity_store(Arc::new(store), guest_access)
 }
 
@@ -184,7 +182,8 @@ async fn raw_ntlmssp_valid_credentials_complete() {
     let mut client = Client::new(USER, PASSWORD);
     let mut state = AuthState::new();
 
-    let (_, session_key, identity) = expect_complete(run(&provider, &mut client, &mut state, false).await);
+    let (_, session_key, identity) =
+        expect_complete(run(&provider, &mut client, &mut state, false).await);
     assert_eq!(identity.username, USER);
     assert!(!identity.is_guest);
     assert_eq!(
@@ -205,7 +204,11 @@ async fn spnego_valid_credentials_complete() {
     assert_eq!(identity.username, USER);
     assert_eq!(session_key, client.session_key());
     // Final negTokenResp must be SPNEGO accept-completed.
-    assert_eq!(output_token.first(), Some(&0xA1), "accept-completed negTokenResp");
+    assert_eq!(
+        output_token.first(),
+        Some(&0xA1),
+        "accept-completed negTokenResp"
+    );
 }
 
 #[tokio::test]

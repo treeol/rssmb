@@ -305,8 +305,7 @@ impl AuthProvider for NtlmAuthProvider {
         // Unwrap SPNEGO to get the raw NTLMSSP token. If extraction fails,
         // reject — do not fall back to passing the raw wrapper to the NTLM
         // parser (finding 1: unbounded suffix / wrong token).
-        let ntlm_token = spnego::extract_ntlm_token(input_token)
-            .map_err(AuthError::SpnegoError)?;
+        let ntlm_token = spnego::extract_ntlm_token(input_token).map_err(AuthError::SpnegoError)?;
 
         // Save the raw NTLMSSP NEGOTIATE (type 1) message for AUTHENTICATE
         // MIC verification (MS-NLMP 3.2.5.1.2). On the first round this is
@@ -474,7 +473,8 @@ impl AuthProvider for NtlmAuthProvider {
                 &session_base_key,
                 fields.neg_flags,
                 &fields.encrypted_random_session_key,
-            ).map_err(|e| AuthError::LogonFailure(e.to_string()))?;
+            )
+            .map_err(|e| AuthError::LogonFailure(e.to_string()))?;
 
             // AUTHENTICATE message MIC verification (MS-NLMP 3.2.5.1.2).
             // If the client's MsvAvFlags has the MIC-present bit set, the
@@ -539,7 +539,8 @@ impl AuthProvider for NtlmAuthProvider {
                 // than silently using an empty key (finding 11).
                 let session_key = state.session_key.clone().ok_or_else(|| {
                     AuthError::LogonFailure(
-                        "internal state error: session key not computed despite verified proof".into(),
+                        "internal state error: session key not computed despite verified proof"
+                            .into(),
                     )
                 })?;
 

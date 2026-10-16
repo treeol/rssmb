@@ -147,7 +147,10 @@ impl Vfs for MemoryFs {
 
         if !exists {
             let now = Self::now_filetime();
-            let new_id = FileId { dev: 0, ino: files.len() as u64 };
+            let new_id = FileId {
+                dev: 0,
+                ino: files.len() as u64,
+            };
             files.insert(
                 key.clone(),
                 InMemoryFile {

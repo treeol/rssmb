@@ -512,7 +512,11 @@ mod tests {
     #[test]
     fn test_new_zero_grants_no_credits() {
         let mgr = CreditManager::new(0);
-        assert_eq!(mgr.available_credits(), 0, "new(0) should start with 0 credits");
+        assert_eq!(
+            mgr.available_credits(),
+            0,
+            "new(0) should start with 0 credits"
+        );
         // Granting should not increase available (max_grant=0 caps everything).
         let granted = mgr.grant(100);
         assert_eq!(granted, 0);

@@ -494,7 +494,7 @@ mod tests {
         // Note: does NOT include KEY_EXCH (0x40000000) — the test
         // EncryptedRandomSessionKey field is empty.
         msg.extend_from_slice(&0x0008_2882u32.to_le_bytes());
-                                                              // Version (8 bytes)
+        // Version (8 bytes)
         msg.extend_from_slice(&[0u8; 8]);
         // MIC placeholder (16 bytes) — will be filled in
         msg.extend_from_slice(&[0u8; 16]);
@@ -630,9 +630,12 @@ mod tests {
         let base_key = compute_session_key(&hash, &f);
         // When KEY_EXCH is set, ExportedSessionKey = RC4(SessionBaseKey, EncRSK).
         let encrypted = rc4_decrypt(&base_key, &[0x42u8; 16]);
-        let exported =
-            compute_exported_session_key(&base_key, FLAG_KEY_EXCH, &encrypted).unwrap();
-        assert_eq!(exported, vec![0x42u8; 16], "RC4 is symmetric — decrypt(encrypt) = original");
+        let exported = compute_exported_session_key(&base_key, FLAG_KEY_EXCH, &encrypted).unwrap();
+        assert_eq!(
+            exported,
+            vec![0x42u8; 16],
+            "RC4 is symmetric — decrypt(encrypt) = original"
+        );
     }
 
     #[test]
@@ -641,7 +644,10 @@ mod tests {
         let hash = nt_hash("Password");
         let base_key = compute_session_key(&hash, &f);
         let result = compute_exported_session_key(&base_key, FLAG_KEY_EXCH, &[]);
-        assert!(result.is_err(), "KEY_EXCH with empty EncryptedRandomSessionKey should error");
+        assert!(
+            result.is_err(),
+            "KEY_EXCH with empty EncryptedRandomSessionKey should error"
+        );
     }
 
     #[test]
@@ -650,6 +656,9 @@ mod tests {
         let hash = nt_hash("Password");
         let base_key = compute_session_key(&hash, &f);
         let exported = compute_exported_session_key(&base_key, 0, &[0x42u8; 16]).unwrap();
-        assert_eq!(exported, base_key, "without KEY_EXCH, ExportedSessionKey = SessionBaseKey");
+        assert_eq!(
+            exported, base_key,
+            "without KEY_EXCH, ExportedSessionKey = SessionBaseKey"
+        );
     }
 }
