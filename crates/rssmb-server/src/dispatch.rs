@@ -5613,14 +5613,6 @@ mod tests {
 
     // --- Phase 4 Option C: per-share read_users/write_users tests ---
 
-    fn make_test_state_with_shares(shares: Vec<(&str, ShareConfig)>) -> Arc<ServerState> {
-        let mut config = crate::config::ServerConfig::for_testing();
-        for (key, sc) in shares {
-            config.shares.insert(key.to_string(), sc);
-        }
-        Arc::new(ServerState::new(config))
-    }
-
     fn make_share_config(
         name: &str,
         read_only: bool,

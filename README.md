@@ -52,6 +52,7 @@ kernel CIFS client, `smbclient`, GNOME Files (Nautilus), and Samba's
 
 ```sh
 mkdir -p data/public data/homes && sudo chown -R 1000:1000 data
+chmod 600 config/rssmb.toml   # contains credentials; see note below
 docker compose -f docker/compose.yml up -d --build
 docker logs -f rssmb   # Ctrl-C to stop following
 curl -s localhost:8080/healthz
@@ -62,6 +63,13 @@ share, a `homes` share, and a test account `alice` / `TestPass123` —
 **not for production.** For production, copy `config/rssmb.example.toml`
 to `config/rssmb.toml` and edit it (signing required, guest disabled, real
 users with NT hashes).
+
+The container runs as UID 1000 and reads `config/rssmb.toml` through a
+read-only bind mount, so the file must stay readable by UID 1000. If your
+host user is not UID 1000, use `sudo chown 1000 config/rssmb.toml`
+(keeping mode `600`), or `sudo chgrp 1000 config/rssmb.toml && chmod 640 config/rssmb.toml`.
+Without this, the server logs a "config file is world-readable" warning on
+startup.
 
 Port 445 on the host must be free (stop a local Samba first). If it
 isn't, change the mapping in `docker/compose.yml` to e.g. `"4450:445"`
