@@ -158,40 +158,67 @@ impl LocalFs {
     /// resolution to the share root; a symlink targeting outside is
     /// refused by the kernel. No extra check needed.
     fn check_no_symlinks(&self, rel: &Path) -> Result<(), VfsError> {
-        if self.follow_symlinks != FollowSymlinks::Never {
-            return Ok(());
-        }
         // "." and empty paths refer to the root dir itself — no symlink.
         if rel == Path::new(".") || rel.as_os_str().is_empty() {
             return Ok(());
         }
-        let mut accum = PathBuf::new();
-        for component in rel.components() {
-            match component {
-                std::path::Component::Normal(name) => {
-                    accum.push(name);
-                    match self.dir.symlink_metadata(&accum) {
-                        Ok(meta) => {
-                            if meta.file_type().is_symlink() {
-                                return Err(VfsError::AccessDenied);
+
+        if self.follow_symlinks == FollowSymlinks::Never {
+            // Never: reject any symlink in any path component. Walk every
+            // component via symlink_metadata (lstat) anchored at the share
+            // root dir. This catches intermediate-directory symlinks that
+            // a final-component-only check would miss.
+            let mut accum = PathBuf::new();
+            for component in rel.components() {
+                match component {
+                    std::path::Component::Normal(name) => {
+                        accum.push(name);
+                        match self.dir.symlink_metadata(&accum) {
+                            Ok(meta) => {
+                                if meta.file_type().is_symlink() {
+                                    return Err(VfsError::AccessDenied);
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // Component doesn't exist — not a symlink. The
+                                // actual file operation will fail with NotFound
+                                // if needed; we only reject symlinks here.
+                            }
+                            Err(e) => {
+                                // Unexpected error (permissions, I/O) — propagate.
+                                return Err(VfsError::Io(format!("symlink_metadata: {e}")));
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Component doesn't exist — not a symlink. The
-                            // actual file operation will fail with NotFound
-                            // if needed; we only reject symlinks here.
-                        }
-                        Err(e) => {
-                            // Unexpected error (permissions, I/O) — propagate.
-                            return Err(VfsError::Io(format!("symlink_metadata: {e}")));
-                        }
                     }
+                    std::path::Component::CurDir => {}
+                    _ => {} // RootDir/ParentDir shouldn't appear after resolve_rel
                 }
-                std::path::Component::CurDir => {}
-                _ => {} // RootDir/ParentDir shouldn't appear after resolve_rel
             }
+            return Ok(());
         }
-        Ok(())
+
+        // WithinShare: cap-std's open operations use openat2(RESOLVE_BENEATH)
+        // on Linux ≥5.6, but unlinkat(2), renameat(2), and other path-based
+        // operations do not. Verify the parent directory is accessible via
+        // cap-std (confined by RESOLVE_BENEATH) to ensure intermediate
+        // symlinks don't escape the share.
+        let parent = match rel.parent() {
+            None => return Ok(()),
+            Some(p) if p == Path::new("") || p == Path::new(".") => return Ok(()),
+            Some(p) => p,
+        };
+        self.dir
+            .open_dir(parent)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    VfsError::NotFound
+                } else {
+                    // RESOLVE_BENEATH rejected a symlink escape, or other
+                    // I/O error — deny access.
+                    VfsError::AccessDenied
+                }
+            })
+            .map(|_| ())
     }
 
     /// On a case-insensitive share, resolve a path that doesn't exist exactly
@@ -871,37 +898,82 @@ impl Vfs for LocalFs {
         self.check_no_symlinks(&old_rel)?;
         self.check_no_symlinks(&new_rel)?;
 
-        // Use renameat2(RENAME_NOREPLACE) when replace=false for an atomic
-        // check-and-rename with no TOCTOU window. On Linux, this is a single
-        // syscall: the kernel atomically refuses if the target exists. On
-        // platforms without RENAME_NOREPLACE, fall back to cap-std's
-        // check-then-rename (which has a narrow TOCTOU window).
+        // Open parent directories via cap-std (confined by RESOLVE_BENEATH
+        // on Linux ≥5.6). Renaming using only the final component name
+        // relative to the parent dir fd prevents intermediate symlinks
+        // from redirecting the rename outside the share — the parent
+        // path is resolved by the kernel with RESOLVE_BENEATH, and the
+        // rename operates on a basename within the already-resolved
+        // directory (finding 4).
+        let old_parent = old_rel
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && *p != Path::new("."));
+        let old_name = old_rel
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("."));
+        let new_parent = new_rel
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && *p != Path::new("."));
+        let new_name = new_rel
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("."));
+
+        let open_parent =
+            |parent: Option<&Path>| -> Result<Option<cap_std::fs::Dir>, VfsError> {
+                match parent {
+                    Some(p) => Ok(Some(self.dir.open_dir(p).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            VfsError::NotFound
+                        } else {
+                            VfsError::AccessDenied
+                        }
+                    })?)),
+                    None => Ok(None),
+                }
+            };
+        let old_parent_dir = open_parent(old_parent)?;
+        let new_parent_dir = open_parent(new_parent)?;
+
         #[cfg(target_os = "linux")]
         {
+            use std::os::fd::AsFd;
             if !replace {
-                use std::os::fd::AsFd;
                 use rustix::fs::{renameat_with, RenameFlags};
-                match renameat_with(
-                    self.dir.as_fd(),
-                    &old_rel,
-                    self.dir.as_fd(),
-                    &new_rel,
-                    RenameFlags::NOREPLACE,
-                ) {
+                let old_fd = old_parent_dir
+                    .as_ref()
+                    .map(|d| d.as_fd())
+                    .unwrap_or_else(|| self.dir.as_fd());
+                let new_fd = new_parent_dir
+                    .as_ref()
+                    .map(|d| d.as_fd())
+                    .unwrap_or_else(|| self.dir.as_fd());
+                match renameat_with(old_fd, old_name, new_fd, new_name, RenameFlags::NOREPLACE) {
                     Ok(()) => {}
-                    Err(rustix::io::Errno::EXIST) => {
-                        return Err(VfsError::AlreadyExists);
-                    }
-                    Err(e) => {
-                        return Err(VfsError::Io(format!("renameat2(NOREPLACE): {e}")));
-                    }
+                    Err(rustix::io::Errno::EXIST) => return Err(VfsError::AlreadyExists),
+                    Err(e) => return Err(VfsError::Io(format!("renameat2(NOREPLACE): {e}"))),
                 }
             } else {
-                self.dir
-                    .rename(&old_rel, &self.dir, &new_rel)
-                    .map_err(|e| VfsError::Io(format!("rename: {e}")))?;
+                // Use cap-std's Dir::rename from the parent dir with a
+                // basename — no intermediate symlinks are traversed.
+                match (&old_parent_dir, &new_parent_dir) {
+                    (Some(od), Some(nd)) => od
+                        .rename(old_name, nd, new_name)
+                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                    (Some(od), None) => od
+                        .rename(old_name, &self.dir, new_name)
+                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                    (None, Some(nd)) => self
+                        .dir
+                        .rename(old_name, nd, new_name)
+                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                    (None, None) => self
+                        .dir
+                        .rename(old_name, &self.dir, new_name)
+                        .map_err(|e| VfsError::Io(format!("rename: {e}"))),
+                }?;
             }
         }
+
         #[cfg(not(target_os = "linux"))]
         {
             if !replace && self.dir.exists(&new_rel) {

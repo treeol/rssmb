@@ -34,8 +34,14 @@ pub struct AuthState {
     first_round: bool,
     /// The session key exported on completion
     session_key: Option<Vec<u8>>,
-    /// Whether auth has already completed (to handle SPNEGO's final round)
+    /// Whether the NTLM mechanism has completed (proof verified).
+    /// The session is usable only if `awaiting_mic` is also false.
     auth_completed: bool,
+    /// Whether we are awaiting the client's mechListMIC in a follow-up
+    /// SPNEGO round. Set when signing is negotiated but the client
+    /// hasn't sent its MIC yet. The session is not Complete until this
+    /// is cleared by the `auth_completed` branch (finding 2).
+    awaiting_mic: bool,
     /// The guest identity from the completed auth
     completed_identity: Option<Identity>,
     /// ServerChallenge we sent in the CHALLENGE message, for our own
@@ -66,6 +72,7 @@ impl std::fmt::Debug for AuthState {
             .field("first_round", &self.first_round)
             .field("has_session_key", &self.session_key.is_some())
             .field("auth_completed", &self.auth_completed)
+            .field("awaiting_mic", &self.awaiting_mic)
             .finish()
     }
 }
@@ -77,6 +84,7 @@ impl AuthState {
             first_round: true,
             session_key: None,
             auth_completed: false,
+            awaiting_mic: false,
             completed_identity: None,
             server_challenge: None,
             proof_verified: false,
@@ -260,6 +268,12 @@ impl AuthProvider for NtlmAuthProvider {
         // If auth already completed, this is the final SPNEGO round
         // (negTokenResp with the client's mechListMIC). Verify the
         // client's MIC when NTLM signing was negotiated (RFC 4178 §5).
+        //
+        // The `awaiting_mic` flag is set when the previous round returned
+        // Continue with `accept-completed` because signing was negotiated
+        // but the client hadn't sent its mechListMIC yet. Only after this
+        // branch verifies the MIC (or determines no MIC is needed) is the
+        // session Complete (finding 2).
         if state.auth_completed {
             let identity = state.completed_identity.clone().ok_or_else(|| {
                 AuthError::LogonFailure("internal state error: completed identity missing".into())
@@ -268,29 +282,35 @@ impl AuthProvider for NtlmAuthProvider {
                 AuthError::LogonFailure("internal state error: session key missing".into())
             })?;
 
-            // Verify the client's mechListMIC if signing was negotiated.
-            // For raw NTLMSSP (no SPNEGO), there is no MIC to verify.
-            if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
-                let client_mic = spnego::extract_mech_list_mic(input_token);
-                if let Some(mic) = client_mic {
-                    let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
-                    if !ntlm_mic::verify_client(
-                        &session_key,
-                        state.ntlm_neg_flags,
-                        mech_types,
-                        &mic,
-                    ) {
-                        tracing::warn!("mechListMIC verification failed — rejecting");
-                        return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
+            // If we're awaiting the client's mechListMIC, it must be present
+            // and must verify. Failure here is terminal — do not allow retry.
+            if state.awaiting_mic {
+                if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
+                    let client_mic = spnego::extract_mech_list_mic(input_token);
+                    if let Some(mic) = client_mic {
+                        let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
+                        if !ntlm_mic::verify_client(
+                            &session_key,
+                            state.ntlm_neg_flags,
+                            mech_types,
+                            &mic,
+                        ) {
+                            tracing::warn!("mechListMIC verification failed — rejecting");
+                            state.awaiting_mic = false; // terminal — no retry
+                            return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
+                        }
+                        tracing::debug!("mechListMIC verified successfully");
+                    } else {
+                        // Signing was negotiated but no MIC was provided.
+                        // This is a protocol violation — the client must send
+                        // its mechListMIC when the server sent one.
+                        tracing::warn!("signing negotiated but client sent no mechListMIC — rejecting");
+                        state.awaiting_mic = false; // terminal — no retry
+                        return Err(AuthError::LogonFailure("missing mechListMIC".into()));
                     }
-                    tracing::debug!("mechListMIC verified successfully");
-                } else {
-                    // Signing was negotiated but no MIC was provided.
-                    // This is a protocol violation — the client must send
-                    // its mechListMIC when the server sent one.
-                    tracing::warn!("signing negotiated but client sent no mechListMIC — rejecting");
-                    return Err(AuthError::LogonFailure("missing mechListMIC".into()));
                 }
+                // MIC verified (or not needed) — session is now complete.
+                state.awaiting_mic = false;
             }
 
             return Ok(AuthStep::Complete {
@@ -322,9 +342,11 @@ impl AuthProvider for NtlmAuthProvider {
             }
         }
 
-        // Unwrap SPNEGO to get the raw NTLMSSP token
-        let ntlm_token =
-            spnego::extract_ntlm_token(input_token).unwrap_or_else(|_| input_token.to_vec());
+        // Unwrap SPNEGO to get the raw NTLMSSP token. If extraction fails,
+        // reject — do not fall back to passing the raw wrapper to the NTLM
+        // parser (finding 1: unbounded suffix / wrong token).
+        let ntlm_token = spnego::extract_ntlm_token(input_token)
+            .map_err(AuthError::SpnegoError)?;
 
         // Save the raw NTLMSSP NEGOTIATE (type 1) message for AUTHENTICATE
         // MIC verification (MS-NLMP 3.2.5.1.2). On the first round this is
@@ -615,13 +637,15 @@ impl AuthProvider for NtlmAuthProvider {
                 };
 
                 // If signing was negotiated but the client hasn't sent its
-                // mechListMIC yet, return Continue so the client must send
-                // it before the session is usable. The auth_completed branch
-                // verifies it on the next round (finding 3).
+                // mechListMIC yet, set `awaiting_mic` and return Continue so
+                // the client must send it before the session is usable. The
+                // auth_completed branch verifies it on the next round
+                // (finding 2).
                 let signing_needs_mic = state.uses_spnego()
                     && ntlm_mic::supported(state.ntlm_neg_flags)
                     && !client_mic_verified;
                 if signing_needs_mic {
+                    state.awaiting_mic = true;
                     tracing::debug!("signing negotiated, awaiting client mechListMIC");
                     Ok(AuthStep::Continue { output_token })
                 } else {
