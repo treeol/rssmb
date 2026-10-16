@@ -1053,9 +1053,19 @@ impl Connection {
             if entry.is_pipe {
                 continue;
             }
-            // Remove from the global open table.
+            // Remove from the global open table and release any byte-range
+            // locks held by this open. On abrupt disconnect (TCP RST, idle
+            // timeout), the normal CLOSE/LOGOFF/TREE_DISCONNECT path doesn't
+            // run, so locks would otherwise survive as stale entries.
             if let Some(fid) = entry.file_id {
                 state.open_table.remove(fid, entry.open_id).await;
+            }
+            let released = state
+                .open_table
+                .release_all_locks_for_open(entry.open_id)
+                .await;
+            if released > 0 {
+                debug!(conn_id, open_id = ?entry.open_id, released, "cleanup: released stale locks");
             }
             // Durable opens: leave the VFS handle alive in the durable
             // table for reconnect. The OpenTable entry was removed above so

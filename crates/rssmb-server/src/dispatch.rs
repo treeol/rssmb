@@ -2812,6 +2812,27 @@ async fn handle_create(
                 rssmb_vfs::VfsError::SharingViolation => NtStatus::SharingViolation,
                 rssmb_vfs::VfsError::PathTraversal => NtStatus::InvalidParameter,
                 rssmb_vfs::VfsError::InvalidName => NtStatus::ObjectNameInvalid,
+                rssmb_vfs::VfsError::IsDirectory => NtStatus::FileIsADirectory,
+                rssmb_vfs::VfsError::NotDirectory => NtStatus::NotADirectory,
+                rssmb_vfs::VfsError::DirectoryNotEmpty => NtStatus::DirectoryNotEmpty,
+                rssmb_vfs::VfsError::NotSupported => NtStatus::NotSupported,
+                rssmb_vfs::VfsError::Io(ref msg) => {
+                    // Map common I/O errors to specific NT statuses so clients
+                    // get actionable error codes instead of a generic
+                    // STATUS_INVALID_PARAMETER.
+                    if msg.contains("No space left") {
+                        NtStatus::DiskFull
+                    } else if msg.contains("Read-only")
+                        || msg.contains("read-only")
+                        || msg.contains("Permission denied")
+                    {
+                        NtStatus::AccessDenied
+                    } else if msg.contains("Too many open") {
+                        NtStatus::InsufficientServerResources
+                    } else {
+                        NtStatus::InvalidParameter
+                    }
+                }
                 _ => NtStatus::InvalidParameter,
             };
             error_response_for(Command::Create, status, &req.header)

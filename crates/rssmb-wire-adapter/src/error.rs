@@ -58,6 +58,12 @@ pub enum NtStatus {
     AccountDisabled,
     /// Not supported (0xC00000BB)
     NotSupported,
+    /// Directory not empty (0xC0000101)
+    DirectoryNotEmpty,
+    /// Disk full (0xC000007F)
+    DiskFull,
+    /// Insufficient server resources (0xC0000205)
+    InsufficientServerResources,
     /// Buffer too small (0xC0000023)
     BufferTooSmall,
     /// No more files (0x80000006) — STATUS_NO_MORE_FILES
@@ -103,6 +109,9 @@ impl NtStatus {
             NtStatus::NoSuchUser => 0xC0000064,
             NtStatus::AccountDisabled => 0xC0000072,
             NtStatus::NotSupported => 0xC00000BB,
+            NtStatus::DirectoryNotEmpty => 0xC0000101,
+            NtStatus::DiskFull => 0xC000007F,
+            NtStatus::InsufficientServerResources => 0xC0000205,
             NtStatus::BufferTooSmall => 0xC0000023,
             NtStatus::NoMoreFiles => 0x80000006,
             NtStatus::NoMoreEntries => 0x8000001A,
@@ -137,6 +146,9 @@ impl NtStatus {
             0xC0000064 => NtStatus::NoSuchUser,
             0xC0000072 => NtStatus::AccountDisabled,
             0xC00000BB => NtStatus::NotSupported,
+            0xC0000101 => NtStatus::DirectoryNotEmpty,
+            0xC000007F => NtStatus::DiskFull,
+            0xC0000205 => NtStatus::InsufficientServerResources,
             0xC0000023 => NtStatus::BufferTooSmall,
             0x80000006 => NtStatus::NoMoreFiles,
             0x8000001A => NtStatus::NoMoreEntries,
