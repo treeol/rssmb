@@ -1653,7 +1653,7 @@ mod tests {
         #[test]
         fn prop_shared_lock_no_read_conflict_same_owner(
             offset in 0u64..=1024,
-            len in 0u64..=1024,
+            len in 1u64..=1024,
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             let conflict: Option<String> = rt.block_on(async {

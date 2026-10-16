@@ -77,11 +77,15 @@ impl std::fmt::Debug for CreditManager {
 
 impl CreditManager {
     pub fn new(max_grant: u32) -> Self {
+        // Start with 1 credit (granted in negotiate response) unless
+        // max_grant is 0 — then no credits at all (max_grant=0 disables
+        // granting; available is 0 and window [0,0) is empty).
+        let initial = if max_grant > 0 { 1 } else { 0 };
         Self {
             window: std::sync::Mutex::new(CreditWindow {
-                available: 1, // Start with 1 credit (granted in negotiate response)
+                available: initial,
                 low: 0,
-                high: 1, // [0, 1) — one credit available starting at MessageId 0
+                high: initial as u64, // [0, initial) — 0 or 1 credit
                 used: HashSet::new(),
             }),
             max_grant,
@@ -99,10 +103,11 @@ impl CreditManager {
     /// - `InsufficientCredits`: the MessageId is outside the window, already
     ///   used, or `m + c` overflows. This is a sequence-window violation
     ///   (MS-SMB2 3.3.5.2.3) — the connection must be terminated.
+    ///   **State is unchanged** on this error.
     /// - `ExcessiveCharge`: the charge exceeds our local policy cap (`max_charge`).
-    ///   The credits are still spent — the client sent the request.
-    ///
-    /// On error, the window state is unchanged (no partial mutation).
+    ///   The credits **are still spent** — the client sent the request and
+    ///   consumed the MessageIds. State **is** mutated; the error is a policy
+    ///   rejection, not a protocol violation.
     pub fn check_and_deduct(&self, message_id: u64, charge: u32) -> Result<(), CreditError> {
         let charge = charge.max(1);
         let mut w = self.window.lock().unwrap();
@@ -505,6 +510,19 @@ mod tests {
     }
 
     #[test]
+    fn test_new_zero_grants_no_credits() {
+        let mgr = CreditManager::new(0);
+        assert_eq!(mgr.available_credits(), 0, "new(0) should start with 0 credits");
+        // Granting should not increase available (max_grant=0 caps everything).
+        let granted = mgr.grant(100);
+        assert_eq!(granted, 0);
+        assert_eq!(mgr.available_credits(), 0);
+        // Any deduction should fail (window [0,0) is empty).
+        let r = mgr.check_and_deduct(0, 1);
+        assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
+    }
+
+    #[test]
     fn test_partial_overlap_rejected() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // window [0..100)
@@ -538,11 +556,12 @@ mod tests {
                 let effective_charge = charge.max(1);
                 let after = mgr.available_credits();
                 prop_assert!(after <= before);
-                // available may decrease by more than charge if low advances
-                // past contiguous used entries — but never by less.
+                // available decreases by exactly effective_charge (credits
+                // are consumed). low advancing doesn't change available —
+                // it only reclaims used entries for future grants.
                 let decrease = before - after;
-                prop_assert!(decrease >= effective_charge,
-                    "decrease {} < effective_charge {}", decrease, effective_charge);
+                prop_assert_eq!(decrease, effective_charge,
+                    "decrease {} != effective_charge {}", decrease, effective_charge);
             }
         }
 

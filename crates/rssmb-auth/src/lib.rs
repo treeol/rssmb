@@ -19,7 +19,7 @@ pub mod spnego;
 #[allow(deprecated)]
 pub use credentials::CredentialStore;
 pub use credentials::IdentityStore;
-pub use ntlmv2::{compute_session_key, nt_hash};
+pub use ntlmv2::{compute_exported_session_key, compute_session_key, nt_hash};
 
 use sspi::{
     ntlm::Ntlm, BufferType, DataRepresentation, SecurityBuffer, SecurityStatus, ServerRequestFlags,
@@ -109,7 +109,6 @@ impl Default for AuthState {
 }
 
 /// The result of one step of the authentication conversation.
-#[derive(Debug)]
 pub enum AuthStep {
     /// Send this output token to the client and wait for the next input.
     Continue { output_token: Vec<u8> },
@@ -121,6 +120,31 @@ pub enum AuthStep {
     },
     /// Authentication failed.
     Reject { reason: AuthError },
+}
+
+impl std::fmt::Debug for AuthStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthStep::Continue { output_token } => f
+                .debug_struct("AuthStep::Continue")
+                .field("output_token", &format!("[{} bytes]", output_token.len()))
+                .finish(),
+            AuthStep::Complete {
+                output_token,
+                session_key: _,
+                identity,
+            } => f
+                .debug_struct("AuthStep::Complete")
+                .field("output_token", &format!("[{} bytes]", output_token.len()))
+                .field("session_key", &"<redacted>")
+                .field("identity", identity)
+                .finish(),
+            AuthStep::Reject { reason } => f
+                .debug_struct("AuthStep::Reject")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 /// Authenticated identity.
@@ -448,7 +472,12 @@ impl AuthProvider for NtlmAuthProvider {
             // Compute the session key directly from the NT hash — we don't
             // need sspi to do this for us, and we don't have the plaintext
             // password to pass to sspi's identity machinery.
-            let session_key = ntlmv2::compute_session_key(&stored.nt_hash, &fields);
+            let session_base_key = ntlmv2::compute_session_key(&stored.nt_hash, &fields);
+            let session_key = ntlmv2::compute_exported_session_key(
+                &session_base_key,
+                fields.neg_flags,
+                &fields.encrypted_random_session_key,
+            ).map_err(|e| AuthError::LogonFailure(e.to_string()))?;
 
             // AUTHENTICATE message MIC verification (MS-NLMP 3.2.5.1.2).
             // If the client's MsvAvFlags has the MIC-present bit set, the
@@ -506,17 +535,14 @@ impl AuthProvider for NtlmAuthProvider {
             ),
             SecurityStatus::Ok | SecurityStatus::CompleteNeeded => {
                 // Use the session key we computed ourselves from the NT hash
-                // (set during CompleteNeeded processing). Fall back to sspi's
-                // if our computation didn't happen for some reason.
-                let session_key = state.session_key.clone().unwrap_or_else(|| {
-                    let key_info = ssp
-                        .query_context_session_key()
-                        .map_err(|e| AuthError::SspiError(format!("session_key: {e}")))
-                        .ok();
-                    key_info
-                        .map(|k| k.session_key.as_ref().clone())
-                        .unwrap_or_default()
-                });
+                // (set during CompleteNeeded processing). If our computation
+                // didn't happen, this is a logic error — fail closed rather
+                // than silently using an empty key (finding 11).
+                let session_key = state.session_key.clone().ok_or_else(|| {
+                    AuthError::LogonFailure(
+                        "internal state error: session key not computed despite verified proof".into(),
+                    )
+                })?;
 
                 // Authenticated account name. Fail closed rather than invent
                 // a principal — valid_users checks depend on it.
@@ -540,6 +566,7 @@ impl AuthProvider for NtlmAuthProvider {
                 // MIC in the same negTokenResp as the AUTHENTICATE; others
                 // send it in a separate follow-up round that lands in the
                 // auth_completed branch. Verify in both places.
+                let mut client_mic_verified = false;
                 if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
                     if let Some(client_mic) = spnego::extract_mech_list_mic(input_token) {
                         let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
@@ -553,10 +580,11 @@ impl AuthProvider for NtlmAuthProvider {
                             return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
                         }
                         tracing::debug!("mechListMIC verified on AUTHENTICATE leg");
+                        client_mic_verified = true;
                     }
-                    // If no MIC is present on this leg, it may arrive in the
-                    // next SPNEGO round (auth_completed branch). Don't reject
-                    // yet — the client may send it separately.
+                    // If no MIC is present, require a follow-up round —
+                    // return Continue so the client must send its
+                    // mechListMIC before the session is usable.
                 }
 
                 // NTLM's final leg has no server token. For SPNEGO clients
@@ -585,11 +613,24 @@ impl AuthProvider for NtlmAuthProvider {
                 } else {
                     state.wrap(&ntlm_output)
                 };
-                Ok(AuthStep::Complete {
-                    output_token,
-                    session_key,
-                    identity,
-                })
+
+                // If signing was negotiated but the client hasn't sent its
+                // mechListMIC yet, return Continue so the client must send
+                // it before the session is usable. The auth_completed branch
+                // verifies it on the next round (finding 3).
+                let signing_needs_mic = state.uses_spnego()
+                    && ntlm_mic::supported(state.ntlm_neg_flags)
+                    && !client_mic_verified;
+                if signing_needs_mic {
+                    tracing::debug!("signing negotiated, awaiting client mechListMIC");
+                    Ok(AuthStep::Continue { output_token })
+                } else {
+                    Ok(AuthStep::Complete {
+                        output_token,
+                        session_key,
+                        identity,
+                    })
+                }
             }
             other => Err(AuthError::SspiError(format!(
                 "unexpected status: {other:?}"

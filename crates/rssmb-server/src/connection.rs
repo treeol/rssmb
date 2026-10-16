@@ -69,12 +69,22 @@ impl ConnectionLimiter {
         let per_ip = counts.entry(addr).or_insert(0);
         if self.max_per_ip > 0 && *per_ip >= self.max_per_ip {
             warn!(ip = %addr, "connection rejected: per-IP limit reached");
+            // Remove the entry we just inserted if its count is still 0,
+            // so rejected IPs don't accumulate in the map (finding 7).
+            if *per_ip == 0 {
+                counts.remove(&addr);
+            }
             return None;
         }
         let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
         if self.max_total > 0 && total > self.max_total as u64 {
             self.total.fetch_sub(1, Ordering::Relaxed);
             warn!(ip = %addr, total, "connection rejected: global limit reached");
+            // Remove the per-IP entry if we haven't incremented it yet —
+            // prevents unbounded map growth from rejected connections (finding 7).
+            if *per_ip == 0 {
+                counts.remove(&addr);
+            }
             return None;
         }
         *per_ip += 1;
@@ -994,8 +1004,21 @@ impl Connection {
                     "encoded response"
                 );
                 // If the write channel is closed (peer gone / write task
-                // exited), sending fails — log and end the loop.
-                if conn_state.write_tx.send(encoded).await.is_err() {
+                // exited) or shutdown is signaled, end the loop. Use a
+                // timeout race so a full channel can't block indefinitely
+                // and prevent shutdown from aborting the loop (finding 6).
+                let send_result = tokio::select! {
+                    biased;
+                    _ = state.shutdown.notified() => {
+                        debug!(
+                            conn_id = conn_state.conn_id,
+                            "shutdown signaled during response enqueue; ending read loop"
+                        );
+                        return Ok(());
+                    }
+                    res = conn_state.write_tx.send(encoded) => res,
+                };
+                if send_result.is_err() {
                     warn!(
                         conn_id = conn_state.conn_id,
                         "write channel closed; ending read loop"

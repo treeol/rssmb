@@ -17,7 +17,10 @@ no Kerberos, no macOS. Single service-OS user with per-share access lists.
   (exponential backoff + hard cooldown). Per-connection failure cap.
 - **Connection flooding:** Global + per-IP connection limits.
 - **Malformed protocol frames:** All parsers are bounds-checked and
-  fuzzed (6 existing + 3 new targets). Panic-catching in the read loop.
+  fuzzed (6 existing + 3 new targets). Panic-catching (`catch_unwind`)
+  in the read loop guards `parse_payload`; downstream handlers, signing,
+  crypto, and cleanup are outside the catch_unwind scope. Build profiles
+  do not set `panic=abort`, so `catch_unwind` is effective.
 - **Path traversal / symlink escapes:** cap-std confinement with
   openat2(RESOLVE_BENEATH) on Linux ≥5.6. TOCTOU-free. Symlink policy
   configurable per share (Never / WithinShare).
@@ -26,7 +29,11 @@ no Kerberos, no macOS. Single service-OS user with per-share access lists.
 - **Credit exhaustion / sequence confusion:** MessageId sequence window
   with bounded state (HashSet capped at max_grant width), overflow-safe
   arithmetic, all-or-nothing deduction.
-- **Replay attacks:** NTLM MsvAvTimestamp anti-replay (configurable).
+- **Replay attacks:** NTLM MsvAvTimestamp presence check (configurable).
+  The server requires the client to include a timestamp AV_PAIR in the
+  AUTHENTICATE blob. This is a presence check, not full replay detection
+  (no comparison against server time, no freshness window). A captured
+  AUTHENTICATE can still be replayed within an active challenge window.
 
 ### Malicious authenticated users
 

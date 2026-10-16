@@ -147,19 +147,50 @@ impl LocalFs {
         Ok(normalized.to_pathbuf())
     }
 
-    /// Check symlink policy for a path that exists. Returns `AccessDenied`
-    /// if the path is a symlink and the policy is `Never`.
-    fn check_symlink_policy(&self, rel: &Path) -> Result<(), VfsError> {
-        if self.follow_symlinks == FollowSymlinks::Never {
-            if let Ok(meta) = self.dir.symlink_metadata(rel) {
-                if meta.file_type().is_symlink() {
-                    return Err(VfsError::AccessDenied);
+    /// Check symlink policy for a path. Returns `AccessDenied` if any
+    /// component of the path is a symlink and the policy is `Never`.
+    ///
+    /// Walks every path component via `symlink_metadata` (lstat) anchored
+    /// at the share root dir. This catches intermediate-directory symlinks
+    /// that `check_symlink_policy` (final-component-only) missed.
+    ///
+    /// For `WithinShare`: cap-std's `openat2(RESOLVE_BENEATH)` confines
+    /// resolution to the share root; a symlink targeting outside is
+    /// refused by the kernel. No extra check needed.
+    fn check_no_symlinks(&self, rel: &Path) -> Result<(), VfsError> {
+        if self.follow_symlinks != FollowSymlinks::Never {
+            return Ok(());
+        }
+        // "." and empty paths refer to the root dir itself — no symlink.
+        if rel == Path::new(".") || rel.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let mut accum = PathBuf::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(name) => {
+                    accum.push(name);
+                    match self.dir.symlink_metadata(&accum) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                return Err(VfsError::AccessDenied);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Component doesn't exist — not a symlink. The
+                            // actual file operation will fail with NotFound
+                            // if needed; we only reject symlinks here.
+                        }
+                        Err(e) => {
+                            // Unexpected error (permissions, I/O) — propagate.
+                            return Err(VfsError::Io(format!("symlink_metadata: {e}")));
+                        }
+                    }
                 }
+                std::path::Component::CurDir => {}
+                _ => {} // RootDir/ParentDir shouldn't appear after resolve_rel
             }
         }
-        // For WithinShare: cap-std's openat2(RESOLVE_BENEATH) confines
-        // resolution. A symlink targeting outside the share root is
-        // refused by the kernel. No extra check needed.
         Ok(())
     }
 
@@ -265,7 +296,7 @@ impl Vfs for LocalFs {
         // openat2 which refuses symlink-escaped paths, returning false).
         let mut exists = self.dir.symlink_metadata(&rel).is_ok();
         if exists {
-            self.check_symlink_policy(&rel)?;
+            self.check_no_symlinks(&rel)?;
         }
 
         // Case-insensitive lookup: if the exact path doesn't exist and the
@@ -278,7 +309,7 @@ impl Vfs for LocalFs {
                 if self.dir.symlink_metadata(&ci_rel).is_ok() {
                     effective_rel = ci_rel;
                     exists = true;
-                    self.check_symlink_policy(&effective_rel)?;
+                    self.check_no_symlinks(&effective_rel)?;
                 }
             }
         }
@@ -469,6 +500,7 @@ impl Vfs for LocalFs {
         // handle_arc is dropped here, closing the fd.
         drop(handle_arc);
         if delete_on_close {
+            self.check_no_symlinks(&rel)?;
             if is_dir {
                 self.dir
                     .remove_dir(&rel)
@@ -615,6 +647,7 @@ impl Vfs for LocalFs {
                 let perms = CapPermissionsExt::from_mode(new_mode);
                 let rel = handle.rel_path.clone();
                 drop(handle);
+                self.check_no_symlinks(&rel)?;
                 if let Err(e) = self.dir.set_permissions(&rel, perms) {
                     return Err(VfsError::Io(format!("set_permissions: {e}")));
                 }
@@ -642,6 +675,8 @@ impl Vfs for LocalFs {
         }
         let rel = handle.rel_path.clone();
         drop(handle);
+
+        self.check_no_symlinks(&rel)?;
 
         let mut entries = Vec::new();
         // Open the subdirectory via cap-std (confined). Root ("." or "")
@@ -767,6 +802,8 @@ impl Vfs for LocalFs {
             (h.rel_path.clone(), h.is_directory)
         };
 
+        self.check_no_symlinks(&rel)?;
+
         if delete && is_dir {
             // Check that the directory is empty (MS-FSCC).
             let read_dir = if rel.as_os_str().is_empty() || rel == Path::new(".") {
@@ -805,6 +842,8 @@ impl Vfs for LocalFs {
         let is_dir = h.is_directory;
         drop(h);
 
+        self.check_no_symlinks(&rel)?;
+
         if is_dir {
             self.dir
                 .remove_dir(&rel)
@@ -826,6 +865,11 @@ impl Vfs for LocalFs {
         drop(handle_guard);
 
         let new_rel = self.resolve_rel(new_path)?;
+
+        // Check symlink policy on both old and new paths — prevents
+        // acting through intermediate symlinks (finding 1 & 2).
+        self.check_no_symlinks(&old_rel)?;
+        self.check_no_symlinks(&new_rel)?;
 
         // Use renameat2(RENAME_NOREPLACE) when replace=false for an atomic
         // check-and-rename with no TOCTOU window. On Linux, this is a single
@@ -1507,5 +1551,86 @@ mod tests {
         }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_intermediate_symlink_rejected_delete() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_root();
+        std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+        std::fs::write(dir.path().join("realdir").join("file.txt"), b"content").unwrap();
+        // Create a symlink "linkdir" → "realdir"
+        symlink("realdir", dir.path().join("linkdir")).unwrap();
+
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // Open the file through the symlink directory
+        let create = CreateArgs {
+            disposition: CreateDisposition::Open,
+            desired_access: DesiredAccess {
+                read: true,
+                delete: true,
+                read_attributes: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        // Open "linkdir/file.txt" — create should reject due to intermediate symlink
+        let result = fs.create("", "linkdir\\file.txt", &create).await;
+        assert!(
+            matches!(result, Err(VfsError::AccessDenied)),
+            "opening through intermediate symlink with Never policy should be refused: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_intermediate_symlink_rejected_rename() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_root();
+        std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+        symlink("realdir", dir.path().join("linkdir")).unwrap();
+
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // Create a file directly in realdir
+        let create = CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                read_attributes: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let open = fs.create("", "realdir\\file.txt", &create).await.unwrap();
+        // Try to rename to a path through the symlink dir
+        let result = fs.rename(open, "linkdir\\moved.txt", false).await;
+        assert!(
+            matches!(result, Err(VfsError::AccessDenied)),
+            "rename through intermediate symlink should be refused: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_intermediate_symlink_allowed_within_share() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_root();
+        std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+        std::fs::write(dir.path().join("realdir").join("file.txt"), b"content").unwrap();
+        symlink("realdir", dir.path().join("linkdir")).unwrap();
+
+        // WithinShare: intermediate symlinks within the share are followed.
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::WithinShare, false).unwrap();
+        let open = fs
+            .create("", "linkdir\\file.txt", &CreateArgs::open_readonly())
+            .await
+            .expect("within-share intermediate symlink should be followed");
+        let data = fs.read_at(open, 0, 100).await.unwrap();
+        assert_eq!(data.as_ref(), b"content");
+        fs.close(open).await.unwrap();
     }
 }

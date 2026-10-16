@@ -281,9 +281,8 @@ pub fn extract_mech_list_mic(input: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut p = 1; // skip A1
-    let outer_len = der_len_value(&input[p..])?;
+    let _outer_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?;
-    let outer_end = p + outer_len;
 
     // Expect SEQUENCE (0x30)
     if input.get(p) != Some(&0x30) {
@@ -292,10 +291,13 @@ pub fn extract_mech_list_mic(input: &[u8]) -> Option<Vec<u8>> {
     p += 1;
     let seq_len = der_len_value(&input[p..])?;
     p += der_len_size(&input[p..])?;
-    let _seq_end = p + seq_len;
+    let seq_end = p + seq_len;
 
     // Walk the SEQUENCE elements looking for [3] (0xA3).
-    while p < outer_end && p < input.len() {
+    // Bound the loop by seq_end — the end of the inner SEQUENCE — not
+    // outer_end, so trailing data after the SEQUENCE can't be misread
+    // as SEQUENCE elements (finding 10).
+    while p < seq_end && p < input.len() {
         let tag = input[p];
         p += 1;
         let len = der_len_value(&input[p..])?;

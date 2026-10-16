@@ -27,6 +27,9 @@ pub struct AuthenticateFields {
     pub domain_utf16: Vec<u8>,
     /// Negotiate flags from the AUTHENTICATE message (MS-NLMP 2.2.1.3 offset 60).
     pub neg_flags: u32,
+    /// EncryptedRandomSessionKey (MS-NLMP 2.2.1.3 offset 52). Present when
+    /// NTLMSSP_NEGOTIATE_KEY_EXCH is set; empty otherwise.
+    pub encrypted_random_session_key: Vec<u8>,
 }
 
 impl AuthenticateFields {
@@ -50,6 +53,7 @@ pub fn parse_authenticate_fields(msg: &[u8]) -> Option<AuthenticateFields> {
         domain_utf16: field(28)?,
         user_utf16: field(36)?,
         neg_flags: u32_le(msg, 60).unwrap_or(0),
+        encrypted_random_session_key: field(52).unwrap_or_default(),
     })
 }
 
@@ -123,6 +127,55 @@ pub fn compute_session_key(nt_hash: &[u8], fields: &AuthenticateFields) -> Vec<u
     let mut mac = <HmacMd5 as Mac>::new_from_slice(&ntowf_v2).expect("any key length");
     mac.update(proof);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// NTLMSSP_NEGOTIATE_KEY_EXCH flag (MS-NLMP 2.2.2.5).
+pub const FLAG_KEY_EXCH: u32 = 0x4000_0000;
+
+/// Compute the ExportedSessionKey from SessionBaseKey and the
+/// EncryptedRandomSessionKey. When KEY_EXCH is negotiated, the
+/// ExportedSessionKey is RC4-encrypted with SessionBaseKey as the key:
+///
+///   ExportedSessionKey = RC4(SessionBaseKey, EncryptedRandomSessionKey)
+///
+/// When KEY_EXCH is not negotiated, ExportedSessionKey = SessionBaseKey.
+pub fn compute_exported_session_key(
+    session_base_key: &[u8],
+    neg_flags: u32,
+    encrypted_random_session_key: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    if neg_flags & FLAG_KEY_EXCH != 0 {
+        if encrypted_random_session_key.is_empty() {
+            return Err("KEY_EXCH negotiated but EncryptedRandomSessionKey is empty");
+        }
+        Ok(rc4_decrypt(session_base_key, encrypted_random_session_key))
+    } else {
+        Ok(session_base_key.to_vec())
+    }
+}
+
+/// Minimal RC4 decryption (same algorithm as ntlm_mic::Rc4 but standalone).
+fn rc4_decrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut state = [0u8; 256];
+    for (i, v) in state.iter_mut().enumerate() {
+        *v = i as u8;
+    }
+    let mut j: u8 = 0;
+    for i in 0..256 {
+        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+        state.swap(i, j as usize);
+    }
+    let mut i: u8 = 0;
+    let mut j: u8 = 0;
+    data.iter()
+        .map(|b| {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(state[i as usize]);
+            state.swap(i as usize, j as usize);
+            let k = state[(state[i as usize].wrapping_add(state[j as usize])) as usize];
+            b ^ k
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +337,7 @@ mod tests {
                 user_utf16: string_to_utf16le("User"),
                 domain_utf16: string_to_utf16le("Domain"),
                 neg_flags: 0,
+                encrypted_random_session_key: vec![],
             },
             server_challenge,
         )
@@ -436,8 +490,10 @@ mod tests {
         msg.extend_from_slice(&[0u8; 8]);
         // EncryptedRandomSessionKeyFields: empty
         msg.extend_from_slice(&[0u8; 8]);
-        // NegFlags
-        msg.extend_from_slice(&0x0008_2882u32.to_le_bytes()); // ESS | 128 | KEY_EXCH | ...
+        // NegFlags: ESS (0x00080000) | NTLM2 (0x000800) | 56 (0x80) | 0x02.
+        // Note: does NOT include KEY_EXCH (0x40000000) — the test
+        // EncryptedRandomSessionKey field is empty.
+        msg.extend_from_slice(&0x0008_2882u32.to_le_bytes());
                                                               // Version (8 bytes)
         msg.extend_from_slice(&[0u8; 8]);
         // MIC placeholder (16 bytes) — will be filled in
@@ -565,5 +621,35 @@ mod tests {
         nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
         nt_response.extend_from_slice(&0u16.to_le_bytes());
         assert!(!has_timestamp(&nt_response));
+    }
+
+    #[test]
+    fn key_exch_decrypts_exported_session_key() {
+        let (f, _sc) = ms_nlmp_vector();
+        let hash = nt_hash("Password");
+        let base_key = compute_session_key(&hash, &f);
+        // When KEY_EXCH is set, ExportedSessionKey = RC4(SessionBaseKey, EncRSK).
+        let encrypted = rc4_decrypt(&base_key, &[0x42u8; 16]);
+        let exported =
+            compute_exported_session_key(&base_key, FLAG_KEY_EXCH, &encrypted).unwrap();
+        assert_eq!(exported, vec![0x42u8; 16], "RC4 is symmetric — decrypt(encrypt) = original");
+    }
+
+    #[test]
+    fn key_exch_empty_encrypted_key_rejected() {
+        let (f, _sc) = ms_nlmp_vector();
+        let hash = nt_hash("Password");
+        let base_key = compute_session_key(&hash, &f);
+        let result = compute_exported_session_key(&base_key, FLAG_KEY_EXCH, &[]);
+        assert!(result.is_err(), "KEY_EXCH with empty EncryptedRandomSessionKey should error");
+    }
+
+    #[test]
+    fn no_key_exch_returns_session_base_key() {
+        let (f, _sc) = ms_nlmp_vector();
+        let hash = nt_hash("Password");
+        let base_key = compute_session_key(&hash, &f);
+        let exported = compute_exported_session_key(&base_key, 0, &[0x42u8; 16]).unwrap();
+        assert_eq!(exported, base_key, "without KEY_EXCH, ExportedSessionKey = SessionBaseKey");
     }
 }
