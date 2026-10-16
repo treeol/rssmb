@@ -352,6 +352,21 @@ impl AuthProvider for NtlmAuthProvider {
                     identity,
                 });
             }
+            // An AUTHENTICATE with no NtChallengeResponse that is not
+            // anonymous (e.g. a user name with no proof) can never verify.
+            // Reject it here with a precise reason instead of letting sspi
+            // fail with an opaque "NtChallengeResponse cannot be empty".
+            if summary.nt_len == 0 {
+                tracing::debug!(
+                    user_len = summary.user_len,
+                    lm_len = summary.lm_len,
+                    "AUTHENTICATE without NT response and not anonymous"
+                );
+                return Err(AuthError::LogonFailure(format!(
+                    "AUTHENTICATE without NT response (not anonymous: user_len={}, lm_len={})",
+                    summary.user_len, summary.lm_len
+                )));
+            }
         }
 
         // Pass the raw NTLMSSP token to the NTLM SSP
