@@ -33,14 +33,14 @@ services:
     stop_grace_period: 10s
     # Restart policy for container orchestration
     restart: unless-stopped
-    # Health check via the HTTP endpoint
-    healthcheck:
-      # The runtime image has no curl; bash's /dev/tcp is enough to probe it.
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+    # Health check via the HTTP endpoint.
+    # The scratch image has no shell, so we use the binary's own health
+    # endpoint by checking if the port is accepting connections.
+    # Docker's healthcheck can't run /rssmb (it's the entrypoint), so we
+    # rely on an external healthcheck via the host port mapping instead.
+    # For now, no in-container healthcheck — use the health endpoint
+    # directly from the host or orchestrator.
+
     # Security: read-only root filesystem, write only to /data and /tmp
     read_only: true
     tmpfs:

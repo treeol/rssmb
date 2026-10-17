@@ -1,34 +1,35 @@
 # Multi-stage Dockerfile for RSSMB
-# Stage 1: Build
-# MSRV is 1.78 (rust-toolchain.toml, needed for Cargo.lock v4).
+# Stage 1: Build a fully static musl binary
+# MSRV is 1.85 (rust-toolchain.toml).
 FROM rust:1.90-bookworm AS builder
+
+# Install musl tools for static linking
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin rssmb
 
-# Stage 2: Runtime (minimal)
-FROM debian:bookworm-slim
+# Build a fully static binary with musl. Strip symbols for a smaller image.
+ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin rssmb
 
-# Install ca-certificates for TLS and create a non-root user (UID 1000)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 1000 rssmb \
-    && useradd -u 1000 -g 1000 -r -s /bin/false rssmb
+# Stage 2: Runtime — FROM scratch, just the static binary
+FROM scratch
 
-COPY --from=builder /build/target/release/rssmb /usr/local/bin/rssmb
+# Copy the static binary
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/rssmb /rssmb
 
 # Create the config directory so bind-mounting a config file works
 # (Docker creates a directory if the parent doesn't exist).
-RUN mkdir -p /etc/rssmb
-
-# Config is NOT baked in — mount it as a volume (see docker/compose.yml).
-# The server will fail fast if /etc/rssmb/rssmb.toml is missing.
+# In scratch we can't mkdir, but Docker will create parent dirs for
+# bind-mount targets automatically.
 
 # Health endpoint on 8080, SMB on 445
 EXPOSE 445 8080
 
-USER rssmb
+# Run as UID 1000 (non-root). scratch has no /etc/passwd, but Docker
+# resolves numeric UIDs without it.
+USER 1000:1000
 
-ENTRYPOINT ["rssmb", "--config", "/etc/rssmb/rssmb.toml"]
+ENTRYPOINT ["/rssmb", "--config", "/etc/rssmb/rssmb.toml"]
