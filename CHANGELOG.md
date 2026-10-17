@@ -5,6 +5,12 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-10-17
+
+First public release. SMB 2.1 – 3.1.1 server with NTLMv2 auth, AES-128-GCM
+encryption, durable handles v2, file leases v1/v2 + traditional oplocks,
+multichannel, SMB over QUIC, and SrvSvc share enumeration.
+
 ## [Unreleased]
 
 ### Added — Release 1.0 Scope

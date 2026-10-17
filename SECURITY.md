@@ -13,7 +13,9 @@ RSSMB is pre-1.0. Security fixes are applied to the latest `main` only.
 
 **Do not open a public issue.**
 
-Email: **TODO — set up security@ email or GitHub Security Advisories**
+Use **GitHub Security Advisories** (Security tab → Advisories → Report a
+vulnerability). This keeps reports private and lets the maintainers
+coordinate a fix and CVE without a public issue.
 
 Include:
 - A description of the vulnerability and its impact
