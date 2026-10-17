@@ -63,7 +63,7 @@ cap-std = "3"
 unicode-normalization = "0.1"
 
 # External — auth
-sspi = "0.21"
+sspi = "0.23"
 
 # Dev/test
 proptest = "1"
