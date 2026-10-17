@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-18
+
+### Fixed
+
+- **WRITE acknowledged before data reached the file.** `write_at` returned as
+  soon as tokio had buffered the data, while the actual `write(2)` still ran in
+  the background. A follow-up QUERY_INFO, CLOSE or re-open could observe the
+  old file size or contents, and write errors (e.g. disk full) were silently
+  lost after the client had already been told the write succeeded. Writes now
+  complete (without fsync) before the WRITE response is sent.
+
 ## [0.1.0] - 2026-10-17
 
 First public release. SMB 2.1 – 3.1.1 server with NTLMv2 auth, AES-128-GCM
