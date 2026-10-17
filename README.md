@@ -4,8 +4,8 @@
 
 A pure-Rust SMB2/3 file server for container-native environments.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/treeol/rssmb/ci.yml?label=CI)](https://github.com/treeol/rssmb/actions/workflows/ci.yml)
-[![Interop](https://img.shields.io/github/actions/workflow/status/treeol/rssmb/interop-ci.yml?label=Interop)](https://github.com/treeol/rssmb/actions/workflows/interop-ci.yml)
+[![CI](https://github.com/treeol/rssmb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/treeol/rssmb/actions/workflows/ci.yml)
+[![Interop](https://github.com/treeol/rssmb/actions/workflows/interop-ci.yml/badge.svg?branch=main)](https://github.com/treeol/rssmb/actions/workflows/interop-ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://www.rust-lang.org/)
 
