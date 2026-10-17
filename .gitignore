@@ -7,3 +7,4 @@ Cargo.lock
 /reference
 .reference/
 /data/
+/tmp/
