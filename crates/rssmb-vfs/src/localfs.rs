@@ -554,6 +554,16 @@ impl Vfs for LocalFs {
             .write_all(data)
             .await
             .map_err(|e| VfsError::from_io("write", e))?;
+        // tokio::fs::File::write_all only copies into an internal buffer and
+        // performs the write(2) on the blocking pool in the background. Wait
+        // for it here (flush does NOT fsync) so that (a) write errors are
+        // reported on this WRITE, not a later op, and (b) the data is visible
+        // to metadata()/other opens/close before we acknowledge the WRITE.
+        handle
+            .file
+            .flush()
+            .await
+            .map_err(|e| VfsError::from_io("write", e))?;
         Ok(data.len() as u32)
     }
 
