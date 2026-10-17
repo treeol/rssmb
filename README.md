@@ -325,4 +325,4 @@ be reused in other SMB tools.
 
 ## License
 
-[Apache-2.0](LICENSE) · Copyright 2024–2026 RSSMB Contributors
+[Apache-2.0](LICENSE) · Copyright 2026 Valon Mamudi
