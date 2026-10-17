@@ -1015,7 +1015,12 @@ impl Connection {
                         msg[48..sig_end].fill(0);
                     }
 
-                    let enc_state = conn_state.encryption_ref().read().unwrap().get(&sid).cloned();
+                    let enc_state = conn_state
+                        .encryption_ref()
+                        .read()
+                        .unwrap()
+                        .get(&sid)
+                        .cloned();
                     match enc_state {
                         Some(st) => {
                             // Strip the 4-byte NetBIOS header, encrypt the
@@ -1261,9 +1266,17 @@ impl Connection {
             if should_remove {
                 state.remove_session(*session_id).await;
                 state.session_registry.write().unwrap().remove(session_id);
-                debug!(conn_id, session_id = *session_id, "removed session on connection cleanup (last channel)");
+                debug!(
+                    conn_id,
+                    session_id = *session_id,
+                    "removed session on connection cleanup (last channel)"
+                );
             } else {
-                debug!(conn_id, session_id = *session_id, "channel disconnected, session still active on other channels");
+                debug!(
+                    conn_id,
+                    session_id = *session_id,
+                    "channel disconnected, session still active on other channels"
+                );
             }
         }
         // Clear the per-connection session list.

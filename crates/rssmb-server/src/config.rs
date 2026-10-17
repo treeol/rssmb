@@ -128,6 +128,15 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub multichannel: bool,
 
+    /// Explicit list of addresses to advertise for multichannel
+    /// (FSCTL_QUERY_NETWORK_INTERFACE_INFO), overriding host interface
+    /// enumeration — e.g. `["10.0.0.5", "192.168.7.2"]`. Use this in
+    /// NAT/container environments where the enumerated addresses are not
+    /// client-reachable. Empty (default) = enumerate the host's
+    /// non-loopback interfaces.
+    #[serde(default)]
+    pub multichannel_interfaces: Vec<String>,
+
     /// User accounts for authentication.
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -638,6 +647,7 @@ impl ServerConfig {
             durable_timeout_secs: 900,
             leases: true,
             multichannel: true,
+            multichannel_interfaces: vec![],
             server_name: "rssmb".to_string(),
             shutdown_grace_secs: 10,
             users: vec![],

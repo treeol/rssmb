@@ -1074,9 +1074,18 @@ async fn handle_negotiate(
         let caps = GlobalCapabilities::new()
             .with_large_mtu(true)
             .with_leasing(state.config.leases);
-        // Multichannel is SMB 3.0+ only.
-        if selected >= DialectConfig::Smb30 {
-            caps.with_multi_channel(state.config.multichannel)
+        // Multichannel is SMB 3.0+ only, and is advertised only when the
+        // server actually has usable (non-loopback) interfaces to report
+        // via FSCTL_QUERY_NETWORK_INTERFACE_INFO. Advertising the bit on a
+        // loopback-only container makes clients probe and fail. This is a
+        // design choice, not a spec rule (3.3.5.4 sets the bit on
+        // IsMultiChannelCapable alone); the advertised value is stored in
+        // the NegotiateRecord and echoed unchanged by VALIDATE_NEGOTIATE_INFO.
+        if selected >= DialectConfig::Smb30
+            && state.config.multichannel
+            && !state.interface_snapshot.get().is_empty()
+        {
+            caps.with_multi_channel(true)
         } else {
             caps
         }
@@ -1298,7 +1307,12 @@ async fn handle_session_setup(
         let session_id = req.header.session_id;
 
         // Look up the existing session in the global registry.
-        let existing_shared = state.session_registry.read().unwrap().get(&session_id).cloned();
+        let existing_shared = state
+            .session_registry
+            .read()
+            .unwrap()
+            .get(&session_id)
+            .cloned();
         let existing_session = {
             let sessions = conn_state.sessions.read().await;
             sessions.iter().find(|s| s.id == session_id).cloned()
@@ -1308,8 +1322,10 @@ async fn handle_session_setup(
         let shared = match existing_shared {
             Some(ss) => ss,
             None => {
-                warn!(conn_id = conn_state.conn_id, session_id,
-                    "binding: session not found in global registry");
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    session_id, "binding: session not found in global registry"
+                );
                 return error_response_for(
                     Command::SessionSetup,
                     NtStatus::UserSessionDeleted,
@@ -1328,14 +1344,15 @@ async fn handle_session_setup(
             .await
             .as_ref()
             .map(|r| r.dialect);
-        if neg_dialect.map(|d| d < DialectConfig::Smb30).unwrap_or(true) {
-            warn!(conn_id = conn_state.conn_id, session_id,
-                "binding: requires SMB 3.0+");
-            return error_response_for(
-                Command::SessionSetup,
-                NtStatus::NotSupported,
-                &req.header,
+        if neg_dialect
+            .map(|d| d < DialectConfig::Smb30)
+            .unwrap_or(true)
+        {
+            warn!(
+                conn_id = conn_state.conn_id,
+                session_id, "binding: requires SMB 3.0+"
             );
+            return error_response_for(Command::SessionSetup, NtStatus::NotSupported, &req.header);
         }
 
         // Add this connection as a channel of the existing session.
@@ -1369,8 +1386,10 @@ async fn handle_session_setup(
             }
         }
 
-        info!(conn_id = conn_state.conn_id, session_id,
-            "multichannel: channel bound to existing session");
+        info!(
+            conn_id = conn_state.conn_id,
+            session_id, "multichannel: channel bound to existing session"
+        );
 
         // Return a successful SESSION_SETUP response with the session flags
         // from the existing session. The auth token is empty for binding.
@@ -2075,7 +2094,12 @@ async fn handle_logoff(
     state.remove_session(session_id).await;
     // The signing state is kept until the LOGOFF response has been signed;
     // the read loop removes it then (see `connection.rs`).
-    if let Some(st) = conn_state.signing_ref().write().unwrap().get_mut(&session_id) {
+    if let Some(st) = conn_state
+        .signing_ref()
+        .write()
+        .unwrap()
+        .get_mut(&session_id)
+    {
         st.retiring = true;
     }
 
@@ -2129,11 +2153,7 @@ fn next_session_id(conn_state: &ConnState, state: &ServerState) -> u64 {
             .map(|s| s.iter().any(|sess| sess.id == id))
             .unwrap_or(false);
         let in_pending = pending.as_ref().map(|p| p.contains(&id)).unwrap_or(false);
-        let in_registry = state
-            .session_registry
-            .read()
-            .unwrap()
-            .contains_key(&id);
+        let in_registry = state.session_registry.read().unwrap().contains_key(&id);
         if !in_sessions && !in_pending && !in_registry {
             return id;
         }
@@ -2912,7 +2932,11 @@ async fn handle_create(
                 );
                 // Close the VFS handle we just re-attached.
                 let _ = durable_entry.vfs.close(durable_entry.open_id).await;
-                conn_state.opens_ref().write().await.remove(&file_id.volatile);
+                conn_state
+                    .opens_ref()
+                    .write()
+                    .await
+                    .remove(&file_id.volatile);
                 return error_response_for(
                     Command::Create,
                     NtStatus::SharingViolation,
@@ -3255,7 +3279,11 @@ async fn handle_create(
                                 Err(()) => {
                                     // Lease key collision with a different underlying file.
                                     let _ = state.open_table.remove(fid, open_id).await;
-                                    conn_state.opens_ref().write().await.remove(&file_id.volatile);
+                                    conn_state
+                                        .opens_ref()
+                                        .write()
+                                        .await
+                                        .remove(&file_id.volatile);
                                     if let Some(guid) = durable_guid {
                                         state.durable_table.forget(&guid).await;
                                     }
@@ -4963,55 +4991,66 @@ async fn handle_ioctl(
         FSCTL_QUERY_NETWORK_INTERFACE_INFO => {
             // MS-SMB2 2.2.32.5 / 3.3.5.15.11: return the server's network
             // interface addresses so the client can establish additional
-            // channels (multichannel). Only meaningful when multichannel
-            // is enabled.
+            // channels (multichannel). Requires SMB 3.0+ and a multichannel-
+            // capable server.
+            let rec_guard = conn_state.negotiate_record.lock().await;
+            let Some(rec) = &*rec_guard else {
+                return error_response_for(Command::Ioctl, NtStatus::InvalidParameter, &req.header);
+            };
+            // QNII is defined for SMB 3.x only.
+            if rec.dialect < DialectConfig::Smb30 {
+                return error_response_for(Command::Ioctl, NtStatus::NotSupported, &req.header);
+            }
             if !state.config.multichannel {
                 NtStatus::NotSupported
             } else {
-                let interfaces = build_network_interface_info(conn_state);
-                if interfaces.is_empty() {
+                let addresses = state.interface_snapshot.get();
+                if addresses.is_empty() {
                     NtStatus::NotSupported
                 } else {
-                    use binrw::BinWrite;
-                    let mut buf = std::io::Cursor::new(Vec::new());
-                    for iface in &interfaces {
-                        if iface.write_le(&mut buf).is_err() {
+                    let interfaces = crate::netinfo::to_network_interface_infos(&addresses);
+                    let mut buf = rssmb_proto::ioctl::serialize_network_interface_list(&interfaces);
+                    // Truncate at entry boundaries if the client's
+                    // MaxOutputResponse cannot hold the full list, and
+                    // return STATUS_BUFFER_OVERFLOW with the truncated data.
+                    let max_output = io.max_output_response as usize;
+                    let entry_size = rssmb_proto::ioctl::NETWORK_INTERFACE_INFO_SIZE;
+                    let mut overflow = false;
+                    if buf.len() > max_output {
+                        let fit = max_output / entry_size;
+                        if fit == 0 {
+                            // Not even one entry fits: STATUS_BUFFER_TOO_SMALL
+                            // with no data (a warning + empty buffer would
+                            // read as "server has zero interfaces").
                             return error_response_for(
                                 Command::Ioctl,
-                                NtStatus::InvalidParameter,
+                                NtStatus::BufferTooSmall,
                                 &req.header,
                             );
                         }
+                        buf.truncate(fit * entry_size);
+                        overflow = true;
+                        // Fix the new last entry's Next to 0.
+                        let last = buf.len() - entry_size;
+                        buf[last..last + 4].fill(0);
                     }
                     let resp = rssmb_proto::ioctl::IoctlResponse {
                         ctl_code: io.ctl_code,
                         file_id: io.file_id,
                         in_buffer: vec![],
-                        out_buffer: buf.into_inner(),
+                        out_buffer: buf,
                     };
-                    return FramedResponse::Plain(build_response(
-                        &req.header,
-                        ResponseContent::Ioctl(resp),
-                    ));
+                    let mut response = build_response(&req.header, ResponseContent::Ioctl(resp));
+                    if overflow {
+                        response.header.status = NtStatus::BufferOverflow.to_u32();
+                    }
+                    return FramedResponse::Plain(response);
                 }
             }
         }
         _ => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
     };
     error_response_for(Command::Ioctl, status, &req.header)
-}
-
-/// Build NETWORK_INTERFACE_INFO entries for FSCTL_QUERY_NETWORK_INTERFACE_INFO.
-///
-/// Returns the server's bound network interfaces. For now we use the
-/// connection's local address as the primary interface. A production
-/// implementation would enumerate all server NICs.
-fn build_network_interface_info(_conn_state: &ConnState) -> Vec<rssmb_proto::ioctl::NetworkInterfaceInfo> {
-    // TODO: enumerate actual server NICs. For now return an empty list
-    // which causes NotSupported. This is a stub — the real implementation
-    // would call `if_addrs` or read `/proc/net/if_inet6` to find the
-    // server's bound IPv4/IPv6 addresses.
-    vec![]
 }
 
 /// LOCK — acquire or release byte-range locks (MS-SMB2 3.3.5.14).
@@ -5697,10 +5736,23 @@ mod tests {
     /// pass the negotiate gate. Also grants credits to simulate what
     /// the real connection read loop does after each response.
     async fn establish_negotiation(state: &Arc<ServerState>, conn: &ConnState) {
-        let req = make_negotiate_request();
+        establish_negotiation_with_dialect(state, conn, WireDialect::Smb021).await
+    }
+
+    /// Negotiate with a specific (3.x-capable) dialect so multichannel-
+    /// related handlers pass their dialect gates.
+    async fn establish_negotiation_with_dialect(
+        state: &Arc<ServerState>,
+        conn: &ConnState,
+        dialect: WireDialect,
+    ) {
+        let req = make_negotiate_request_with_dialects(vec![dialect]);
         let resp = handle_message(state, conn, FramedMessage::Plain(req), &[], None).await;
         assert!(resp.is_some(), "negotiate should produce a response");
-        assert!(!matches!(resp, Some(FramedResponse::Disconnect)));
+        assert!(
+            !matches!(resp, Some(FramedResponse::Disconnect)),
+            "negotiation failed"
+        );
         // The negotiate consumed the initial credit; grant some back
         // so subsequent test commands have credits to spend.
         conn.credits.grant(16);
@@ -5823,6 +5875,358 @@ mod tests {
             },
             content,
         }
+    }
+
+    /// Build an SMB2 IOCTL request for FSCTL_QUERY_NETWORK_INTERFACE_INFO.
+    fn make_qnii_request(max_output_response: u32) -> rssmb_proto::plain::PlainRequest {
+        make_qnii_request_with_id(max_output_response, 1)
+    }
+
+    fn make_qnii_request_with_id(
+        max_output_response: u32,
+        message_id: u64,
+    ) -> rssmb_proto::plain::PlainRequest {
+        use rssmb_proto::create::FileId;
+        use rssmb_proto::ioctl::{IoctlBuffer, IoctlReqData, IoctlRequest, IoctlRequestFlags};
+        let content = RequestContent::Ioctl(IoctlRequest {
+            ctl_code: 0x0014_01FC,
+            file_id: FileId {
+                persistent: u64::MAX,
+                volatile: u64::MAX,
+            },
+            max_input_response: 0,
+            max_output_response,
+            flags: IoctlRequestFlags::new().with_is_fsctl(true),
+            buffer: IoctlReqData::Ioctl(IoctlBuffer::from(vec![])),
+        });
+        rssmb_proto::plain::PlainRequest {
+            header: Header {
+                credit_charge: 0,
+                status: 0,
+                command: Command::Ioctl,
+                credit_request: 1,
+                flags: HeaderFlags::new(),
+                next_command: 0,
+                message_id,
+                tree_id: Some(0),
+                async_id: None,
+                session_id: 0,
+                signature: 0,
+            },
+            content,
+        }
+    }
+
+    /// Publish a fixed interface list into the state's snapshot (simulates a
+    /// successful background refresh) — keeps tests host-independent.
+    fn publish_interfaces(state: &Arc<ServerState>, addrs: Vec<crate::netinfo::UsableAddress>) {
+        // Use the refresher's override mechanism via publish (test-only
+        // direct access to keep determinism).
+        // InterfaceSnapshot::publish is private; publish through the same
+        // channel production uses: start_refresher with a pinned list and
+        // wait for the immediate first refresh.
+        // Simpler: use the override path synchronously via spawn_blocking.
+        let snap = state.interface_snapshot.clone();
+        let handle = tokio::runtime::Handle::current();
+        let shutdown = Arc::new(crate::ShutdownSignal::new());
+        snap.start_refresher(
+            handle,
+            std::time::Duration::from_secs(3600),
+            shutdown,
+            addrs,
+        );
+        // start_refresher performs the first refresh immediately on a
+        // blocking thread; wait for it.
+    }
+
+    async fn wait_for_snapshot(state: &Arc<ServerState>) {
+        for _ in 0..2000 {
+            if !state.interface_snapshot.get().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_qnii_returns_interface_entries() {
+        let state = make_test_state();
+        let conn = make_conn_state();
+        establish_negotiation_with_dialect(&state, &conn, WireDialect::Smb030).await;
+
+        publish_interfaces(
+            &state,
+            vec![
+                crate::netinfo::UsableAddress {
+                    if_index: 1,
+                    ip: "10.0.0.1".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1_000_000_000,
+                },
+                crate::netinfo::UsableAddress {
+                    if_index: 2,
+                    ip: "10.0.0.2".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1_000_000_000,
+                },
+            ],
+        );
+        wait_for_snapshot(&state).await;
+
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_qnii_request(4096)),
+            &[],
+            None,
+        )
+        .await;
+        let Some(FramedResponse::Plain(p)) = resp else {
+            panic!("expected plain response, got {resp:?}");
+        };
+        assert_eq!(p.header.status, 0, "full list must return STATUS_SUCCESS");
+        match p.content {
+            ResponseContent::Ioctl(io) => {
+                assert_eq!(io.out_buffer.len(), 2 * 152);
+                // First entry Next = 152 (chained), last = 0.
+                assert_eq!(&io.out_buffer[0..4], &152u32.to_le_bytes());
+                assert_eq!(&io.out_buffer[152..156], &[0, 0, 0, 0]);
+            }
+            other => panic!("expected ioctl response, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_qnii_truncation_boundaries_and_buffer_overflow() {
+        let state = make_test_state();
+        let conn = make_conn_state();
+        establish_negotiation_with_dialect(&state, &conn, WireDialect::Smb030).await;
+
+        publish_interfaces(
+            &state,
+            vec![
+                crate::netinfo::UsableAddress {
+                    if_index: 1,
+                    ip: "10.0.0.1".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1,
+                },
+                crate::netinfo::UsableAddress {
+                    if_index: 2,
+                    ip: "10.0.0.2".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1,
+                },
+            ],
+        );
+        wait_for_snapshot(&state).await;
+
+        // Cases: (MaxOutputResponse, expected_out_len, expected_status)
+        // 0 = STATUS_BUFFER_TOO_SMALL (nothing fits), 1 = BUFFER_OVERFLOW
+        // (partial list), 2 = STATUS_SUCCESS (full list).
+        let cases: &[(u32, usize, u8)] = &[
+            (0, 0, 0),      // nothing fits: BUFFER_TOO_SMALL, no data
+            (151, 0, 0),    // partial entry: BUFFER_TOO_SMALL
+            (152, 152, 1),  // exactly one entry of two: BUFFER_OVERFLOW
+            (153, 152, 1),  // one entry + slack: BUFFER_OVERFLOW
+            (303, 152, 1),  // one full + one partial: BUFFER_OVERFLOW
+            (304, 304, 2),  // exactly two: SUCCESS
+            (4096, 304, 2), // plenty: SUCCESS
+        ];
+        for (i, &(max_out, expect_len, expect_kind)) in cases.iter().enumerate() {
+            let resp = handle_message(
+                &state,
+                &conn,
+                FramedMessage::Plain(make_qnii_request_with_id(max_out, 2 + i as u64)),
+                &[],
+                None,
+            )
+            .await;
+            match expect_kind {
+                0 => {
+                    // Nothing fits: BUFFER_TOO_SMALL error, no data.
+                    let Some(FramedResponse::Error { status, .. }) = resp else {
+                        panic!("max_out={max_out}: expected error response, got {resp:?}");
+                    };
+                    assert_eq!(status, NtStatus::BufferTooSmall);
+                }
+                1 | 2 => {
+                    let Some(FramedResponse::Plain(p)) = resp else {
+                        panic!("max_out={max_out}: expected plain response, got {resp:?}");
+                    };
+                    match &p.content {
+                        ResponseContent::Ioctl(io) => {
+                            assert_eq!(io.out_buffer.len(), expect_len, "max_out={max_out}");
+                            let last = expect_len - 152;
+                            assert_eq!(
+                                &io.out_buffer[last..last + 4],
+                                &[0, 0, 0, 0],
+                                "max_out={max_out}: list must terminate with Next=0"
+                            );
+                            let expected_status = if expect_kind == 2 {
+                                0
+                            } else {
+                                NtStatus::BufferOverflow.to_u32()
+                            };
+                            assert_eq!(p.header.status, expected_status, "max_out={max_out}");
+                        }
+                        other => panic!("max_out={max_out}: unexpected content {other:?}"),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // A three-entry snapshot capped at two: real BUFFER_OVERFLOW with
+        // truncated data (warning severity, full IOCTL body).
+        publish_interfaces(
+            &state,
+            vec![
+                crate::netinfo::UsableAddress {
+                    if_index: 1,
+                    ip: "10.0.0.1".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1,
+                },
+                crate::netinfo::UsableAddress {
+                    if_index: 2,
+                    ip: "10.0.0.2".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1,
+                },
+                crate::netinfo::UsableAddress {
+                    if_index: 3,
+                    ip: "10.0.0.3".parse().unwrap(),
+                    scope_id: 0,
+                    link_speed: 1,
+                },
+            ],
+        );
+        // Wait for the override to republish (immediate refresh).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..2000 {
+            if state.interface_snapshot.get().len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        // Grant enough credits that message_id 99 is inside the window.
+        conn.credits.grant(256);
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_qnii_request_with_id(304, 99)),
+            &[],
+            None,
+        )
+        .await;
+        let Some(FramedResponse::Plain(p)) = resp else {
+            panic!("expected plain response, got {resp:?}");
+        };
+        assert_eq!(p.header.status, NtStatus::BufferOverflow.to_u32());
+        match p.content {
+            ResponseContent::Ioctl(io) => {
+                assert_eq!(io.out_buffer.len(), 304, "two entries must fit");
+                // Terminal Next must be 0 after truncation.
+                assert_eq!(&io.out_buffer[152..156], &[0, 0, 0, 0]);
+            }
+            other => panic!("BUFFER_OVERFLOW must carry an IOCTL body, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_qnii_rejects_pre_smb30_dialect() {
+        let state = make_test_state();
+        let conn = make_conn_state();
+        // Negotiate SMB 2.1 only.
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_negotiate_request()),
+            &[],
+            None,
+        )
+        .await;
+        assert!(resp.is_some());
+        conn.credits.grant(16);
+
+        publish_interfaces(
+            &state,
+            vec![crate::netinfo::UsableAddress {
+                if_index: 1,
+                ip: "10.0.0.1".parse().unwrap(),
+                scope_id: 0,
+                link_speed: 1,
+            }],
+        );
+        wait_for_snapshot(&state).await;
+
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_qnii_request(4096)),
+            &[],
+            None,
+        )
+        .await;
+        let Some(FramedResponse::Error { status, .. }) = resp else {
+            panic!("expected error response, got {resp:?}");
+        };
+        assert_eq!(status, NtStatus::NotSupported);
+    }
+
+    #[tokio::test]
+    async fn test_qnii_not_supported_when_snapshot_empty() {
+        let state = make_test_state();
+        let conn = make_conn_state();
+        establish_negotiation(&state, &conn).await;
+        // No refresher started: snapshot stays empty → fail closed.
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_qnii_request(4096)),
+            &[],
+            None,
+        )
+        .await;
+        let Some(FramedResponse::Error { status, .. }) = resp else {
+            panic!("expected error response, got {resp:?}");
+        };
+        assert_eq!(status, NtStatus::NotSupported);
+    }
+
+    #[tokio::test]
+    async fn test_qnii_not_supported_when_multichannel_disabled() {
+        let mut cfg = crate::config::ServerConfig::for_testing();
+        cfg.multichannel = false;
+        let state = Arc::new(ServerState::new(cfg));
+        let conn = make_conn_state();
+        establish_negotiation_with_dialect(&state, &conn, WireDialect::Smb030).await;
+
+        publish_interfaces(
+            &state,
+            vec![crate::netinfo::UsableAddress {
+                if_index: 1,
+                ip: "10.0.0.1".parse().unwrap(),
+                scope_id: 0,
+                link_speed: 1,
+            }],
+        );
+        wait_for_snapshot(&state).await;
+
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Plain(make_qnii_request(4096)),
+            &[],
+            None,
+        )
+        .await;
+        let Some(FramedResponse::Error { status, .. }) = resp else {
+            panic!("expected error response, got {resp:?}");
+        };
+        // Disabled multichannel must neither advertise nor leak topology.
+        assert_eq!(status, NtStatus::NotSupported);
     }
 
     #[tokio::test]

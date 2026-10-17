@@ -1025,7 +1025,7 @@ impl OpenTable {
     /// a *different* `file_id` (MS-SMB2: `STATUS_INVALID_PARAMETER`), or if the
     /// requested state is granted/upgraded along with any break notifications
     /// that must be sent to other lease/oplock holders on `file_id`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
     pub async fn request_lease(
         &self,
         file_id: FileId,

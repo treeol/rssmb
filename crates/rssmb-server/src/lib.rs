@@ -15,6 +15,7 @@ pub mod durable;
 pub mod fsinfo;
 pub mod metrics;
 pub mod negotiate_ctx;
+pub mod netinfo;
 pub mod notify;
 pub mod opens;
 pub mod quic;
@@ -144,10 +145,15 @@ pub struct ServerState {
     /// Global monotonically increasing connection ID counter shared across
     /// TCP and QUIC listeners.
     pub next_conn_id: std::sync::atomic::AtomicU64,
+    /// Cached snapshot of the server's usable network interface addresses
+    /// (FSCTL_QUERY_NETWORK_INTERFACE_INFO), refreshed by a background task.
+    pub interface_snapshot: std::sync::Arc<crate::netinfo::InterfaceSnapshot>,
     /// Global registry of session-shared state for multichannel (SessionId → Arc<SessionShared>).
     /// When multichannel is disabled, this is still populated but only one channel
     /// per session exists.
-    pub session_registry: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::dispatch::SessionShared>>>>,
+    pub session_registry: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::dispatch::SessionShared>>>,
+    >,
 }
 
 impl ServerState {
@@ -200,6 +206,7 @@ impl ServerState {
             shutdown: Arc::new(ShutdownSignal::new()),
             server_guid: guid,
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
+            interface_snapshot: std::sync::Arc::new(crate::netinfo::InterfaceSnapshot::new()),
             session_registry: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }

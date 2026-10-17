@@ -32,6 +32,7 @@ notify = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

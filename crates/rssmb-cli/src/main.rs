@@ -231,6 +231,36 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Create server state
     let state = Arc::new(ServerState::new(config.clone()));
 
+    // Start the network interface snapshot refresher (multichannel). The
+    // request path only clones the cached snapshot; all blocking
+    // getifaddrs/sysfs work happens on this background task.
+    {
+        let override_addrs: Vec<rssmb_server::netinfo::UsableAddress> = config
+            .multichannel_interfaces
+            .iter()
+            .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| rssmb_server::netinfo::UsableAddress {
+                if_index: 1,
+                ip,
+                scope_id: 0,
+                link_speed: 1_000_000_000,
+            })
+            .collect();
+        if !config.multichannel_interfaces.is_empty()
+            && override_addrs.len() != config.multichannel_interfaces.len()
+        {
+            warn!(
+                "multichannel_interfaces contains entries that are not valid IP addresses — they are ignored"
+            );
+        }
+        state.interface_snapshot.clone().start_refresher(
+            tokio::runtime::Handle::current(),
+            std::time::Duration::from_secs(15),
+            state.shutdown.clone(),
+            override_addrs,
+        );
+    }
+
     // Start the durable handle sweeper — periodically cleans up expired
     // durable opens whose VFS handles need to be closed.
     let sweeper_state = state.clone();
