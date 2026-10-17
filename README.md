@@ -64,7 +64,7 @@ minimal overhead and maximal security**.
 - `KEY_EXCH` session key derivation (ExportedSessionKey)
 - Large MTU (1 MiB) with multi-credit flow control
 - Durable handles v2 (DH2Q / DH2C) with reconnection
-- File leases v1/v2 (R, RH, RW) and traditional oplocks with break handling
+- File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break handling
 - Multichannel (SMB 3.x): session binding across connections and
   `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
 - SMB over QUIC (SMB 3.1.1 over TLS 1.3, ALPN `smb`, UDP/443) — traverse
@@ -297,7 +297,7 @@ be reused in other SMB tools.
 - ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 
 **Recently implemented:**
-- ✅ File leases v1/v2 (R, RH, RW) and traditional oplocks (Level II, Exclusive, Batch)
+- ✅ File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks (Level II, Exclusive, Batch)
 - ✅ SMB over QUIC transport (TLS 1.3, ALPN `smb`, UDP/443)
 - ✅ Multichannel (SMB 3.x session binding, shared state across channels)
 - ✅ `FSCTL_QUERY_NETWORK_INTERFACE_INFO` — NIC enumeration for multichannel

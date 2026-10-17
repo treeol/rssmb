@@ -1,7 +1,7 @@
 # RSSMB — Docker Compose for easy deployment
 # ===========================================
 # Usage:
-#   1. Copy config/rssmb.toml.example to config/rssmb.toml and edit shares
+#   1. Copy config/rssmb.example.toml to config/rssmb.toml and edit shares
 #   2. Create the data directory: mkdir -p data/public data/homes
 #   3. Start: docker compose -f docker/compose.yml up -d
 #   4. Connect: smbclient //localhost/public -U guest
