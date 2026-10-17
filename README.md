@@ -1,51 +1,82 @@
-# RSSMB — Pure-Rust SMB2/3 Server
+# RSSMB
 
-[![CI](https://github.com/rssmb/rssmb/actions/workflows/ci.yml/badge.svg)](https://github.com/rssmb/rssmb/actions/workflows/ci.yml)
-[![Interop CI](https://github.com/rssmb/rssmb/actions/workflows/interop-ci.yml/badge.svg)](https://github.com/rssmb/rssmb/actions/workflows/interop-ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://www.rust-lang.org/)
+A pure-Rust SMB2/3 file server for container-native environments.
 
-A standalone SMB2/3 file server written in pure Rust, designed for
-container-native deployment (Docker, Swarm, Kubernetes). No Samba, no
-external C libraries — just Rust and the Linux kernel.
+SMB 2.1 – 3.1.1 · AES-128-GCM encryption · NTLMv2 auth · 5 MB static binary
 
-Negotiates SMB 2.1 through 3.1.1 with AES-128-GCM encryption, NTLMv2
-authentication, and SrvSvc share enumeration. Tested against the Linux
-kernel CIFS client, `smbclient`, GNOME Files (Nautilus), and Samba's
-`smbtorture` conformance suite.
+RSSMB is a standalone SMB2/3 file server written entirely in Rust. No Samba,
+no external C libraries — just Rust and the Linux kernel. It is designed for
+cloud-native file serving: a single static binary that runs in a `scratch`
+container, mounts config as a secret, and serves shares from a data volume.
+
+The server negotiates SMB 2.1 through 3.1.1 with AES-128-GCM encryption,
+NTLMv2 authentication via SPNEGO, and SrvSvc share enumeration. It has been
+tested against the Linux kernel CIFS client, `smbclient`, GNOME Files
+(Nautilus), and Samba's `smbtorture` conformance suite.
+
+## Table of contents
+
+- [Why RSSMB?](#why-rssmb)
+- [Features](#features)
+- [Quick start (Docker)](#quick-start-docker)
+- [Building from source](#building-from-source)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Testing & conformance](#testing--conformance)
+- [Architecture](#architecture)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+## Why RSSMB?
+
+| | RSSMB | Samba |
+|---|---|---|
+| **Runtime dependencies** | None (static binary) | glibc, libtalloc, libldb, libtdb, … |
+| **Container image** | ~5 MB (`FROM scratch`) | ~100 MB+ (Debian/Ubuntu base) |
+| **Attack surface** | Pure Rust, no C FFI | ~1 M LOC C |
+| **Config** | One TOML file, hot-reload via SIGHUP | `smb.conf` + `pdbedit` + `net` |
+| **Users** | Config file (NT hashes) | Multiple backends (tdbsam, ldapsam, …) |
+| **Focus** | File serving for containers | General-purpose SMB/AD/DC |
+
+RSSMB does not aim to replace Samba in Active Directory environments. It
+targets the common case: **serve files from a volume to SMB clients with
+minimal overhead and maximal security**.
 
 ## Features
 
-**SMB protocol**
-- SMB 2.1 → 3.1.1 dialect negotiation
-- AES-128-GCM encryption (SMB 3.x), SHA-512 pre-auth integrity (3.1.1)
-- HMAC-SHA256 signing (required by default)
-- NTLMv2 authentication via SPNEGO, AUTHENTICATE message MIC verification
-- KEY_EXCH session key derivation (ExportedSessionKey)
+### SMB protocol
+
+- SMB 2.1 – 3.1.1 dialect negotiation
+- AES-128-GCM encryption (SMB 3.x) with SHA-512 pre-auth integrity (3.1.1)
+- HMAC-SHA256 message signing (required by default)
+- NTLMv2 authentication via SPNEGO with AUTHENTICATE message MIC verification
+- `KEY_EXCH` session key derivation (ExportedSessionKey)
 - Large MTU (1 MiB) with multi-credit flow control
-- Durable handles v2 (DH2Q/DH2C) with reconnection
-- CHANGE_NOTIFY (inotify-backed directory change notifications)
-- Byte-range locks (mandatory, all-or-nothing batch)
-- Case-insensitive path lookup (NFC-aware)
+- Durable handles v2 (DH2Q / DH2C) with reconnection
+- `CHANGE_NOTIFY` — inotify-backed directory change notifications
+- Mandatory byte-range locks (all-or-nothing batch)
+- Case-insensitive path lookup (NFC-aware, multi-component)
 - Security descriptors synthesized from POSIX uid/gid/mode
 
-**Security**
+### Security
+
 - Path confinement via `cap-std` + `openat2(RESOLVE_BENEATH)` — TOCTOU-free
 - Per-share symlink policy (`Never` / `WithinShare`)
-- NFC name normalization, control/reserved char rejection, length limits
-- Per-IP auth throttling (exponential backoff + hard cooldown)
-- Global + per-IP connection limits
+- NFC name normalization, control/reserved character rejection, length limits
+- Per-IP authentication throttling (exponential backoff + hard cooldown)
+- Global and per-IP connection limits
 - MessageId sequence window (bounded state, overflow-safe)
 - Per-share access lists: `valid_users`, `read_users`, `write_users`
-- `deny_unknown_fields` config validation, config permission warnings
+- `deny_unknown_fields` config validation with permission warnings
 - `catch_unwind` in the read loop for malformed-frame resilience
 
-**Operations**
-- Graceful shutdown (SIGTERM/SIGINT, bounded drain)
+### Operations
+
+- Graceful shutdown (SIGTERM / SIGINT with bounded drain)
 - SIGHUP live-reload of users and shares without restart
 - Prometheus metrics on `/metrics`, health on `/healthz`
 - Structured JSON logging (`--log-format json`)
-- `rssmb check-config` validates config before startup
+- `rssmb check-config` validates configuration before startup
 - `rssmb hash-password` generates NT hashes
 
 ## Quick start (Docker)
@@ -55,29 +86,36 @@ no shell, no dynamic libraries. Just the binary and the config/data volumes
 you mount.
 
 ```sh
-mkdir -p data/public data/homes && sudo chown -R 1000:1000 data
-chmod 600 config/rssmb.toml   # contains credentials; see note below
+# 1. Create data directories owned by UID 1000 (the container's user)
+mkdir -p data/public data/homes
+sudo chown -R 1000:1000 data
+
+# 2. Lock down the config file (it contains credentials)
+chmod 600 config/rssmb.toml
+
+# 3. Start the server
 docker compose -f docker/compose.yml up -d --build
-docker logs -f rssmb   # Ctrl-C to stop following
+
+# 4. Verify it's healthy
 curl -s localhost:8080/healthz
+docker logs -f rssmb   # Ctrl-C to stop following
 ```
 
-The dev config (`config/rssmb.toml`) ships with a guest-access `public`
-share, a `homes` share, and a test account `alice` / `TestPass123` —
-**not for production.** For production, copy `config/rssmb.example.toml`
-to `config/rssmb.toml` and edit it (signing required, guest disabled, real
-users with NT hashes).
+> **Dev config:** `config/rssmb.toml` ships with a guest-access `public`
+> share, a `homes` share, and test account `alice` / `TestPass123` —
+> **not for production.** For production, copy `config/rssmb.example.toml`
+> to `config/rssmb.toml` and edit it (signing required, guest disabled,
+> real users with NT hashes).
 
-The container runs as UID 1000 and reads `config/rssmb.toml` through a
-read-only bind mount, so the file must stay readable by UID 1000. If your
-host user is not UID 1000, use `sudo chown 1000 config/rssmb.toml`
-(keeping mode `600`), or `sudo chgrp 1000 config/rssmb.toml && chmod 640 config/rssmb.toml`.
-Without this, the server logs a "config file is world-readable" warning on
-startup.
+> **File permissions:** The container runs as UID 1000 and reads
+> `config/rssmb.toml` through a read-only bind mount. If your host user
+> is not UID 1000, use `sudo chown 1000 config/rssmb.toml` (keeping mode
+> `600`), or `sudo chgrp 1000 config/rssmb.toml && chmod 640`. Without
+> this, the server logs a "config file is world-readable" warning.
 
-Port 445 on the host must be free (stop a local Samba first). If it
-isn't, change the mapping in `docker/compose.yml` to e.g. `"4450:445"`
-and add `port=4450` to the mount options below.
+> **Port 445:** Must be free on the host (stop a local Samba first). If
+> it isn't, change the mapping in `docker/compose.yml` to e.g.
+> `"4450:445"` and add `port=4450` to the mount options below.
 
 ### Mount it (Linux)
 
@@ -128,9 +166,11 @@ rssmb hash-password <password>                  # generate NT hash
 
 See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 
+### Server settings
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `listen_addr` / `port` | `0.0.0.0:445` | Bind address |
+| `listen_addr` / `port` | `0.0.0.0:445` | SMB bind address |
 | `min_dialect` / `max_dialect` | `smb21` / `smb311` | SMB dialect range |
 | `signing` | `required` | `required` (reject unsigned + disable guest) · `desired` · `disabled` |
 | `encryption` | `desired` | `required` · `desired` · `disabled` (SMB 3.1.1 AES-128-GCM) |
@@ -141,7 +181,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
 
-Per share (`[shares.<name>]`):
+### Per-share settings (`[shares.<name>]`)
 
 | Key | Description |
 |-----|-------------|
@@ -153,22 +193,25 @@ Per share (`[shares.<name>]`):
 | `read_users` | Restrict read access (empty = all `valid_users`) |
 | `write_users` | Restrict write access (empty = all `valid_users`) |
 
-Users (`[[users]]`): `username`, `password` (plaintext) or `nt_hash` (hex,
-preferred — generate with `rssmb hash-password`), `disabled`.
+### Users (`[[users]]`)
 
-The config file may contain password-equivalent secrets — `chmod 600` it
-and mount it as a secret in Kubernetes (not a ConfigMap).
+Each user needs a `username` and either a `password` (plaintext) or
+`nt_hash` (hex — preferred, generate with `rssmb hash-password`). Set
+`disabled = true` to deactivate an account without removing it.
+
+> **Security:** The config file may contain password-equivalent secrets.
+> `chmod 600` it and mount it as a secret in Kubernetes (not a ConfigMap).
 
 ## Security
 
 See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting policy and
 [`docs/threat-model.md`](docs/threat-model.md) for the full threat model.
 
-**Status:** Pre-1.0. An external security review is required before the 1.0
-release. The [MS-NLMP], [MS-SMB2], and [MS-SRVS] protocol implementations have
-been hardened through multiple rounds of automated review (Mashūra) covering
-NTLM authentication, SPNEGO parsing, path confinement, credit tracking,
-connection lifecycle, delete-on-close semantics, and config validation.
+**Status:** Pre-1.0. The [MS-NLMP], [MS-SMB2], and [MS-SRVS] protocol
+implementations have been hardened through multiple rounds of automated
+review (Mashūra) covering NTLM authentication, SPNEGO parsing, path
+confinement, credit tracking, connection lifecycle, delete-on-close
+semantics, and config validation.
 
 [MS-NLMP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp
 [MS-SMB2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2
@@ -183,18 +226,24 @@ tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privile
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
 ```
 
-CI runs on every push and PR:
+### CI
 
-- **ci.yml** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build
-  --locked`, `cargo test --workspace`, `cargo deny check` (advisories,
-  licenses, bans, sources), `cargo audit`
-- **interop-ci.yml** — unit tests, impacket interop, `smbclient` interop,
-  nightly `smbtorture` conformance, nightly fuzz campaigns (9 targets, 5
-  min each)
+Every push and PR runs:
 
-Fuzz targets (9): `parse_payload`, `read_netbios_frame`, `extract_ntlm_token`,
-`extract_mech_types`, `proto_decode_header`, `proto_decode_plain_request`,
-`normalize_path`, `ntlm_authenticate`, `decrypt_transform`.
+| Workflow | Checks |
+|---------|--------|
+| **ci.yml** | `cargo fmt --check` · `cargo clippy -D warnings` · `cargo build --locked` · `cargo test --workspace` · `cargo deny check` (advisories, licenses, bans, sources) · `cargo audit` |
+| **interop-ci.yml** | impacket interop · `smbclient` interop · nightly `smbtorture` conformance · nightly fuzz campaigns (9 targets, 5 min each) |
+
+### Fuzz targets
+
+9 targets covering the attack surface:
+
+```
+parse_payload · read_netbios_frame · extract_ntlm_token · extract_mech_types
+proto_decode_header · proto_decode_plain_request · normalize_path
+ntlm_authenticate · decrypt_transform
+```
 
 ## Architecture
 
@@ -213,7 +262,17 @@ config/                 Example configurations
 fuzz/                   cargo-fuzz targets
 ```
 
+Each crate is independently testable. The protocol layer
+(`rssmb-proto` / `rssmb-wire-adapter`) has zero server dependencies and can
+be reused in other SMB tools.
+
 ## Roadmap
+
+**Implemented (1.0 scope):**
+- ✅ SMB 2.1 – 3.1.1 with encryption, signing, and NTLMv2
+- ✅ Durable handles v2, byte-range locks, change notify
+- ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
+- ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 
 **Not yet implemented (post-1.0):**
 - Oplocks and leases
@@ -224,4 +283,4 @@ fuzz/                   cargo-fuzz targets
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE) · Copyright 2024–2026 RSSMB Contributors
