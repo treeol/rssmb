@@ -1,8 +1,19 @@
+<div align="center">
+
 # RSSMB
 
 A pure-Rust SMB2/3 file server for container-native environments.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/rssmb/rssmb/ci.yml?label=CI)](https://github.com/rssmb/rssmb/actions/workflows/ci.yml)
+[![Interop](https://img.shields.io/github/actions/workflow/status/rssmb/rssmb/interop-ci.yml?label=Interop)](https://github.com/rssmb/rssmb/actions/workflows/interop-ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://www.rust-lang.org/)
+
 SMB 2.1 – 3.1.1 · AES-128-GCM encryption · NTLMv2 auth · 5 MB static binary
+
+</div>
+
+---
 
 RSSMB is a standalone SMB2/3 file server written entirely in Rust. No Samba,
 no external C libraries — just Rust and the Linux kernel. It is designed for
@@ -18,7 +29,7 @@ tested against the Linux kernel CIFS client, `smbclient`, GNOME Files
 
 - [Why RSSMB?](#why-rssmb)
 - [Features](#features)
-- [Quick start (Docker)](#quick-start-docker)
+- [Quick start](#quick-start)
 - [Building from source](#building-from-source)
 - [Configuration](#configuration)
 - [Security](#security)
@@ -31,12 +42,12 @@ tested against the Linux kernel CIFS client, `smbclient`, GNOME Files
 
 | | RSSMB | Samba |
 |---|---|---|
-| **Runtime dependencies** | None (static binary) | glibc, libtalloc, libldb, libtdb, … |
-| **Container image** | ~5 MB (`FROM scratch`) | ~100 MB+ (Debian/Ubuntu base) |
-| **Attack surface** | Pure Rust, no C FFI | ~1 M LOC C |
-| **Config** | One TOML file, hot-reload via SIGHUP | `smb.conf` + `pdbedit` + `net` |
-| **Users** | Config file (NT hashes) | Multiple backends (tdbsam, ldapsam, …) |
-| **Focus** | File serving for containers | General-purpose SMB/AD/DC |
+| **Runtime dependencies** | ✅ None (static binary) | ❌ glibc, libtalloc, libldb, libtdb, … |
+| **Container image** | ✅ ~5 MB (`FROM scratch`) | ❌ ~100 MB+ (Debian/Ubuntu base) |
+| **Attack surface** | ✅ Pure Rust, no C FFI | ⚠️ ~1 M LOC C |
+| **Config** | ✅ One TOML file, hot-reload via SIGHUP | ⚠️ `smb.conf` + `pdbedit` + `net` |
+| **Users** | ✅ Config file (NT hashes) | ⚠️ Multiple backends (tdbsam, ldapsam, …) |
+| **Scope** | 🎯 File serving for containers | 🎯 General-purpose SMB/AD/DC |
 
 RSSMB does not aim to replace Samba in Active Directory environments. It
 targets the common case: **serve files from a volume to SMB clients with
@@ -44,7 +55,7 @@ minimal overhead and maximal security**.
 
 ## Features
 
-### SMB protocol
+### 📡 SMB protocol
 
 - SMB 2.1 – 3.1.1 dialect negotiation
 - AES-128-GCM encryption (SMB 3.x) with SHA-512 pre-auth integrity (3.1.1)
@@ -58,7 +69,7 @@ minimal overhead and maximal security**.
 - Case-insensitive path lookup (NFC-aware, multi-component)
 - Security descriptors synthesized from POSIX uid/gid/mode
 
-### Security
+### 🔒 Security
 
 - Path confinement via `cap-std` + `openat2(RESOLVE_BENEATH)` — TOCTOU-free
 - Per-share symlink policy (`Never` / `WithinShare`)
@@ -70,7 +81,7 @@ minimal overhead and maximal security**.
 - `deny_unknown_fields` config validation with permission warnings
 - `catch_unwind` in the read loop for malformed-frame resilience
 
-### Operations
+### ⚙️ Operations
 
 - Graceful shutdown (SIGTERM / SIGINT with bounded drain)
 - SIGHUP live-reload of users and shares without restart
@@ -79,7 +90,7 @@ minimal overhead and maximal security**.
 - `rssmb check-config` validates configuration before startup
 - `rssmb hash-password` generates NT hashes
 
-## Quick start (Docker)
+## Quick start
 
 The Docker image is a **~5 MB static binary in `FROM scratch`** — no OS,
 no shell, no dynamic libraries. Just the binary and the config/data volumes
@@ -101,19 +112,19 @@ curl -s localhost:8080/healthz
 docker logs -f rssmb   # Ctrl-C to stop following
 ```
 
-> **Dev config:** `config/rssmb.toml` ships with a guest-access `public`
+> **💡 Dev config:** `config/rssmb.toml` ships with a guest-access `public`
 > share, a `homes` share, and test account `alice` / `TestPass123` —
 > **not for production.** For production, copy `config/rssmb.example.toml`
 > to `config/rssmb.toml` and edit it (signing required, guest disabled,
 > real users with NT hashes).
 
-> **File permissions:** The container runs as UID 1000 and reads
+> **📁 File permissions:** The container runs as UID 1000 and reads
 > `config/rssmb.toml` through a read-only bind mount. If your host user
 > is not UID 1000, use `sudo chown 1000 config/rssmb.toml` (keeping mode
 > `600`), or `sudo chgrp 1000 config/rssmb.toml && chmod 640`. Without
 > this, the server logs a "config file is world-readable" warning.
 
-> **Port 445:** Must be free on the host (stop a local Samba first). If
+> **🔌 Port 445:** Must be free on the host (stop a local Samba first). If
 > it isn't, change the mapping in `docker/compose.yml` to e.g.
 > `"4450:445"` and add `port=4450` to the mount options below.
 
@@ -199,7 +210,7 @@ Each user needs a `username` and either a `password` (plaintext) or
 `nt_hash` (hex — preferred, generate with `rssmb hash-password`). Set
 `disabled = true` to deactivate an account without removing it.
 
-> **Security:** The config file may contain password-equivalent secrets.
+> **🔒 Security:** The config file may contain password-equivalent secrets.
 > `chmod 600` it and mount it as a secret in Kubernetes (not a ConfigMap).
 
 ## Security
