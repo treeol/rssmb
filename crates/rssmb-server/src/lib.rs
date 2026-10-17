@@ -144,6 +144,10 @@ pub struct ServerState {
     /// Global monotonically increasing connection ID counter shared across
     /// TCP and QUIC listeners.
     pub next_conn_id: std::sync::atomic::AtomicU64,
+    /// Global registry of session-shared state for multichannel (SessionId → Arc<SessionShared>).
+    /// When multichannel is disabled, this is still populated but only one channel
+    /// per session exists.
+    pub session_registry: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::dispatch::SessionShared>>>>,
 }
 
 impl ServerState {
@@ -196,6 +200,7 @@ impl ServerState {
             shutdown: Arc::new(ShutdownSignal::new()),
             server_guid: guid,
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
+            session_registry: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 

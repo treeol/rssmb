@@ -37,7 +37,7 @@ use rssmb_wire_adapter::framing::parse_payload;
 use rssmb_wire_adapter::{encode_response, FramedMessage, FramedResponse, NtStatus};
 
 use crate::config::ServerConfig;
-use crate::dispatch::{handle_message, ConnState, TransportKind};
+use crate::dispatch::{handle_message, ConnState, SessionArcs, SessionShared, TransportKind};
 use crate::signing;
 use crate::ServerState;
 
@@ -322,6 +322,10 @@ impl Connection {
 
         // Build the per-connection dispatch state. The session is attached
         // later (after SESSION_SETUP); for Phase 1 it stays `None`.
+        // For multichannel, trees/opens/signing/encryption/counters live in
+        // a SessionShared struct stored in the global registry. ConnState
+        // holds clones of the same Arcs so all channels see the same state.
+        let session_shared = Arc::new(SessionShared::new(conn_id));
         let conn_state = ConnState {
             conn_id,
             remote_addr: remote_addr.ip(),
@@ -331,19 +335,22 @@ impl Connection {
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
             auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
-            trees: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            opens: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            active: Arc::new(StdRwLock::new(SessionArcs {
+                trees: session_shared.trees.clone(),
+                opens: session_shared.opens.clone(),
+                signing: session_shared.signing.clone(),
+                encryption: session_shared.encryption.clone(),
+                next_tree_id: session_shared.next_tree_id.clone(),
+                next_volatile_id: session_shared.next_volatile_id.clone(),
+                persistent_base: session_shared.persistent_base,
+            })),
+            session_shared: Arc::new(StdRwLock::new(Some(session_shared))),
             pending_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             credits: credits.clone(),
             pending_async: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            signing: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            encryption: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
-            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            persistent_base: rand::random::<u64>(),
         };
 
         // Read loop.
@@ -472,7 +479,7 @@ impl Connection {
                 let transform_session_id = u64::from_le_bytes(payload[44..52].try_into().unwrap());
                 was_encrypted = Some(transform_session_id);
                 let enc_state = conn_state
-                    .encryption
+                    .encryption_ref()
                     .read()
                     .unwrap()
                     .get(&transform_session_id)
@@ -572,7 +579,7 @@ impl Connection {
                                         break;
                                     }
                                     let st = conn_state
-                                        .encryption
+                                        .encryption_ref()
                                         .read()
                                         .unwrap()
                                         .get(&m.effective_sid)
@@ -619,7 +626,7 @@ impl Connection {
                                     // resolve the session from raw bytes), so
                                     // encrypt directly here.
                                     let enc_st = conn_state
-                                        .encryption
+                                        .encryption_ref()
                                         .read()
                                         .unwrap()
                                         .get(&transform_sid)
@@ -702,7 +709,7 @@ impl Connection {
                     } else {
                         // Plaintext frame: authenticate the raw bytes first.
                         let verdict = signing::verify_frame(&payload, |sid| {
-                            conn_state.signing.read().unwrap().get(&sid).cloned()
+                            conn_state.signing_ref().read().unwrap().get(&sid).cloned()
                         });
                         if payload.len() >= 64 && verdict == signing::Verdict::Ok {
                             match rssmb_proto::header::Header::read_le(&mut std::io::Cursor::new(
@@ -788,7 +795,7 @@ impl Connection {
                             // The session must have encryption state and not be
                             // retiring.
                             let st = conn_state
-                                .encryption
+                                .encryption_ref()
                                 .read()
                                 .unwrap()
                                 .get(&m.effective_sid)
@@ -820,7 +827,7 @@ impl Connection {
                 }
             } else if matches!(framed, FramedMessage::Plain(_) | FramedMessage::Compound(_)) {
                 let verdict = signing::verify_frame(&payload, |sid| {
-                    conn_state.signing.read().unwrap().get(&sid).cloned()
+                    conn_state.signing_ref().read().unwrap().get(&sid).cloned()
                 });
                 if verdict == signing::Verdict::Reject {
                     warn!(
@@ -907,9 +914,9 @@ impl Connection {
                 signing::sign_response_frame(
                     &mut encoded,
                     &client_signed,
-                    |sid| conn_state.signing.read().unwrap().get(&sid).cloned(),
+                    |sid| conn_state.signing_ref().read().unwrap().get(&sid).cloned(),
                     |sid| {
-                        if let Some(st) = conn_state.signing.write().unwrap().get_mut(&sid) {
+                        if let Some(st) = conn_state.signing_ref().write().unwrap().get_mut(&sid) {
                             st.force_sign_once = false;
                         }
                     },
@@ -942,7 +949,7 @@ impl Connection {
                 // the LOGOFF response itself. But don't retire encryption
                 // state yet — it's needed to encrypt the response below.
                 conn_state
-                    .signing
+                    .signing_ref()
                     .write()
                     .unwrap()
                     .retain(|_, st| !st.retiring);
@@ -982,7 +989,8 @@ impl Connection {
                         if sid == 0 {
                             return None;
                         }
-                        let enc_map = conn_state.encryption.read().unwrap();
+                        let enc_arc = conn_state.encryption_ref();
+                        let enc_map = enc_arc.read().unwrap();
                         enc_map
                             .get(&sid)
                             .map(|st| st.encrypt_data)
@@ -1007,7 +1015,7 @@ impl Connection {
                         msg[48..sig_end].fill(0);
                     }
 
-                    let enc_state = conn_state.encryption.read().unwrap().get(&sid).cloned();
+                    let enc_state = conn_state.encryption_ref().read().unwrap().get(&sid).cloned();
                     match enc_state {
                         Some(st) => {
                             // Strip the 4-byte NetBIOS header, encrypt the
@@ -1087,7 +1095,7 @@ impl Connection {
                 // Now retire encryption state (after the response has been
                 // encrypted or sent as plaintext).
                 conn_state
-                    .encryption
+                    .encryption_ref()
                     .write()
                     .unwrap()
                     .retain(|_, st| !st.retiring);
@@ -1136,7 +1144,8 @@ impl Connection {
         // TREE_DISCONNECT/LOGOFF — the peer is gone, so there is nobody
         // to wait for a response.
         let removed_opens: Vec<(u64, crate::dispatch::OpenEntry)> = {
-            let mut opens = conn_state.opens.write().await;
+            let opens_arc = conn_state.opens_ref();
+            let mut opens = opens_arc.write().await;
             let entries: Vec<(u64, crate::dispatch::OpenEntry)> =
                 opens.iter().map(|(k, v)| (*k, v.clone())).collect();
             for (key, _) in &entries {
@@ -1229,18 +1238,36 @@ impl Connection {
         }
 
         // Remove all sessions owned by this connection from the shared state.
+        // For multichannel: only remove the session from the global state when
+        // the last channel disconnects. Remove this connection from the channel
+        // set of each session first.
         let to_remove: Vec<u64> = {
-            let sessions = state.sessions.read().await;
-            sessions
-                .iter()
-                .filter(|s| s.connection_id == conn_id)
-                .map(|s| s.id)
-                .collect()
+            let sessions = conn_state.sessions.read().await;
+            sessions.iter().map(|s| s.id).collect()
         };
-        for session_id in to_remove {
-            state.remove_session(session_id).await;
-            debug!(conn_id, session_id, "removed session on connection cleanup");
+        for session_id in &to_remove {
+            // Remove this connection from the session's channel set.
+            let should_remove = {
+                let registry = state.session_registry.read().unwrap();
+                if let Some(shared) = registry.get(session_id) {
+                    let mut channels = shared.channels.write().unwrap();
+                    channels.remove(&conn_id);
+                    channels.is_empty()
+                } else {
+                    // No registry entry — single-channel session, remove it.
+                    true
+                }
+            };
+            if should_remove {
+                state.remove_session(*session_id).await;
+                state.session_registry.write().unwrap().remove(session_id);
+                debug!(conn_id, session_id = *session_id, "removed session on connection cleanup (last channel)");
+            } else {
+                debug!(conn_id, session_id = *session_id, "channel disconnected, session still active on other channels");
+            }
         }
+        // Clear the per-connection session list.
+        conn_state.sessions.write().await.clear();
     }
 }
 
@@ -1619,6 +1646,7 @@ mod tests {
         use rssmb_vfs::Vfs;
         let state = Arc::new(ServerState::new(ServerConfig::for_testing()));
         let (tx, _rx) = mpsc::channel::<Bytes>(4);
+        let session_shared = Arc::new(crate::dispatch::SessionShared::new(77));
         let conn_state = ConnState {
             conn_id: 77,
             remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -1628,19 +1656,22 @@ mod tests {
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
             auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
-            trees: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            opens: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            active: Arc::new(StdRwLock::new(SessionArcs {
+                trees: session_shared.trees.clone(),
+                opens: session_shared.opens.clone(),
+                signing: session_shared.signing.clone(),
+                encryption: session_shared.encryption.clone(),
+                next_tree_id: session_shared.next_tree_id.clone(),
+                next_volatile_id: session_shared.next_volatile_id.clone(),
+                persistent_base: session_shared.persistent_base,
+            })),
+            session_shared: Arc::new(StdRwLock::new(Some(session_shared))),
             pending_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             credits: Arc::new(CreditManager::new(16)),
             pending_async: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            signing: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            encryption: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
-            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            persistent_base: 0,
         };
 
         let vfs: Arc<dyn Vfs> = Arc::new(rssmb_vfs::memoryfs::MemoryFs::new());
@@ -1651,7 +1682,7 @@ mod tests {
             create_options: Default::default(),
         };
         let open_id = vfs.create("", "f.txt", &args).await.expect("create");
-        conn_state.opens.write().await.insert(
+        conn_state.opens_ref().write().await.insert(
             1,
             crate::dispatch::OpenEntry {
                 session_id: 5,
@@ -1681,7 +1712,7 @@ mod tests {
         Connection::cleanup(&state, 77, &conn_state).await;
 
         assert!(
-            conn_state.opens.read().await.is_empty(),
+            conn_state.opens_ref().read().await.is_empty(),
             "opens not drained"
         );
         assert!(

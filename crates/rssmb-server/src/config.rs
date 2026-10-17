@@ -124,6 +124,10 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 
+    /// Whether SMB 3.x multichannel is enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub multichannel: bool,
+
     /// User accounts for authentication.
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -633,6 +637,7 @@ impl ServerConfig {
             ntlm_require_timestamp: false,
             durable_timeout_secs: 900,
             leases: true,
+            multichannel: true,
             server_name: "rssmb".to_string(),
             shutdown_grace_secs: 10,
             users: vec![],

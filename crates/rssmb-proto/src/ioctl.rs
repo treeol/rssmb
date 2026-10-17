@@ -173,6 +173,65 @@ pub struct ValidateNegotiateInfoResponse {
     pub dialect: crate::negotiate::NegotiateDialect,
 }
 
+/// Network interface info entry (FSCTL_QUERY_NETWORK_INTERFACE_INFO).
+///
+/// MS-SMB2 2.2.32.5
+#[binrw::binrw]
+#[derive(Debug, Clone)]
+#[brw(little)]
+pub struct NetworkInterfaceInfo {
+    /// Next entry offset (0 if last).
+    pub next_offset: u32,
+    /// Size of this entry (including addresses).
+    pub entry_size: u32,
+    /// Interface index.
+    pub interface_index: u32,
+    /// Capability flags (RSS, RDMA).
+    pub capability_flags: NetworkInterfaceCapabilityFlags,
+    /// Number of addresses.
+    pub address_count: u8,
+    /// Reserved.
+    #[bw(calc = 0)]
+    #[br(temp)]
+    reserved: u8,
+    /// Link speed in bits per second.
+    pub link_speed: u64,
+    /// Socket addresses.
+    #[br(count = address_count)]
+    pub addresses: Vec<NetworkAddress>,
+}
+
+/// Network address (SOCKADDR_STORAGE, 128 bytes on wire; we use 16 for compactness).
+///
+/// MS-SMB2 2.2.32.5
+#[binrw::binrw]
+#[derive(Debug, Clone)]
+#[brw(little)]
+pub struct NetworkAddress {
+    /// Address family (1 = IPv4, 2 = IPv6).
+    pub family: u16,
+    /// Port (0 in this context).
+    #[bw(calc = 0)]
+    #[br(temp)]
+    port: u16,
+    /// IPv4 or IPv6 address as 16 raw bytes (IPv4 in last 4, IPv6 in all 16).
+    pub address: [u8; 16],
+}
+
+/// Network interface capability flags.
+///
+/// MS-SMB2 2.2.32.5
+#[bitfield]
+#[derive(BinWrite, BinRead, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[bw(map = |&x| Self::into_bytes(x))]
+#[br(map = Self::from_bytes)]
+pub struct NetworkInterfaceCapabilityFlags {
+    pub rss: bool,
+    pub rdma: bool,
+    #[skip]
+    __: B30,
+}
+
 /// SMB2 IOCTL Response.
 ///
 /// MS-SMB2 2.2.32

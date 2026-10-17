@@ -8,11 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use rssmb_proto::header::{Command, Header, HeaderFlags};
 use rssmb_proto::negotiate::{
@@ -90,6 +91,93 @@ pub enum TransportKind {
     Quic,
 }
 
+/// Per-session shared state, accessible across multiple connections (channels)
+/// for SMB 3.x multichannel. When multichannel is disabled or only one channel
+/// exists, this structure still holds the authoritative trees/opens/signing/
+/// encryption state; ConnState holds clones of the same Arcs.
+pub struct SessionShared {
+    /// Active tree connections: TreeId → TreeEntry.
+    pub trees: Arc<tokio::sync::RwLock<HashMap<u32, TreeEntry>>>,
+    /// Open file handles: FileId volatile → OpenEntry.
+    pub opens: Arc<tokio::sync::RwLock<HashMap<u64, OpenEntry>>>,
+    /// Signing state per SessionId.
+    pub signing: Arc<std::sync::RwLock<HashMap<u64, SigningState>>>,
+    /// Encryption state per SessionId.
+    pub encryption: Arc<std::sync::RwLock<HashMap<u64, EncryptionState>>>,
+    /// Per-session next TreeId counter.
+    pub next_tree_id: Arc<std::sync::atomic::AtomicU32>,
+    /// Per-session next volatile FileId counter.
+    pub next_volatile_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-session random persistent FileId base.
+    pub persistent_base: u64,
+    /// Set of channel connection IDs bound to this session.
+    pub channels: std::sync::RwLock<std::collections::HashSet<u64>>,
+}
+
+impl SessionShared {
+    pub(crate) fn new(conn_id: u64) -> Self {
+        Self {
+            trees: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            opens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            signing: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            encryption: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            persistent_base: rand::random::<u64>(),
+            channels: std::sync::RwLock::new(std::collections::HashSet::from([conn_id])),
+        }
+    }
+}
+
+/// Swappable per-session state Arcs. All channels of the same session share
+/// the same Arcs. On binding, the new channel's `active` is swapped to point
+/// to the existing session's Arcs.
+#[derive(Clone)]
+pub struct SessionArcs {
+    pub trees: Arc<tokio::sync::RwLock<HashMap<u32, TreeEntry>>>,
+    pub opens: Arc<tokio::sync::RwLock<HashMap<u64, OpenEntry>>>,
+    pub signing: Arc<StdRwLock<HashMap<u64, SigningState>>>,
+    pub encryption: Arc<StdRwLock<HashMap<u64, EncryptionState>>>,
+    pub next_tree_id: Arc<std::sync::atomic::AtomicU32>,
+    pub next_volatile_id: Arc<std::sync::atomic::AtomicU64>,
+    pub persistent_base: u64,
+}
+
+impl ConnState {
+    /// Read the active session arcs. Cheap — just clones the Arc wrapper.
+    fn arcs(&self) -> Arc<SessionArcs> {
+        Arc::new(self.active.read().unwrap().clone())
+    }
+    /// Get the trees map.
+    pub fn trees_ref(&self) -> Arc<tokio::sync::RwLock<HashMap<u32, TreeEntry>>> {
+        self.arcs().trees.clone()
+    }
+    /// Get the opens map.
+    pub fn opens_ref(&self) -> Arc<tokio::sync::RwLock<HashMap<u64, OpenEntry>>> {
+        self.arcs().opens.clone()
+    }
+    /// Get the signing map.
+    pub fn signing_ref(&self) -> Arc<StdRwLock<HashMap<u64, SigningState>>> {
+        self.arcs().signing.clone()
+    }
+    /// Get the encryption map.
+    pub fn encryption_ref(&self) -> Arc<StdRwLock<HashMap<u64, EncryptionState>>> {
+        self.arcs().encryption.clone()
+    }
+    /// Get the next_tree_id counter.
+    pub fn next_tree_id_ref(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.arcs().next_tree_id.clone()
+    }
+    /// Get the next_volatile_id counter.
+    pub fn next_volatile_id_ref(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.arcs().next_volatile_id.clone()
+    }
+    /// Get the persistent_base.
+    pub fn persistent_base_val(&self) -> u64 {
+        self.arcs().persistent_base
+    }
+}
+
 /// Per-connection state handed to the dispatcher.
 #[derive(Clone)]
 pub struct ConnState {
@@ -112,10 +200,14 @@ pub struct ConnState {
     /// Negotiation record for this connection (set by NEGOTIATE, used by
     /// SESSION_SETUP, signing, and VALIDATE_NEGOTIATE_INFO).
     pub negotiate_record: std::sync::Arc<tokio::sync::Mutex<Option<NegotiateRecord>>>,
-    /// Tree connections on this connection: tree_id → (share_name, VFS, session_id).
-    pub trees: std::sync::Arc<tokio::sync::RwLock<HashMap<u32, TreeEntry>>>,
-    /// Open file handles: FileId volatile → OpenEntry.
-    pub opens: std::sync::Arc<tokio::sync::RwLock<HashMap<u64, OpenEntry>>>,
+    /// Swappable per-session state — contains the Arcs to trees/opens/signing/
+    /// encryption/counters that are shared across channels of the same session.
+    /// On binding, the inner value is swapped to the existing session's Arcs.
+    pub active: Arc<StdRwLock<SessionArcs>>,
+    /// The SessionShared for this connection's primary session, registered
+    /// in the global registry on session establishment. For binding channels,
+    /// this is replaced with the existing session's shared state.
+    pub session_shared: Arc<StdRwLock<Option<Arc<SessionShared>>>>,
     /// Pending authentication SessionIds — only these may be used as
     /// continuation IDs in subsequent SESSION_SETUP rounds.
     pub pending_sessions: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<u64>>>,
@@ -124,12 +216,6 @@ pub struct ConnState {
     /// Pending async operations keyed by MessageId — for CHANGE_NOTIFY, LOCK, etc.
     /// When a CANCEL arrives, the op is looked up here and completed.
     pub pending_async: std::sync::Arc<tokio::sync::Mutex<HashMap<u64, AsyncOp>>>,
-    /// Signing state per SessionId. Only sessions with a non-empty session
-    /// key appear here (guest/anonymous sessions are never signed).
-    pub signing: std::sync::Arc<std::sync::RwLock<HashMap<u64, SigningState>>>,
-    /// Encryption state per SessionId. Only 3.x sessions with a negotiated
-    /// cipher and non-empty session key appear here.
-    pub encryption: std::sync::Arc<std::sync::RwLock<HashMap<u64, EncryptionState>>>,
     /// Preauth integrity hash for the connection (SMB 3.1.1 only).
     /// H0 = 64 zero bytes; updated with NEGOTIATE request+response.
     /// Forked per-session at SESSION_SETUP SessionId==0.
@@ -144,12 +230,6 @@ pub struct ConnState {
     /// `Conn` → hash into preauth_conn; `Session(sid)` → hash into preauth_sessions[sid].
     /// Consumed exactly once by the connection loop after encode+sign.
     pub preauth_hash_response: std::sync::Arc<std::sync::Mutex<Option<PreauthTarget>>>,
-    /// Per-connection next TreeId counter (MS-SMB2 3.3.1.5: per-session, starts at 1).
-    pub next_tree_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// Per-connection next volatile FileId counter (MS-SMB2 3.3.1.6).
-    pub next_volatile_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Per-connection random persistent FileId base (MS-SMB2 3.3.1.6).
-    pub persistent_base: u64,
 }
 
 /// Per-session SMB2 message signing state (MS-SMB2 3.3.1.8).
@@ -855,7 +935,8 @@ async fn handle_plain(
         let sid = req.header.session_id;
         if sid != 0 {
             let session_encrypt = {
-                let enc_map = conn_state.encryption.read().unwrap();
+                let enc_map = conn_state.encryption_ref();
+                let enc_map = enc_map.read().unwrap();
                 enc_map.get(&sid).map(|st| st.encrypt_data).unwrap_or(false)
             };
             if session_encrypt {
@@ -871,7 +952,8 @@ async fn handle_plain(
             // Tree-level encrypt_data: check if the tree requires encryption.
             if let Some(tid) = req.header.tree_id {
                 let tree_encrypt = {
-                    let trees = conn_state.trees.read().await;
+                    let trees = conn_state.trees_ref();
+                    let trees = trees.read().await;
                     trees.get(&tid).map(|t| t.encrypt_data).unwrap_or(false)
                 };
                 if tree_encrypt {
@@ -989,9 +1071,15 @@ async fn handle_negotiate(
     // Server capabilities: large_mtu and leasing for 2.1+ (MS-SMB2 3.3.5.4:
     // capabilities MUST be 0 for 2.0.2).
     let server_capabilities = if selected > DialectConfig::Smb2002 {
-        GlobalCapabilities::new()
+        let caps = GlobalCapabilities::new()
             .with_large_mtu(true)
-            .with_leasing(state.config.leases)
+            .with_leasing(state.config.leases);
+        // Multichannel is SMB 3.0+ only.
+        if selected >= DialectConfig::Smb30 {
+            caps.with_multi_channel(state.config.multichannel)
+        } else {
+            caps
+        }
     } else {
         GlobalCapabilities::new()
     };
@@ -1168,7 +1256,7 @@ async fn handle_session_setup(
         // A fresh authentication: discard any stale per-connection auth state
         // and invalidate the SessionId it was bound to.
         *auth_state = rssmb_auth::AuthState::new();
-        let new_id = next_session_id(conn_state);
+        let new_id = next_session_id(conn_state, state);
         let mut pending = conn_state.pending_sessions.write().await;
         pending.clear();
         pending.insert(new_id);
@@ -1200,6 +1288,125 @@ async fn handle_session_setup(
         .contains(&req.header.session_id)
     {
         req.header.session_id
+    } else if session_setup_req.flags.binding()
+        && req.header.session_id != 0
+        && state.config.multichannel
+    {
+        // SMB 3.x multichannel binding (MS-SMB2 3.3.5.5):
+        // A second connection binds to an existing session. The request
+        // must be signed with the existing session's signing key.
+        let session_id = req.header.session_id;
+
+        // Look up the existing session in the global registry.
+        let existing_shared = state.session_registry.read().unwrap().get(&session_id).cloned();
+        let existing_session = {
+            let sessions = conn_state.sessions.read().await;
+            sessions.iter().find(|s| s.id == session_id).cloned()
+        };
+
+        // The session must exist in the global registry (not just locally).
+        let shared = match existing_shared {
+            Some(ss) => ss,
+            None => {
+                warn!(conn_id = conn_state.conn_id, session_id,
+                    "binding: session not found in global registry");
+                return error_response_for(
+                    Command::SessionSetup,
+                    NtStatus::UserSessionDeleted,
+                    &req.header,
+                );
+            }
+        };
+
+        // Verify the binding request is signed with the existing session's key.
+        // The signing verification already happened in the connection read loop
+        // (signing::verify_frame). If we got here, the signature was valid.
+        // MS-SMB2 3.3.5.5: binding requires SMB 3.0+ and the dialect must match.
+        let neg_dialect = conn_state
+            .negotiate_record
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.dialect);
+        if neg_dialect.map(|d| d < DialectConfig::Smb30).unwrap_or(true) {
+            warn!(conn_id = conn_state.conn_id, session_id,
+                "binding: requires SMB 3.0+");
+            return error_response_for(
+                Command::SessionSetup,
+                NtStatus::NotSupported,
+                &req.header,
+            );
+        }
+
+        // Add this connection as a channel of the existing session.
+        {
+            let mut channels = shared.channels.write().unwrap();
+            channels.insert(conn_state.conn_id);
+        }
+
+        // Swap the ConnState's shared state to point to the existing session's
+        // shared state, so this channel sees the same trees/opens/signing/encryption.
+        *conn_state.session_shared.write().unwrap() = Some(shared.clone());
+        *conn_state.active.write().unwrap() = SessionArcs {
+            trees: shared.trees.clone(),
+            opens: shared.opens.clone(),
+            signing: shared.signing.clone(),
+            encryption: shared.encryption.clone(),
+            next_tree_id: shared.next_tree_id.clone(),
+            next_volatile_id: shared.next_volatile_id.clone(),
+            persistent_base: shared.persistent_base,
+        };
+
+        // Also add the session to this connection's session list.
+        if let Some(session) = existing_session {
+            conn_state.sessions.write().await.push(session);
+        } else {
+            // The session exists in the global registry but not on this connection.
+            // Find it in ServerState.sessions.
+            let sessions = state.sessions.read().await;
+            if let Some(s) = sessions.iter().find(|s| s.id == session_id).cloned() {
+                conn_state.sessions.write().await.push(s);
+            }
+        }
+
+        info!(conn_id = conn_state.conn_id, session_id,
+            "multichannel: channel bound to existing session");
+
+        // Return a successful SESSION_SETUP response with the session flags
+        // from the existing session. The auth token is empty for binding.
+        let session_flags = {
+            let sessions = conn_state.sessions.read().await;
+            sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .map(|s| {
+                    let mut flags = rssmb_proto::session_setup::SessionFlags::new();
+                    if s.is_guest {
+                        flags.set_is_guest(true);
+                    }
+                    if s.session_key.as_ref().map(|k| k.is_empty()).unwrap_or(true) {
+                        flags.set_is_null_session(true);
+                    }
+                    // Check encrypt_data from encryption state.
+                    let enc = conn_state.encryption_ref();
+                    let enc = enc.read().unwrap();
+                    if let Some(st) = enc.get(&session_id) {
+                        if st.encrypt_data {
+                            flags.set_encrypt_data(true);
+                        }
+                    }
+                    flags
+                })
+                .unwrap_or_default()
+        };
+
+        let resp = rssmb_proto::session_setup::SessionSetupResponse {
+            session_flags,
+            buffer: vec![],
+        };
+        let mut response = build_response(&req.header, ResponseContent::SessionSetup(resp));
+        response.header.session_id = session_id;
+        return FramedResponse::Plain(response);
     } else {
         // Re-authentication of an established session and multichannel
         // binding are not supported — refuse instead of pretending success.
@@ -1563,7 +1770,7 @@ async fn handle_session_setup(
                     // 3.1.1: force-sign the final success response once.
                     // This does NOT set Session.SigningRequired — only the one
                     // response is force-signed, not subsequent requests.
-                    conn_state.signing.write().unwrap().insert(
+                    conn_state.signing_ref().write().unwrap().insert(
                         session_id,
                         SigningState {
                             key,
@@ -1576,7 +1783,7 @@ async fn handle_session_setup(
                 }
                 if let Some(ref st) = enc_state_derived {
                     conn_state
-                        .encryption
+                        .encryption_ref()
                         .write()
                         .unwrap()
                         .insert(session_id, st.clone());
@@ -1603,6 +1810,15 @@ async fn handle_session_setup(
                     .auth_success_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 conn_state.sessions.write().await.push(Arc::new(session));
+                // Register the SessionShared in the global registry so that
+                // a binding channel can find and share this session's state.
+                if let Some(ss) = conn_state.session_shared.read().unwrap().clone() {
+                    state
+                        .session_registry
+                        .write()
+                        .unwrap()
+                        .insert(session_id, ss);
+                }
                 // SMB 3.1.1: remove the preauth session entry (keys derived).
                 conn_state
                     .preauth_sessions
@@ -1782,7 +1998,8 @@ async fn handle_logoff(
 
     // Remove all opens belonging to this session, closing them via VFS.
     let removed = {
-        let mut opens = conn_state.opens.write().await;
+        let opens_ref = conn_state.opens_ref();
+        let mut opens = opens_ref.write().await;
         let to_close: Vec<(u64, OpenEntry)> = opens
             .iter()
             .filter(|(_, e)| e.session_id == session_id)
@@ -1835,7 +2052,8 @@ async fn handle_logoff(
 
     // Remove all trees belonging to this session.
     {
-        let mut trees = conn_state.trees.write().await;
+        let trees_ref = conn_state.trees_ref();
+        let mut trees = trees_ref.write().await;
         let tree_ids: Vec<u32> = trees
             .iter()
             .filter(|(_, e)| e.session_id == session_id)
@@ -1846,15 +2064,18 @@ async fn handle_logoff(
         }
     }
 
-    // Remove the session.
+    // Remove the session from the connection's list and the global registry.
+    // LOGOFF tears down the entire session across all channels (MS-SMB2 3.3.5.6).
     conn_state
         .sessions
         .write()
         .await
         .retain(|s| s.id != session_id);
+    state.session_registry.write().unwrap().remove(&session_id);
+    state.remove_session(session_id).await;
     // The signing state is kept until the LOGOFF response has been signed;
     // the read loop removes it then (see `connection.rs`).
-    if let Some(st) = conn_state.signing.write().unwrap().get_mut(&session_id) {
+    if let Some(st) = conn_state.signing_ref().write().unwrap().get_mut(&session_id) {
         st.retiring = true;
     }
 
@@ -1893,8 +2114,10 @@ fn handle_echo(req_header: &Header) -> FramedResponse {
 
 // ── Phase 3: File serving handlers ─────────────────────────────────────
 
-/// Allocate a fresh, non-zero SMB2 SessionId (random with collision check).
-fn next_session_id(conn_state: &ConnState) -> u64 {
+/// Allocate a fresh, non-zero SMB2 SessionId (random with collision check
+/// against the connection's sessions, pending sessions, and the global
+/// session registry).
+fn next_session_id(conn_state: &ConnState, state: &ServerState) -> u64 {
     use rand::Rng;
     loop {
         let id: u64 = rand::thread_rng().gen_range(1..u64::MAX);
@@ -1906,7 +2129,12 @@ fn next_session_id(conn_state: &ConnState) -> u64 {
             .map(|s| s.iter().any(|sess| sess.id == id))
             .unwrap_or(false);
         let in_pending = pending.as_ref().map(|p| p.contains(&id)).unwrap_or(false);
-        if !in_sessions && !in_pending {
+        let in_registry = state
+            .session_registry
+            .read()
+            .unwrap()
+            .contains_key(&id);
+        if !in_sessions && !in_pending && !in_registry {
             return id;
         }
     }
@@ -1915,18 +2143,18 @@ fn next_session_id(conn_state: &ConnState) -> u64 {
 /// Allocate a per-connection TreeId (starts at 1, never 0 or 0xFFFFFFFF).
 fn next_tree_id(conn_state: &ConnState) -> u32 {
     conn_state
-        .next_tree_id
+        .next_tree_id_ref()
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Allocate a per-connection FileId: volatile from a counter, persistent random.
 fn next_file_id(conn_state: &ConnState) -> rssmb_proto::create::FileId {
     let volatile = conn_state
-        .next_volatile_id
+        .next_volatile_id_ref()
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Skip the sentinel value (0xFFFFFFFFFFFFFFFF) used by substitute_file_id.
     let volatile = if volatile == u64::MAX { 0 } else { volatile };
-    let persistent = conn_state.persistent_base.wrapping_add(volatile);
+    let persistent = conn_state.persistent_base_val().wrapping_add(volatile);
     rssmb_proto::create::FileId {
         persistent,
         volatile,
@@ -1986,7 +2214,7 @@ async fn handle_tree_connect(
     // behind it is still a stub.
     if share_name.eq_ignore_ascii_case("IPC$") {
         let tree_id = next_tree_id(conn_state);
-        conn_state.trees.write().await.insert(
+        conn_state.trees_ref().write().await.insert(
             tree_id,
             TreeEntry {
                 share_name: "IPC$".to_string(),
@@ -2121,7 +2349,7 @@ async fn handle_tree_connect(
         .map(|n| n.accept_transport_security)
         .unwrap_or(false);
     let tree_encrypt_data = share_config.encrypt_data && !accept_transport_security;
-    conn_state.trees.write().await.insert(
+    conn_state.trees_ref().write().await.insert(
         tree_id,
         TreeEntry {
             share_name: share_name.clone(),
@@ -2175,7 +2403,8 @@ async fn handle_tree_disconnect(
 
     // Validate that the tree belongs to this session before removing.
     let tree_owned = {
-        let trees = conn_state.trees.read().await;
+        let trees_ref = conn_state.trees_ref();
+        let trees = trees_ref.read().await;
         trees
             .get(&tree_id)
             .map(|e| e.session_id == session_id)
@@ -2187,7 +2416,8 @@ async fn handle_tree_disconnect(
 
     // Remove all opens belonging to this tree, closing them via VFS.
     let removed = {
-        let mut opens = conn_state.opens.write().await;
+        let opens_ref = conn_state.opens_ref();
+        let mut opens = opens_ref.write().await;
         let to_close: Vec<(u64, OpenEntry)> = opens
             .iter()
             .filter(|(_, e)| e.tree_id == tree_id)
@@ -2235,7 +2465,7 @@ async fn handle_tree_disconnect(
     }
 
     // Remove the tree from the connection tree table.
-    conn_state.trees.write().await.remove(&tree_id);
+    conn_state.trees_ref().write().await.remove(&tree_id);
 
     // Cancel any pending async ops for this tree.
     {
@@ -2522,7 +2752,8 @@ async fn handle_create(
     // that it belongs to this session.
     let tree_id = req.header.tree_id.unwrap_or(0);
     let session_id = req.header.session_id;
-    let trees = conn_state.trees.read().await;
+    let trees_ref = conn_state.trees_ref();
+    let trees = trees_ref.read().await;
     let tree_entry = match trees.get(&tree_id) {
         Some(e) => e.clone(),
         None => {
@@ -2646,7 +2877,7 @@ async fn handle_create(
 
         // Re-attach: insert into the per-connection open table.
         let file_id = next_file_id(conn_state);
-        conn_state.opens.write().await.insert(
+        conn_state.opens_ref().write().await.insert(
             file_id.volatile,
             OpenEntry {
                 session_id,
@@ -2681,7 +2912,7 @@ async fn handle_create(
                 );
                 // Close the VFS handle we just re-attached.
                 let _ = durable_entry.vfs.close(durable_entry.open_id).await;
-                conn_state.opens.write().await.remove(&file_id.volatile);
+                conn_state.opens_ref().write().await.remove(&file_id.volatile);
                 return error_response_for(
                     Command::Create,
                     NtStatus::SharingViolation,
@@ -2743,7 +2974,7 @@ async fn handle_create(
             return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
         let file_id = next_file_id(conn_state);
-        conn_state.opens.write().await.insert(
+        conn_state.opens_ref().write().await.insert(
             file_id.volatile,
             OpenEntry {
                 session_id,
@@ -2910,7 +3141,7 @@ async fn handle_create(
             };
 
             // Store the open in the per-connection open table
-            conn_state.opens.write().await.insert(
+            conn_state.opens_ref().write().await.insert(
                 file_id.volatile,
                 OpenEntry {
                     session_id,
@@ -3024,7 +3255,7 @@ async fn handle_create(
                                 Err(()) => {
                                     // Lease key collision with a different underlying file.
                                     let _ = state.open_table.remove(fid, open_id).await;
-                                    conn_state.opens.write().await.remove(&file_id.volatile);
+                                    conn_state.opens_ref().write().await.remove(&file_id.volatile);
                                     if let Some(guid) = durable_guid {
                                         state.durable_table.forget(&guid).await;
                                     }
@@ -3160,7 +3391,8 @@ async fn handle_close(
 
     // Look up and remove the open, validating session ownership.
     let open_entry = {
-        let mut opens = conn_state.opens.write().await;
+        let opens_ref = conn_state.opens_ref();
+        let mut opens = opens_ref.write().await;
         match opens.get(&file_id_volatile) {
             Some(entry) => {
                 if entry.session_id != session_id || entry.tree_id != tree_id {
@@ -3519,7 +3751,8 @@ async fn handle_write(
 
     // Enforce read-only / no-write-access policy using the tree entry.
     {
-        let trees = conn_state.trees.read().await;
+        let trees_ref = conn_state.trees_ref();
+        let trees = trees_ref.read().await;
         if let Some(tree_entry) = trees.get(&tree_id) {
             if tree_entry.read_only || !tree_entry.write_access {
                 debug!(conn_id = conn_state.conn_id, share = %tree_entry.share_name, "write denied: read-only or no write access");
@@ -3788,7 +4021,8 @@ async fn handle_query_info(
                 }
             };
             let share_name = {
-                let trees = conn_state.trees.read().await;
+                let trees_ref = conn_state.trees_ref();
+                let trees = trees_ref.read().await;
                 trees
                     .get(&tree_id)
                     .map(|t| t.share_name.clone())
@@ -4449,7 +4683,8 @@ async fn handle_change_notify(
     // watcher needs a real filesystem path, so we reconstruct it from
     // the share config path + the entry's relative path.
     let dir_path = {
-        let trees = conn_state.trees.read().await;
+        let trees_ref = conn_state.trees_ref();
+        let trees = trees_ref.read().await;
         let share_name = trees
             .get(&tree_id)
             .map(|t| t.share_name.clone())
@@ -4543,7 +4778,9 @@ async fn handle_change_notify(
 ///   return the server's values. A mismatch terminates the connection
 ///   (MS-SMB2 3.3.5.15.12).
 /// - FSCTL_DFS_GET_REFERRALS(_EX): STATUS_NOT_FOUND (0xC0000225)
-/// - FSCTL_QUERY_NETWORK_INTERFACE_INFO: STATUS_NOT_SUPPORTED (no multichannel).
+/// - FSCTL_QUERY_NETWORK_INTERFACE_INFO: returns server interface addresses
+///   for multichannel (SMB 3.0+). Returns NotSupported when multichannel
+///   is disabled or no interfaces are available.
 /// - anything else: STATUS_INVALID_DEVICE_REQUEST (the documented code for
 ///   an unsupported FSCTL).
 async fn handle_ioctl(
@@ -4723,10 +4960,58 @@ async fn handle_ioctl(
             }
         }
         FSCTL_DFS_GET_REFERRALS | FSCTL_DFS_GET_REFERRALS_EX => NtStatus::Other(STATUS_NOT_FOUND),
-        FSCTL_QUERY_NETWORK_INTERFACE_INFO => NtStatus::NotSupported,
+        FSCTL_QUERY_NETWORK_INTERFACE_INFO => {
+            // MS-SMB2 2.2.32.5 / 3.3.5.15.11: return the server's network
+            // interface addresses so the client can establish additional
+            // channels (multichannel). Only meaningful when multichannel
+            // is enabled.
+            if !state.config.multichannel {
+                NtStatus::NotSupported
+            } else {
+                let interfaces = build_network_interface_info(conn_state);
+                if interfaces.is_empty() {
+                    NtStatus::NotSupported
+                } else {
+                    use binrw::BinWrite;
+                    let mut buf = std::io::Cursor::new(Vec::new());
+                    for iface in &interfaces {
+                        if iface.write_le(&mut buf).is_err() {
+                            return error_response_for(
+                                Command::Ioctl,
+                                NtStatus::InvalidParameter,
+                                &req.header,
+                            );
+                        }
+                    }
+                    let resp = rssmb_proto::ioctl::IoctlResponse {
+                        ctl_code: io.ctl_code,
+                        file_id: io.file_id,
+                        in_buffer: vec![],
+                        out_buffer: buf.into_inner(),
+                    };
+                    return FramedResponse::Plain(build_response(
+                        &req.header,
+                        ResponseContent::Ioctl(resp),
+                    ));
+                }
+            }
+        }
         _ => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
     };
     error_response_for(Command::Ioctl, status, &req.header)
+}
+
+/// Build NETWORK_INTERFACE_INFO entries for FSCTL_QUERY_NETWORK_INTERFACE_INFO.
+///
+/// Returns the server's bound network interfaces. For now we use the
+/// connection's local address as the primary interface. A production
+/// implementation would enumerate all server NICs.
+fn build_network_interface_info(_conn_state: &ConnState) -> Vec<rssmb_proto::ioctl::NetworkInterfaceInfo> {
+    // TODO: enumerate actual server NICs. For now return an empty list
+    // which causes NotSupported. This is a stub — the real implementation
+    // would call `if_addrs` or read `/proc/net/if_inet6` to find the
+    // server's bound IPv4/IPv6 addresses.
+    vec![]
 }
 
 /// LOCK — acquire or release byte-range locks (MS-SMB2 3.3.5.14).
@@ -5115,7 +5400,7 @@ pub(crate) async fn send_unsolicited(
                 None
             } else {
                 conn_state
-                    .encryption
+                    .encryption_ref()
                     .read()
                     .unwrap()
                     .get(&sid)
@@ -5133,7 +5418,7 @@ pub(crate) async fn send_unsolicited(
         crate::signing::sign_response_frame(
             &mut bytes,
             &[client_signed],
-            |sid| conn_state.signing.read().unwrap().get(&sid).cloned(),
+            |sid| conn_state.signing_ref().read().unwrap().get(&sid).cloned(),
             |_| {},
         );
     }
@@ -5224,7 +5509,7 @@ async fn lookup_session_identity(
 /// (fail closed); ownership has already been validated by the caller.
 async fn tree_read_only(conn_state: &ConnState, tree_id: u32) -> bool {
     conn_state
-        .trees
+        .trees_ref()
         .read()
         .await
         .get(&tree_id)
@@ -5236,7 +5521,7 @@ async fn tree_read_only(conn_state: &ConnState, tree_id: u32) -> bool {
 /// count as no-write (fail closed).
 async fn tree_write_access(conn_state: &ConnState, tree_id: u32) -> bool {
     conn_state
-        .trees
+        .trees_ref()
         .read()
         .await
         .get(&tree_id)
@@ -5309,7 +5594,8 @@ async fn lookup_open_for_session(
     tree_id: u32,
     file_id_volatile: u64,
 ) -> Result<OpenEntry, NtStatus> {
-    let opens = conn_state.opens.read().await;
+    let opens_ref = conn_state.opens_ref();
+    let opens = opens_ref.read().await;
     let entry = opens
         .get(&file_id_volatile)
         .ok_or(NtStatus::InvalidHandle)?;
@@ -5378,6 +5664,7 @@ mod tests {
 
     fn make_conn_state() -> ConnState {
         let (tx, _rx) = mpsc::channel::<Bytes>(16);
+        let session_shared = Arc::new(SessionShared::new(1));
         ConnState {
             conn_id: 1,
             remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -5387,19 +5674,22 @@ mod tests {
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
             auth_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             negotiate_record: Arc::new(tokio::sync::Mutex::new(None)),
-            trees: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            opens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            active: Arc::new(std::sync::RwLock::new(SessionArcs {
+                trees: session_shared.trees.clone(),
+                opens: session_shared.opens.clone(),
+                signing: session_shared.signing.clone(),
+                encryption: session_shared.encryption.clone(),
+                next_tree_id: session_shared.next_tree_id.clone(),
+                next_volatile_id: session_shared.next_volatile_id.clone(),
+                persistent_base: session_shared.persistent_base,
+            })),
+            session_shared: Arc::new(std::sync::RwLock::new(Some(session_shared))),
             pending_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
             credits: Arc::new(rssmb_wire_adapter::credits::CreditManager::new(1024)),
             pending_async: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            signing: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            encryption: Arc::new(std::sync::RwLock::new(HashMap::new())),
             preauth_conn: Arc::new(std::sync::Mutex::new(None)),
             preauth_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             preauth_hash_response: Arc::new(std::sync::Mutex::new(None)),
-            next_tree_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            persistent_base: 0,
         }
     }
 
@@ -6126,7 +6416,7 @@ mod tests {
     async fn file_ids_volatile_never_hits_sentinel() {
         let conn = make_conn_state();
         // Set the counter close to u64::MAX to test the skip.
-        conn.next_volatile_id
+        conn.next_volatile_id_ref()
             .store(u64::MAX - 1, std::sync::atomic::Ordering::Relaxed);
         let fid1 = next_file_id(&conn);
         let fid2 = next_file_id(&conn);
@@ -6144,8 +6434,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_ids_persistent_differs_from_volatile() {
-        let mut conn = make_conn_state();
-        conn.persistent_base = 0x1234_5678_9ABC_DEF0;
+        let conn = make_conn_state();
+        conn.active.write().unwrap().persistent_base = 0x1234_5678_9ABC_DEF0;
         let fid = next_file_id(&conn);
         // persistent = base + volatile; with base != 0 they should differ.
         assert_ne!(
@@ -6156,9 +6446,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_ids_are_random_and_nonzero() {
+        let state = make_test_state();
         let conn = make_conn_state();
-        let id1 = next_session_id(&conn);
-        let id2 = next_session_id(&conn);
+        let id1 = next_session_id(&conn, &state);
+        let id2 = next_session_id(&conn, &state);
         assert_ne!(0, id1, "SessionId must be non-zero");
         assert_ne!(0, id2, "SessionId must be non-zero");
         // Random — extremely unlikely to collide.
