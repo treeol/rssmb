@@ -48,7 +48,7 @@ rand = "0.8"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-toml = "0.8"
+toml = "1.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 notify = "6"
