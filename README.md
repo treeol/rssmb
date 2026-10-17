@@ -285,12 +285,15 @@ be reused in other SMB tools.
 - ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
 - ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 
-**Not yet implemented (post-1.0):**
-- Oplocks and leases
-- Multichannel
+**Recently implemented:**
+- ✅ File leases v1/v2 (R, RH, RW) and traditional oplocks (Level II, Exclusive, Batch)
+- ✅ SMB over QUIC transport (TLS 1.3, ALPN `smb`, UDP/443)
+- ✅ Multichannel (SMB 3.x session binding, shared state across channels)
+
+**Not yet implemented:**
 - Kerberos authentication
 - Persistent handles (TLER resilient)
-- QUIC transport (SMB 3.1.1 alternative)
+- `FSCTL_QUERY_NETWORK_INTERFACE_INFO` NIC enumeration (multichannel capability advertised; interface discovery returns `NotSupported` until real NIC enumeration is added)
 
 ## License
 
