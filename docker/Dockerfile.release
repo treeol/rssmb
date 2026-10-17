@@ -1,0 +1,15 @@
+# Release image: packages a prebuilt static binary (built by
+# .github/workflows/release.yml) into a FROM-scratch image.
+# Build context layout: bin/<arch>/rssmb for arch in {amd64, arm64}.
+# For local source builds use docker/Dockerfile instead.
+FROM scratch
+ARG TARGETARCH
+COPY bin/${TARGETARCH}/rssmb /rssmb
+
+# Health endpoint on 8080, SMB on 445
+EXPOSE 445 8080
+
+# Non-root; scratch has no /etc/passwd, numeric UIDs resolve without it.
+USER 1000:1000
+
+ENTRYPOINT ["/rssmb", "--config", "/etc/rssmb/rssmb.toml"]

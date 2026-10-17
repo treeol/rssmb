@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rssmb-server",
+    "crates/rssmb-wire-adapter",
+    "crates/rssmb-auth",
+    "crates/rssmb-vfs",
+    "crates/rssmb-rpc-server",
+    "crates/rssmb-cli",
+    "crates/rssmb-tests",
+    "crates/rssmb-proto",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["RSSMB Contributors"]
+
+[workspace.dependencies]
+# Internal crates
+rssmb-proto = { path = "crates/rssmb-proto", version = "0.1.0" }
+rssmb-server = { path = "crates/rssmb-server", version = "0.1.0" }
+rssmb-wire-adapter = { path = "crates/rssmb-wire-adapter", version = "0.1.0" }
+rssmb-auth = { path = "crates/rssmb-auth", version = "0.1.0" }
+rssmb-vfs = { path = "crates/rssmb-vfs", version = "0.1.0" }
+rssmb-rpc-server = { path = "crates/rssmb-rpc-server", version = "0.1.0" }
+
+# External — async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "signal", "fs", "time"] }
+bytes = "1"
+async-trait = "0.1"
+futures = "0.3"
+
+# External — crypto
+hmac = "0.12"
+sha2 = "0.10"
+cmac = "0.7"
+aes = "0.8"
+aes-gcm = "0.10"
+rand = "0.8"
+
+# External — utility
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+notify = "6"
+libc = "0.2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+
+# External — VFS confinement
+cap-std = "3"
+unicode-normalization = "0.1"
+
+# External — auth
+sspi = "0.21"
+
+# Dev/test
+proptest = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,139 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag -s v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Static musl binaries, built natively on each architecture (no cross
+  # toolchain needed for ring's C/asm parts).
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo version
+        run: |
+          want="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $want"; exit 1; }
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-s"
+        run: cargo +stable build --release --locked --target ${{ matrix.target }} --bin rssmb
+      - name: Package
+        run: |
+          name="rssmb-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/rssmb" "dist/$name/"
+          cp LICENSE README.md CHANGELOG.md config/rssmb.example.toml packaging/rssmb.service "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # Bare binary for the container image build.
+          mkdir -p "bin/${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/rssmb" "bin/${{ matrix.arch }}/rssmb"
+      - name: Smoke test
+        run: |
+          file "target/${{ matrix.target }}/release/rssmb"
+          "target/${{ matrix.target }}/release/rssmb" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rssmb-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            bin/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd artifacts/dist
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Extract release notes from CHANGELOG
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 ~ "^## \\[" v "\\]" {p=1; next}
+            /^## \[/ && p {exit}
+            p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release $GITHUB_REF_NAME" > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            artifacts/dist/*.tar.gz
+            artifacts/dist/SHA256SUMS
+
+  # Multi-arch FROM-scratch image on GHCR, reusing the binaries above.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Stage build context
+        run: |
+          mkdir -p ctx
+          cp -r artifacts/bin ctx/bin
+          chmod +x ctx/bin/*/rssmb
+          cp docker/Dockerfile.release ctx/Dockerfile
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

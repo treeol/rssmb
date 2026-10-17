@@ -1,0 +1,727 @@
+//! RSSMB authentication — NTLM acceptor via sspi, SPNEGO, credential store.
+//!
+//! The auth layer is a multi-round acceptor conversation. SMB SESSION_SETUP
+//! exchanges security tokens over multiple messages (STATUS_MORE_PROCESSING_REQUIRED),
+//! and the session key is exported at the end for signing/encryption.
+//!
+//! We use the raw `sspi::ntlm::Ntlm` SSP directly and handle SPNEGO
+//! wrapping/unwrapping ourselves, because the `Negotiate` SSP doesn't
+//! correctly unwrap SPNEGO negTokenResp on the second round.
+
+use std::sync::Arc;
+use thiserror::Error;
+
+pub mod credentials;
+pub mod ntlm_mic;
+pub mod ntlmv2;
+pub mod spnego;
+
+#[allow(deprecated)]
+pub use credentials::CredentialStore;
+pub use credentials::IdentityStore;
+pub use ntlmv2::{compute_exported_session_key, compute_session_key, nt_hash};
+
+use sspi::{
+    ntlm::Ntlm, BufferType, DataRepresentation, SecurityBuffer, SecurityStatus, ServerRequestFlags,
+    Sspi, SspiImpl,
+};
+
+/// Authentication state during a multi-round exchange.
+pub struct AuthState {
+    /// The sspi acceptor (raw NTLM SSP)
+    ssp: Option<Ntlm>,
+    /// Whether this is the first round
+    first_round: bool,
+    /// The session key exported on completion
+    session_key: Option<Vec<u8>>,
+    /// Whether the NTLM mechanism has completed (proof verified).
+    auth_completed: bool,
+    /// The guest identity from the completed auth
+    completed_identity: Option<Identity>,
+    /// ServerChallenge we sent in the CHALLENGE message, for our own
+    /// NTLMv2 proof check on the AUTHENTICATE leg.
+    server_challenge: Option<[u8; 8]>,
+    /// Set only after our own NTLMv2 proof check succeeded in this
+    /// conversation. Required for any non-guest completion.
+    proof_verified: bool,
+    /// The client sent bare NTLMSSP (no SPNEGO), as Linux cifs.ko does with
+    /// sec=ntlmssp. Replies must then also be bare NTLMSSP.
+    raw_ntlmssp: bool,
+    /// DER-encoded mechTypes from the client's SPNEGO negTokenInit, saved
+    /// for the mechListMIC in the final accept-completed response.
+    mech_types: Option<Vec<u8>>,
+    /// NTLM negotiate flags from the AUTHENTICATE message, for MIC signing.
+    ntlm_neg_flags: u32,
+    /// The raw NTLMSSP NEGOTIATE message (type 1) from the first round,
+    /// saved for AUTHENTICATE MIC verification (MS-NLMP 3.2.5.1.2).
+    negotiate_message: Option<Vec<u8>>,
+    /// The raw NTLMSSP CHALLENGE message (type 2) we sent, for AUTHENTICATE
+    /// MIC verification (MS-NLMP 3.2.5.1.2).
+    challenge_message: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field("first_round", &self.first_round)
+            .field("has_session_key", &self.session_key.is_some())
+            .field("auth_completed", &self.auth_completed)
+            .finish()
+    }
+}
+
+impl AuthState {
+    pub fn new() -> Self {
+        Self {
+            ssp: None,
+            first_round: true,
+            session_key: None,
+            auth_completed: false,
+            completed_identity: None,
+            server_challenge: None,
+            proof_verified: false,
+            raw_ntlmssp: false,
+            mech_types: None,
+            ntlm_neg_flags: 0,
+            negotiate_message: None,
+            challenge_message: None,
+        }
+    }
+
+    /// Whether replies in this conversation should be SPNEGO-wrapped.
+    pub fn uses_spnego(&self) -> bool {
+        !self.raw_ntlmssp
+    }
+
+    fn wrap(&self, ntlm: &[u8]) -> Vec<u8> {
+        if self.raw_ntlmssp {
+            ntlm.to_vec()
+        } else {
+            spnego::wrap_ntlm_response(ntlm)
+        }
+    }
+}
+
+impl Default for AuthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The result of one step of the authentication conversation.
+pub enum AuthStep {
+    /// Send this output token to the client and wait for the next input.
+    Continue { output_token: Vec<u8> },
+    /// Authentication successful — the session key is available.
+    Complete {
+        output_token: Vec<u8>,
+        session_key: Vec<u8>,
+        identity: Identity,
+    },
+    /// Authentication failed.
+    Reject { reason: AuthError },
+}
+
+impl std::fmt::Debug for AuthStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthStep::Continue { output_token } => f
+                .debug_struct("AuthStep::Continue")
+                .field("output_token", &format!("[{} bytes]", output_token.len()))
+                .finish(),
+            AuthStep::Complete {
+                output_token,
+                session_key: _,
+                identity,
+            } => f
+                .debug_struct("AuthStep::Complete")
+                .field("output_token", &format!("[{} bytes]", output_token.len()))
+                .field("session_key", &"<redacted>")
+                .field("identity", identity)
+                .finish(),
+            AuthStep::Reject { reason } => f
+                .debug_struct("AuthStep::Reject")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+/// Authenticated identity.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub username: String,
+    pub domain: String,
+    pub is_guest: bool,
+}
+
+/// Authentication error.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("logon failure: {0}")]
+    LogonFailure(String),
+    #[error("no more processing required but not complete")]
+    NotComplete,
+    #[error("SPNEGO parse error: {0}")]
+    SpnegoError(String),
+    #[error("sspi error: {0}")]
+    SspiError(String),
+    #[error("no credentials provided")]
+    NoCredentials,
+    #[error("unsupported mechanism")]
+    UnsupportedMechanism,
+}
+
+/// The authentication provider trait — a multi-round acceptor conversation.
+#[async_trait::async_trait]
+pub trait AuthProvider: Send + Sync {
+    async fn step(&self, input_token: &[u8], state: &mut AuthState) -> Result<AuthStep, AuthError>;
+}
+
+/// NTLM authentication provider using the raw `sspi::ntlm::Ntlm` SSP.
+///
+/// We handle SPNEGO unwrapping ourselves:
+/// - Incoming: extract NTLMSSP token from SPNEGO wrapper via `spnego::extract_ntlm_token`
+/// - Outgoing: wrap NTLMSSP response in SPNEGO negTokenResp via `spnego::wrap_ntlm_response`
+///
+/// This avoids the sspi `Negotiate` SSP's bug where it doesn't correctly
+/// unwrap SPNEGO negTokenResp on the second round.
+///
+/// Server-side credentials are stored as pre-computed NT hashes in an
+/// [`IdentityStore`], built once at startup. The provider verifies NTLMv2
+/// proofs against these hashes and computes the session key directly,
+/// without needing the plaintext password or passing it to sspi.
+pub struct NtlmAuthProvider {
+    /// Pre-computed NT hashes from the identity store.
+    identities: Arc<IdentityStore>,
+    /// Whether guest access is enabled at the server level.
+    guest_access: bool,
+    /// Whether to require MsvAvTimestamp in the NTLMv2 blob (anti-replay).
+    require_timestamp: bool,
+}
+
+impl NtlmAuthProvider {
+    #[deprecated(note = "Use NtlmAuthProvider::with_identity_store instead")]
+    #[allow(deprecated)]
+    pub fn from_store(store: &CredentialStore) -> Self {
+        Self {
+            identities: Arc::new(store.to_identity_store()),
+            guest_access: false,
+            require_timestamp: false,
+        }
+    }
+
+    pub fn with_identities(identities: Vec<sspi::AuthIdentity>) -> Self {
+        // Legacy constructor: convert plaintext-password identities into
+        // an IdentityStore by computing NT hashes.
+        let store = IdentityStore::from_identities(&identities);
+        Self {
+            identities: Arc::new(store),
+            guest_access: false,
+            require_timestamp: false,
+        }
+    }
+
+    pub fn with_identities_and_guest(
+        identities: Vec<sspi::AuthIdentity>,
+        guest_access: bool,
+    ) -> Self {
+        let store = IdentityStore::from_identities(&identities);
+        Self {
+            identities: Arc::new(store),
+            guest_access,
+            require_timestamp: false,
+        }
+    }
+
+    pub fn with_identity_store(identities: Arc<IdentityStore>, guest_access: bool) -> Self {
+        Self {
+            identities,
+            guest_access,
+            require_timestamp: false,
+        }
+    }
+
+    pub fn with_identity_store_and_flags(
+        identities: Arc<IdentityStore>,
+        guest_access: bool,
+        require_timestamp: bool,
+    ) -> Self {
+        Self {
+            identities,
+            guest_access,
+            require_timestamp,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for NtlmAuthProvider {
+    async fn step(&self, input_token: &[u8], state: &mut AuthState) -> Result<AuthStep, AuthError> {
+        // If auth already completed, this is the final SPNEGO round
+        // (negTokenResp with the client's mechListMIC or an empty token).
+        // Samba/GVFS clients send their mechListMIC with the AUTHENTICATE
+        // or not at all; the dispatch layer handles the follow-up round
+        // (session already exists → return success). We just return
+        // Complete again (finding 2: the `awaiting_mic` mechanism was
+        // removed — it forced an extra round that Samba clients don't
+        // expect, causing auth failures).
+        if state.auth_completed {
+            let identity = state.completed_identity.clone().ok_or_else(|| {
+                AuthError::LogonFailure("internal state error: completed identity missing".into())
+            })?;
+            let session_key = state.session_key.clone().ok_or_else(|| {
+                AuthError::LogonFailure("internal state error: session key missing".into())
+            })?;
+
+            // If the client sends a mechListMIC in a follow-up round, verify it.
+            if !identity.is_guest
+                && state.uses_spnego()
+                && ntlm_mic::supported(state.ntlm_neg_flags)
+            {
+                if let Some(client_mic) = spnego::extract_mech_list_mic(input_token) {
+                    let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
+                    if !ntlm_mic::verify_client(
+                        &session_key,
+                        state.ntlm_neg_flags,
+                        mech_types,
+                        &client_mic,
+                    ) {
+                        tracing::warn!("mechListMIC verification failed on follow-up leg");
+                        state.auth_completed = false;
+                        state.proof_verified = false;
+                        state.session_key = None;
+                        state.completed_identity = None;
+                        return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
+                    }
+                    tracing::debug!("mechListMIC verified on follow-up leg");
+                }
+            }
+
+            return Ok(AuthStep::Complete {
+                output_token: vec![],
+                session_key,
+                identity,
+            });
+        }
+
+        // Initialize the NTLM SSP on the first call
+        if state.first_round {
+            state.first_round = false;
+
+            // Candidate identities are applied after the AUTHENTICATE message
+            // is parsed (see below); setting them here would also pre-seed
+            // `identity` and they are discarded by sspi on that leg anyway.
+            state.ssp = Some(Ntlm::new());
+        }
+
+        let ssp = state.ssp.as_mut().ok_or(AuthError::NotComplete)?;
+
+        // Framing is decided by the client's first token and then fixed.
+        if state.server_challenge.is_none() {
+            state.raw_ntlmssp = input_token.starts_with(b"NTLMSSP\0");
+            // Save the mechTypes from the SPNEGO negTokenInit for the
+            // mechListMIC in the final accept-completed response.
+            if !state.raw_ntlmssp {
+                state.mech_types = spnego::extract_mech_types(input_token);
+            }
+        }
+
+        // Unwrap SPNEGO to get the raw NTLMSSP token. If extraction fails,
+        // reject — do not fall back to passing the raw wrapper to the NTLM
+        // parser (finding 1: unbounded suffix / wrong token).
+        let ntlm_token = spnego::extract_ntlm_token(input_token).map_err(AuthError::SpnegoError)?;
+
+        // Save the raw NTLMSSP NEGOTIATE (type 1) message for AUTHENTICATE
+        // MIC verification (MS-NLMP 3.2.5.1.2). On the first round this is
+        // the NEGOTIATE; on the second round it's the AUTHENTICATE, and the
+        // NEGOTIATE was already saved.
+        if state.negotiate_message.is_none() && ntlm_token.starts_with(b"NTLMSSP\0") {
+            // Check the message type: type 1 = NEGOTIATE
+            if ntlm_token.len() >= 12 && u32_le(&ntlm_token, 8) == Some(1) {
+                state.negotiate_message = Some(ntlm_token.clone());
+            }
+        }
+
+        // Save a clone for AUTHENTICATE MIC verification — the original is
+        // moved into SecurityBuffer below.
+        let ntlm_token_for_mic = ntlm_token.clone();
+
+        // Anonymous AUTHENTICATE (MS-NLMP 3.2.5.1.2) is recognised
+        // structurally — never from sspi error text. It never reaches the
+        // proof verifier: either it becomes a guest session (when the server
+        // allows guests) or it is a logon failure.
+        if let Some(summary) = spnego::parse_authenticate(&ntlm_token) {
+            if summary.is_anonymous() {
+                // Only valid as the reply to our CHALLENGE.
+                if state.server_challenge.is_none() {
+                    return Err(AuthError::LogonFailure(
+                        "AUTHENTICATE before CHALLENGE".into(),
+                    ));
+                }
+                if !self.guest_access {
+                    return Err(AuthError::LogonFailure("anonymous logon disabled".into()));
+                }
+                tracing::debug!("NTLM anonymous AUTHENTICATE → guest session");
+                let identity = Identity {
+                    username: "guest".to_string(),
+                    domain: String::new(),
+                    is_guest: true,
+                };
+                state.session_key = Some(vec![]);
+                state.auth_completed = true;
+                state.completed_identity = Some(identity.clone());
+                let output_token = if state.uses_spnego() {
+                    spnego::wrap_accept_completed(None)
+                } else {
+                    vec![]
+                };
+                return Ok(AuthStep::Complete {
+                    output_token,
+                    session_key: vec![],
+                    identity,
+                });
+            }
+            // An AUTHENTICATE with no NtChallengeResponse that is not
+            // anonymous (e.g. a user name with no proof) can never verify.
+            // Reject it here with a precise reason instead of letting sspi
+            // fail with an opaque "NtChallengeResponse cannot be empty".
+            if summary.nt_len == 0 {
+                tracing::debug!(
+                    user_len = summary.user_len,
+                    lm_len = summary.lm_len,
+                    "AUTHENTICATE without NT response and not anonymous"
+                );
+                return Err(AuthError::LogonFailure(format!(
+                    "AUTHENTICATE without NT response (not anonymous: user_len={}, lm_len={})",
+                    summary.user_len, summary.lm_len
+                )));
+            }
+        }
+
+        // Pass the raw NTLMSSP token to the NTLM SSP
+        let mut input = [SecurityBuffer::new(ntlm_token, BufferType::Token)];
+        let mut output = [SecurityBuffer::new(Vec::new(), BufferType::Token)];
+
+        let mut cred_handle: Option<_> = None;
+
+        let builder = ssp
+            .accept_security_context()
+            .with_credentials_handle(&mut cred_handle)
+            .with_context_requirements(ServerRequestFlags::empty())
+            .with_target_data_representation(DataRepresentation::Native)
+            .with_input(&mut input)
+            .with_output(&mut output);
+
+        // Any acceptor error is a logon failure. No error ever becomes guest.
+        let result = ssp
+            .accept_security_context_impl(builder)
+            .and_then(|mut gen| gen.resolve_to_result())
+            .map_err(|e| {
+                tracing::debug!("NTLM accept failed: {e}");
+                AuthError::LogonFailure(e.to_string())
+            })?;
+
+        let ntlm_output = output[0].buffer.clone();
+
+        if result.status == SecurityStatus::ContinueNeeded {
+            state.server_challenge = ntlmv2::server_challenge(&ntlm_output);
+            if state.server_challenge.is_none() {
+                return Err(AuthError::SspiError(
+                    "CHALLENGE message missing server challenge".into(),
+                ));
+            }
+            // Save the raw CHALLENGE message for AUTHENTICATE MIC verification.
+            state.challenge_message = Some(ntlm_output.clone());
+        }
+
+        let mut status = result.status;
+        if status == SecurityStatus::CompleteNeeded {
+            // The AUTHENTICATE message has been parsed. We verify the NTLMv2
+            // proof ourselves using the pre-computed NT hash from the
+            // identity store, and compute the session key directly — no
+            // plaintext password is needed.
+            //
+            // Timing equalization: when the user is unknown, we still run
+            // verify_with_nt_hash against a dummy hash so that the
+            // auth-failure path takes approximately the same time as a
+            // known-user-with-wrong-password. This is not "constant-time
+            // authentication" — the HashMap lookup, string comparisons, and
+            // field parsing add small timing differences — but it
+            // eliminates the most obvious oracle: unknown-user fast-fail
+            // before crypto vs. known-user crypto-verify-then-fail.
+            let wire_user = ssp
+                .query_context_names()
+                .map(|n| account_name(&n.username))
+                .map_err(|e| AuthError::LogonFailure(format!("no user in AUTHENTICATE: {e}")))?;
+
+            // Look up the pre-computed NT hash for this user, or use a dummy
+            // hash so the verification path runs regardless. A matching proof
+            // against the dummy hash never authenticates: `stored` is None
+            // for unknown users, and proof_verified is only set when both
+            // the user exists and the proof matches.
+            let stored = self.identities.lookup(&wire_user);
+            let dummy_hash = [0u8; 16];
+            let nt_hash: &[u8] = stored
+                .as_ref()
+                .map(|s| &s.nt_hash[..])
+                .unwrap_or(&dummy_hash);
+
+            let challenge = state
+                .server_challenge
+                .ok_or_else(|| AuthError::LogonFailure("AUTHENTICATE before CHALLENGE".into()))?;
+            let fields = ntlmv2::parse_authenticate_fields(&input[0].buffer)
+                .ok_or_else(|| AuthError::LogonFailure("malformed AUTHENTICATE".into()))?;
+            // Both parsers must agree on who is logging in.
+            let parsed_user = fields.user();
+            if account_name_str(&parsed_user) != wire_user {
+                return Err(AuthError::LogonFailure("AUTHENTICATE user mismatch".into()));
+            }
+            // Verify the NTLMv2 proof. For unknown users this runs against
+            // the dummy hash and will fail; for known users it runs against
+            // the real hash. Both paths do the same HMAC-MD5 work.
+            if !ntlmv2::verify_with_nt_hash(&fields, nt_hash, &challenge) {
+                tracing::debug!(user = %wire_user, "NTLMv2 proof mismatch");
+                return Err(AuthError::LogonFailure("NTLMv2 proof mismatch".into()));
+            }
+            // The proof matched — but if the user is unknown (stored is None),
+            // this was a match against the dummy hash. Never authenticate
+            // an unknown user, even if their proof happened to match the
+            // all-zeros dummy.
+            let stored = match stored {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(user = %wire_user, "proof matched dummy hash — refusing unknown user");
+                    return Err(AuthError::LogonFailure("unknown user".into()));
+                }
+            };
+
+            // Compute the session key directly from the NT hash — we don't
+            // need sspi to do this for us, and we don't have the plaintext
+            // password to pass to sspi's identity machinery.
+            let session_base_key = ntlmv2::compute_session_key(&stored.nt_hash, &fields);
+            let session_key = ntlmv2::compute_exported_session_key(
+                &session_base_key,
+                fields.neg_flags,
+                &fields.encrypted_random_session_key,
+            )
+            .map_err(|e| AuthError::LogonFailure(e.to_string()))?;
+
+            // AUTHENTICATE message MIC verification (MS-NLMP 3.2.5.1.2).
+            // If the client's MsvAvFlags has the MIC-present bit set, the
+            // AUTHENTICATE message carries a MIC at offset 72 computed over
+            // NEGOTIATE || CHALLENGE || AUTHENTICATE (with the MIC field
+            // zeroed). We verify it with the ExportedSessionKey.
+            if ntlmv2::has_mic_flag(&fields.nt_response) {
+                let neg = state.negotiate_message.as_deref().unwrap_or(&[]);
+                let chal = state.challenge_message.as_deref().unwrap_or(&[]);
+                if !ntlmv2::verify_authenticate_mic(&session_key, neg, chal, &ntlm_token_for_mic) {
+                    tracing::warn!("AUTHENTICATE MIC verification failed — rejecting");
+                    return Err(AuthError::LogonFailure("AUTHENTICATE MIC mismatch".into()));
+                }
+                tracing::debug!("AUTHENTICATE MIC verified successfully");
+            }
+
+            // Anti-replay: require MsvAvTimestamp in the NTLMv2 blob.
+            // This is a presence check — it requires that the client include
+            // a timestamp in the blob, making replay of a captured
+            // AUTHENTICATE observable by comparison with the challenge time.
+            if self.require_timestamp && !ntlmv2::has_timestamp(&fields.nt_response) {
+                tracing::warn!(
+                    "NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)"
+                );
+                return Err(AuthError::LogonFailure("missing NTLMv2 timestamp".into()));
+            }
+
+            // All checks passed — commit state.
+            state.proof_verified = true;
+            state.session_key = Some(session_key);
+            // Save the negotiate flags for the mechListMIC computation.
+            state.ntlm_neg_flags = fields.neg_flags;
+
+            // We've verified the NTLMv2 proof and computed the session key
+            // ourselves from the NT hash. We do NOT call sspi's
+            // complete_auth_token — it requires credentials with the
+            // plaintext password (we only have the NT hash) and its
+            // custom_set_auth_identities rejects empty identity lists.
+            // Instead, set the status to Ok and let the match below
+            // handle the rest using our own session key and the wire
+            // username from query_context_names (which reads the identity
+            // that read_authenticate already set from the AUTHENTICATE
+            // message's user/domain fields).
+            status = SecurityStatus::Ok;
+        }
+
+        match status {
+            SecurityStatus::ContinueNeeded => {
+                // Wrap the NTLM challenge in SPNEGO negTokenResp
+                let wrapped = state.wrap(&ntlm_output);
+                Ok(AuthStep::Continue {
+                    output_token: wrapped,
+                })
+            }
+            SecurityStatus::Ok | SecurityStatus::CompleteNeeded if !state.proof_verified => Err(
+                AuthError::LogonFailure("acceptor completed without a verified proof".into()),
+            ),
+            SecurityStatus::Ok | SecurityStatus::CompleteNeeded => {
+                // Use the session key we computed ourselves from the NT hash
+                // (set during CompleteNeeded processing). If our computation
+                // didn't happen, this is a logic error — fail closed rather
+                // than silently using an empty key (finding 11).
+                let session_key = state.session_key.clone().ok_or_else(|| {
+                    AuthError::LogonFailure(
+                        "internal state error: session key not computed despite verified proof"
+                            .into(),
+                    )
+                })?;
+
+                // Authenticated account name. Fail closed rather than invent
+                // a principal — valid_users checks depend on it.
+                let username = ssp
+                    .query_context_names()
+                    .map(|names| account_name(&names.username))
+                    .map_err(|e| AuthError::SspiError(format!("query_context_names: {e}")))?;
+
+                let identity = Identity {
+                    username,
+                    domain: String::new(),
+                    is_guest: false,
+                };
+
+                // Verify the client's mechListMIC if it accompanies the
+                // AUTHENTICATE token (RFC 4178 §5) BEFORE committing
+                // auth_completed to state, so a failed MIC check does not
+                // leave AuthState marked completed for subsequent step() calls.
+                if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
+                    if let Some(client_mic) = spnego::extract_mech_list_mic(input_token) {
+                        let mech_types = state.mech_types.as_deref().unwrap_or(&[]);
+                        if !ntlm_mic::verify_client(
+                            &session_key,
+                            state.ntlm_neg_flags,
+                            mech_types,
+                            &client_mic,
+                        ) {
+                            tracing::warn!("mechListMIC verification failed on AUTHENTICATE leg");
+                            state.proof_verified = false;
+                            state.session_key = None;
+                            return Err(AuthError::LogonFailure("mechListMIC mismatch".into()));
+                        }
+                        tracing::debug!("mechListMIC verified on AUTHENTICATE leg");
+                    }
+                    // If no MIC is present, the dispatch layer handles any
+                    // follow-up round (session already exists → success).
+                }
+
+                state.session_key = Some(session_key.clone());
+                state.auth_completed = true;
+                state.completed_identity = Some(identity.clone());
+
+                // NTLM's final leg has no server token. For SPNEGO clients
+                // that negotiated NTLMSSP signing (Samba/Windows), the final
+                // negTokenResp must carry a mechListMIC — a signature of the
+                // mechTypes list with the session key — or the client rejects
+                // the response (Samba: NT_STATUS_INVALID_NETWORK_RESPONSE).
+                let output_token = if ntlm_output.is_empty() {
+                    if state.uses_spnego() && ntlm_mic::supported(state.ntlm_neg_flags) {
+                        let mic = state.mech_types.as_deref().map(|mt| {
+                            ntlm_mic::sign(
+                                &session_key,
+                                state.ntlm_neg_flags,
+                                ntlm_mic::Direction::ServerToClient,
+                                0,
+                                mt,
+                            )
+                        });
+                        spnego::wrap_accept_completed(mic.as_ref().map(|m| m.as_slice()))
+                    } else if state.uses_spnego() {
+                        // No signing negotiated — simple accept-completed.
+                        spnego::wrap_accept_completed(None)
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    state.wrap(&ntlm_output)
+                };
+
+                // If the client sent its mechListMIC with the AUTHENTICATE,
+                // it was already verified above. If not, the dispatch layer
+                // handles the follow-up round (session already exists →
+                // success). The `awaiting_mic` mechanism was removed — it
+                // forced an extra round that Samba clients don't expect
+                // (finding 2).
+                Ok(AuthStep::Complete {
+                    output_token,
+                    session_key,
+                    identity,
+                })
+            }
+            other => Err(AuthError::SspiError(format!(
+                "unexpected status: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// The bare account name of a username (drops any NetBIOS domain / UPN suffix).
+fn account_name(u: &sspi::Username) -> String {
+    match u.parts() {
+        sspi::UsernameParts::DownLevelLogonName(d) => d.account_name().to_string(),
+        sspi::UsernameParts::UserPrincipalName(p) => p.account_name().to_string(),
+    }
+}
+
+/// Read a little-endian u32 at `offset` from a byte slice, or None if out of bounds.
+fn u32_le(b: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        b.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// `account_name` for a raw wire string, via the same parser.
+fn account_name_str(s: &str) -> String {
+    sspi::Username::parse(s)
+        .map(|u| account_name(&u))
+        .unwrap_or_else(|_| s.to_string())
+}
+
+/// Guest authentication provider — always succeeds with guest identity.
+pub struct GuestAuthProvider;
+
+#[async_trait::async_trait]
+impl AuthProvider for GuestAuthProvider {
+    async fn step(
+        &self,
+        _input_token: &[u8],
+        _state: &mut AuthState,
+    ) -> Result<AuthStep, AuthError> {
+        Ok(AuthStep::Complete {
+            output_token: vec![],
+            session_key: vec![],
+            identity: Identity {
+                username: "guest".to_string(),
+                domain: "".to_string(),
+                is_guest: true,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_guest_auth() {
+        let provider = GuestAuthProvider;
+        let mut state = AuthState::new();
+
+        let result = provider.step(&[], &mut state).await.unwrap();
+        match result {
+            AuthStep::Complete { identity, .. } => {
+                assert_eq!(identity.username, "guest");
+                assert!(identity.is_guest);
+            }
+            _ => panic!("expected Complete"),
+        }
+    }
+}

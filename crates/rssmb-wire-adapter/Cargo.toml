@@ -1,0 +1,20 @@
+[package]
+name = "rssmb-wire-adapter"
+description = "Server-side wire codec adapter over smb-msg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rssmb-proto = { workspace = true }
+binrw = "0.15"
+bytes = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }

@@ -1,0 +1,92 @@
+# RSSMB configuration — production-safe example
+# ================================================
+# Copy this to config/rssmb.toml and edit shares + users for your setup.
+# See config/rssmb.dev.toml for a dev/test config with guest access.
+
+listen_addr = "0.0.0.0"
+port = 445
+min_dialect = "smb21"
+max_dialect = "smb311"
+
+# Signing: required for production (Windows 11 24H2 requires it by default).
+signing = "required"
+
+# Encryption: offered but not required for 3.0+.
+# Set to "required" to force encryption on all 3.x sessions.
+encryption = "desired"
+
+# Connection limits
+max_frame_size = 1048576
+max_credits = 1024
+
+# Guest access: disabled by default.
+# Recent Windows blocks insecure guest logons, so authenticated users only.
+guest_access = false
+
+# Health & metrics endpoint (HTTP, separate from SMB port)
+# Bind to localhost for security — change if you need remote access.
+health_port = 8080
+
+# Grace period (seconds) for draining active connections on shutdown.
+# After this, remaining connections are aborted. Default: 10.
+# shutdown_grace_secs = 10
+
+# ── Leases & multichannel (SMB 2.1+/3.x) ────────────────────────────────
+# File leases and traditional oplocks (client-side caching coordination).
+# Default: true.
+# leases = true
+
+# SMB 3.x multichannel. Advertised only when the server has usable
+# (non-loopback) network interfaces. Default: true.
+# multichannel = true
+
+# Pin the addresses advertised to multichannel clients. Use this in NAT or
+# Kubernetes environments where the container's enumerated addresses are
+# not reachable by clients, e.g.:
+# multichannel_interfaces = ["10.0.0.5", "192.168.7.2"]
+# Empty (default) = enumerate the host's interfaces automatically.
+
+# ── SMB over QUIC (SMB 3.1.1 over TLS 1.3, UDP) ─────────────────────────
+# Serves the same SMB 3.1.1 protocol over QUIC (ALPN "smb"), useful when
+# TCP/445 is blocked. Requires a TLS certificate chain and private key in
+# PEM format. Windows 11 / Server 2022+ clients connect over UDP/443.
+# Default: disabled.
+# quic_enabled = false
+# quic_port = 443
+# quic_cert_path = "/etc/rssmb/tls/cert.pem"
+# quic_key_path = "/etc/rssmb/tls/key.pem"
+
+# ── Shares ──────────────────────────────────────────────────────────────
+# Add your shares here. Each share needs a path, and at minimum
+# read_only and guest_ok settings.
+
+[shares.public]
+name = "public"
+path = "/data/public"
+comment = "Public share"
+read_only = false
+browseable = true
+guest_ok = false
+valid_users = ["alice"]
+# Optional: restrict read access to specific users (empty = all valid_users).
+# read_users = ["alice", "bob"]
+# Optional: restrict write access to specific users (empty = all valid_users).
+# write_users = ["alice"]
+
+# ── Authentication ─────────────────────────────────────────────────────
+# User accounts for NTLM authentication.
+# Either `password` (plaintext) or `nt_hash` (hex NT hash) may be used.
+# NT hashes are preferred — generate with: `rssmb hash-password <password>`.
+# The config file may contain passwords or hashes, so restrict its
+# permissions (chmod 600) and mount it as a secret in production.
+#
+# [[users]]
+# username = "alice"
+# nt_hash = "8846f7eaee8fb117ad06bdd830b7586c"  # hash of "password"
+# disabled = false
+#
+# Or with plaintext password (not recommended for production):
+# [[users]]
+# username = "alice"
+# password = "change-me"
+# disabled = false

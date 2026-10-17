@@ -1,0 +1,11 @@
+# Don't send build artifacts to the Docker builder
+target/
+smb-rs/.git/
+smb-rs/target/
+**/*.rs.bk
+.DS_Store
+.git
+# Let the Docker image's Rust version be used. The Dockerfile uses rust:1.90
+# whose cargo can parse the v4 lock file; rust-toolchain.toml is for local MSRV
+# pinning only and would downgrade to 1.78 inside the builder.
+rust-toolchain.toml

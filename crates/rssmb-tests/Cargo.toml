@@ -1,0 +1,19 @@
+[package]
+name = "rssmb-tests"
+description = "Integration test harness and interop tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rssmb-server = { workspace = true }
+rssmb-vfs = { workspace = true }
+rssmb-proto = { workspace = true }
+rssmb-wire-adapter = { workspace = true }
+tokio = { workspace = true }
+binrw = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

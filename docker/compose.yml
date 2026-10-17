@@ -1,0 +1,76 @@
+# RSSMB — Docker Compose for easy deployment
+# ===========================================
+# Usage:
+#   1. Copy config/rssmb.example.toml to config/rssmb.toml and edit shares
+#   2. Create the data directory: mkdir -p data/public data/homes
+#   3. Start: docker compose -f docker/compose.yml up -d
+#   4. Connect: smbclient //localhost/public -U guest
+#
+# The server runs as UID/GID 1000 (rssmb). Ensure the data directories
+# are owned by that UID: sudo chown -R 1000:1000 data/
+
+services:
+  rssmb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: rssmb
+    # Run as the rssmb user (UID 1000, GID 1000)
+    user: "1000:1000"
+    ports:
+      - "445:445"      # SMB over TCP
+      - "8080:8080"    # Health & metrics (HTTP)
+    volumes:
+      # Config (read-only) — mount your production config here.
+      # Use config/rssmb.example.toml as a template.
+      - ../config/rssmb.toml:/etc/rssmb/rssmb.toml:ro
+      # Share data — adjust paths for your environment
+      - ../data/public:/data/public
+      - ../data/homes:/data/homes
+    environment:
+      - RUST_LOG=info
+    # Graceful shutdown: give the server 10s to drain connections
+    stop_grace_period: 10s
+    # Restart policy for container orchestration
+    restart: unless-stopped
+    # Health check via the HTTP endpoint.
+    # The scratch image has no shell, so we use the binary's own health
+    # endpoint by checking if the port is accepting connections.
+    # Docker's healthcheck can't run /rssmb (it's the entrypoint), so we
+    # rely on an external healthcheck via the host port mapping instead.
+    # For now, no in-container healthcheck — use the health endpoint
+    # directly from the host or orchestrator.
+
+    # Security: read-only root filesystem, write only to /data and /tmp
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Port 445 may need CAP_NET_BIND_SERVICE on hosts without
+    # ip_unprivileged_port_start=0. Docker's -p maps the port at the
+    # container boundary, so this is mainly for host networking mode.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional: Samba client container for interop testing
+  # Run: docker compose -f docker/compose.yml run --rm samba-client
+  samba-client:
+    image: ubuntu:22.04
+    profiles: ["test"]
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y samba-client &&
+        echo 'Testing RSSMB connectivity...' &&
+        smbclient -L //rssmb -U guest -N &&
+        echo 'Listing shares OK'
+      "
+    depends_on:
+      rssmb:
+        condition: service_healthy
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined

@@ -1,0 +1,71 @@
+[package]
+name = "rssmb-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rssmb-wire-adapter = { path = "../crates/rssmb-wire-adapter" }
+rssmb-proto = { path = "../crates/rssmb-proto" }
+rssmb-auth = { path = "../crates/rssmb-auth" }
+rssmb-vfs = { path = "../crates/rssmb-vfs" }
+rssmb-server = { path = "../crates/rssmb-server" }
+binrw = "0.15"
+
+[[bin]]
+name = "parse_payload"
+path = "fuzz_targets/parse_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "read_netbios_frame"
+path = "fuzz_targets/read_netbios_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_ntlm_token"
+path = "fuzz_targets/extract_ntlm_token.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_mech_types"
+path = "fuzz_targets/extract_mech_types.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "proto_decode_header"
+path = "fuzz_targets/proto_decode_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "proto_decode_plain_request"
+path = "fuzz_targets/proto_decode_plain_request.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "normalize_path"
+path = "fuzz_targets/normalize_path.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ntlm_authenticate"
+path = "fuzz_targets/ntlm_authenticate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decrypt_transform"
+path = "fuzz_targets/decrypt_transform.rs"
+test = false
+doc = false
