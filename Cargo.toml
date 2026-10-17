@@ -37,7 +37,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # External — crypto
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 cmac = "0.7"
 aes = "0.8"
