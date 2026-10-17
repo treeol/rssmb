@@ -9,7 +9,7 @@ authors.workspace = true
 
 [dependencies]
 binrw = "0.15"
-modular-bitfield = "0.11"
+modular-bitfield = "0.13"
 rand = { workspace = true }
 
 [dev-dependencies]
