@@ -79,4 +79,4 @@ vulnerability reporting.
 ## License
 
 By contributing, you agree that your contributions are licensed under
-MIT OR Apache-2.0.
+Apache-2.0.

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/rssmb/rssmb/actions/workflows/ci.yml/badge.svg)](https://github.com/rssmb/rssmb/actions/workflows/ci.yml)
 [![Interop CI](https://github.com/rssmb/rssmb/actions/workflows/interop-ci.yml/badge.svg)](https://github.com/rssmb/rssmb/actions/workflows/interop-ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://www.rust-lang.org/)
 
 A standalone SMB2/3 file server written in pure Rust, designed for
@@ -49,6 +49,10 @@ kernel CIFS client, `smbclient`, GNOME Files (Nautilus), and Samba's
 - `rssmb hash-password` generates NT hashes
 
 ## Quick start (Docker)
+
+The Docker image is a **~5 MB static binary in `FROM scratch`** — no OS,
+no shell, no dynamic libraries. Just the binary and the config/data volumes
+you mount.
 
 ```sh
 mkdir -p data/public data/homes && sudo chown -R 1000:1000 data
@@ -134,7 +138,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `max_connections_per_ip` | `0` (`100` in example config) | Per-IP connection limit (`0` = unlimited) |
 | `max_frame_size` | `1048576` | Maximum SMB frame size (1 MiB) |
 | `max_credits` | `1024` | Maximum outstanding credits |
-| `health_port` | `8080` | HTTP health/metrics endpoint |
+| `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
 
 Per share (`[shares.<name>]`):
@@ -162,9 +166,9 @@ See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting policy and
 
 **Status:** Pre-1.0. An external security review is required before the 1.0
 release. The [MS-NLMP], [MS-SMB2], and [MS-SRVS] protocol implementations have
-been hardened through three rounds of automated review (Mashūra) covering
-NTLM authentication, SPNEGO parsing, path confinement, credit tracking, and
-config validation.
+been hardened through multiple rounds of automated review (Mashūra) covering
+NTLM authentication, SPNEGO parsing, path confinement, credit tracking,
+connection lifecycle, delete-on-close semantics, and config validation.
 
 [MS-NLMP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp
 [MS-SMB2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2
@@ -173,7 +177,7 @@ config validation.
 ## Testing & conformance
 
 ```sh
-cargo test --workspace          # 503 unit + integration tests
+cargo test --workspace          # 520 unit + integration tests
 tests/live/run.sh               # impacket-based interop (needs Python)
 tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privileged)
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
@@ -220,4 +224,4 @@ fuzz/                   cargo-fuzz targets
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
