@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod negotiate_ctx;
 pub mod notify;
 pub mod opens;
+pub mod quic;
 pub mod session;
 pub mod signing;
 pub mod tree;
@@ -140,6 +141,9 @@ pub struct ServerState {
     /// Stable server GUID (generated once, used for all negotiate responses).
     /// Clients use this for reconnect/multichannel matching.
     pub server_guid: [u8; 16],
+    /// Global monotonically increasing connection ID counter shared across
+    /// TCP and QUIC listeners.
+    pub next_conn_id: std::sync::atomic::AtomicU64,
 }
 
 impl ServerState {
@@ -191,6 +195,7 @@ impl ServerState {
             metrics: Arc::new(crate::metrics::ServerMetrics::new()),
             shutdown: Arc::new(ShutdownSignal::new()),
             server_guid: guid,
+            next_conn_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 

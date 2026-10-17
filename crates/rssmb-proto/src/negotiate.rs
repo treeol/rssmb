@@ -338,6 +338,15 @@ impl From<CompressionCapabilities> for NegotiateContext {
     }
 }
 
+impl From<TransportCapabilities> for NegotiateContext {
+    fn from(val: TransportCapabilities) -> Self {
+        NegotiateContext {
+            context_type: NegotiateContextType::TransportCapabilities,
+            data: NegotiateContextValue::TransportCapabilities(val),
+        }
+    }
+}
+
 // ── Context value structs ─────────────────────────────────────────
 
 /// Pre-authentication integrity capabilities.
@@ -631,6 +640,16 @@ impl NegotiateRequest {
         self.negotiate_context_list.as_ref().and_then(|contexts| {
             contexts.iter().find_map(|ctx| match &ctx.data {
                 NegotiateContextValue::SigningCapabilities(c) => Some(c),
+                _ => None,
+            })
+        })
+    }
+
+    /// Gets the transport capabilities context, if present.
+    pub fn get_ctx_transport_capabilities(&self) -> Option<&TransportCapabilities> {
+        self.negotiate_context_list.as_ref().and_then(|contexts| {
+            contexts.iter().find_map(|ctx| match &ctx.data {
+                NegotiateContextValue::TransportCapabilities(c) => Some(c),
                 _ => None,
             })
         })

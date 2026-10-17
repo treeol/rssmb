@@ -80,6 +80,16 @@ pub enum PreauthTarget {
     Session(u64),
 }
 
+/// Transport type for a client connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TransportKind {
+    /// Direct TCP (port 445).
+    #[default]
+    Tcp,
+    /// SMB over QUIC (UDP / TLS 1.3, ALPN `smb`).
+    Quic,
+}
+
 /// Per-connection state handed to the dispatcher.
 #[derive(Clone)]
 pub struct ConnState {
@@ -88,6 +98,8 @@ pub struct ConnState {
     pub conn_id: u64,
     /// Remote peer IP address — used for auth throttling and audit logging.
     pub remote_addr: std::net::IpAddr,
+    /// Transport used by this connection (Direct TCP vs SMB over QUIC).
+    pub transport: TransportKind,
     /// Active sessions for this connection (SMB allows multiple).
     pub sessions: std::sync::Arc<tokio::sync::RwLock<Vec<Arc<Session>>>>,
     /// Sender half of the connection's write channel.
@@ -356,7 +368,16 @@ pub async fn handle_message(
             handle_compound(state, conn_state, requests, raw_frame, was_encrypted).await
         }
         FramedMessage::Smb1Negotiate(_) => {
-            // SMB2-only server: do not respond to SMB1 negotiate.
+            // MS-SMB2 3.3.5.3.1: over QUIC, SMB1 multi-protocol negotiate is
+            // not allowed — disconnect immediately.
+            if conn_state.transport == TransportKind::Quic {
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    "SMB1 negotiate on QUIC transport — disconnecting"
+                );
+                return Some(FramedResponse::Disconnect);
+            }
+            // SMB2-only server: do not respond to SMB1 negotiate on TCP.
             // The client (impacket, smbclient, cifs.ko) will close and retry
             // with SMB2. Returning an SMB2 error response here would be
             // misinterpreted by some clients as a truncated SMB2 negotiate
@@ -938,18 +959,26 @@ async fn handle_negotiate(
         "negotiate request");
 
     // MS-SMB2 3.3.5.4: select the highest common dialect.
-    let selected = match select_dialect(
-        &neg_req.dialects,
-        state.config.min_dialect,
-        state.config.max_dialect,
-    ) {
+    // Over QUIC (TLS 1.3), only SMB 3.1.1 is permitted on the transport;
+    // if the client does not offer 0x0311 (or server max_dialect < Smb311),
+    // terminate the connection.
+    let min_dialect = if conn_state.transport == TransportKind::Quic {
+        DialectConfig::Smb311
+    } else {
+        state.config.min_dialect
+    };
+    let selected = match select_dialect(&neg_req.dialects, min_dialect, state.config.max_dialect) {
         Some(d) => d,
         None => {
             warn!(conn_id = conn_state.conn_id,
+                transport = ?conn_state.transport,
                 dialects = ?neg_req.dialects,
-                min = ?state.config.min_dialect,
+                min = ?min_dialect,
                 max = ?state.config.max_dialect,
                 "no common dialect — rejecting NEGOTIATE");
+            if conn_state.transport == TransportKind::Quic {
+                return FramedResponse::Disconnect;
+            }
             return error_response_for(Command::Negotiate, NtStatus::NotSupported, req_header);
         }
     };
@@ -975,8 +1004,13 @@ async fn handle_negotiate(
         .with_signing_required(signing_required);
 
     // SMB 3.1.1: process negotiate contexts (MS-SMB2 3.3.5.4).
+    let is_quic = conn_state.transport == TransportKind::Quic;
     let (neg311, response_contexts) = if selected == DialectConfig::Smb311 {
-        match crate::negotiate_ctx::process_request_contexts(neg_req, state.config.encryption) {
+        match crate::negotiate_ctx::process_request_contexts_for_transport(
+            neg_req,
+            state.config.encryption,
+            is_quic,
+        ) {
             Ok((neg, ctxs)) => (Some(neg), Some(ctxs)),
             Err(status) => {
                 warn!(conn_id = conn_state.conn_id,
@@ -1385,16 +1419,17 @@ async fn handle_session_setup(
                 // Only signable (non-guest, keyed) sessions are eligible for
                 // encryption. Guest/anonymous sessions (empty session key) are
                 // never encrypted — Samba forces cipher = NONE for them.
+                let (neg_cipher, accept_transport_security) = {
+                    let rec = conn_state.negotiate_record.lock().await;
+                    let neg311 = rec.as_ref().and_then(|r| r.neg311.as_ref());
+                    (
+                        neg311.and_then(|n| n.cipher),
+                        neg311.map(|n| n.accept_transport_security).unwrap_or(false),
+                    )
+                };
                 let cipher: Option<crate::crypto::Cipher> = if signable
                     && dialect >= DialectConfig::Smb30
                 {
-                    let neg_cipher = conn_state
-                        .negotiate_record
-                        .lock()
-                        .await
-                        .as_ref()
-                        .and_then(|r| r.neg311.as_ref())
-                        .and_then(|n| n.cipher);
                     if dialect == DialectConfig::Smb311 {
                         neg_cipher.and_then(|c| match c {
                             EncryptionCipher::Aes128Gcm => Some(crate::crypto::Cipher::Aes128Gcm),
@@ -1409,10 +1444,13 @@ async fn handle_session_setup(
 
                 // MS-SMB2 3.3.5.5.3: if encryption is required and the session
                 // cannot be encrypted (no cipher — includes guest, anonymous,
-                // 2.x dialect, no common cipher), deny session establishment.
-                // This check runs OUTSIDE `signable` so guest/anon are denied.
+                // 2.x dialect, no common cipher) and Connection.AcceptTransportSecurity
+                // is false, deny session establishment.
+                // This check runs OUTSIDE `signable` so guest/anon are denied
+                // unless transport-level security was accepted (and signable).
                 if state.config.encryption == crate::config::EncryptionPolicy::Required
                     && cipher.is_none()
+                    && !(accept_transport_security && signable)
                 {
                     warn!(conn_id = conn_state.conn_id,
                         dialect = ?dialect, is_guest = identity.is_guest,
@@ -1505,8 +1543,9 @@ async fn handle_session_setup(
                             );
                         }
                     };
-                    let encrypt_data =
-                        state.config.encryption == crate::config::EncryptionPolicy::Required;
+                    let encrypt_data = state.config.encryption
+                        == crate::config::EncryptionPolicy::Required
+                        && !accept_transport_security;
                     Some(EncryptionState {
                         enc_key: enc_key_arr,
                         dec_key: dec_key_arr,
@@ -2070,8 +2109,18 @@ async fn handle_tree_connect(
     // Assign tree ID
     let tree_id = next_tree_id(conn_state);
 
-    // Store tree in connection tree table with owning session and policy
-    let tree_encrypt_data = share_config.encrypt_data;
+    // Store tree in connection tree table with owning session and policy.
+    // MS-SMB2 3.3.5.7: if Connection.AcceptTransportSecurity is true, do not
+    // require SMB-layer encryption on the tree.
+    let accept_transport_security = conn_state
+        .negotiate_record
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|r| r.neg311.as_ref())
+        .map(|n| n.accept_transport_security)
+        .unwrap_or(false);
+    let tree_encrypt_data = share_config.encrypt_data && !accept_transport_security;
     conn_state.trees.write().await.insert(
         tree_id,
         TreeEntry {
@@ -2968,7 +3017,8 @@ async fn handle_create(
                             {
                                 Ok((grant, breaks)) => {
                                     granted_oplock = rssmb_proto::oplock::OplockLevel::Lease;
-                                    resp_ctx_items.push((RQLS_NAME, build_rqls_response_data(&grant)));
+                                    resp_ctx_items
+                                        .push((RQLS_NAME, build_rqls_response_data(&grant)));
                                     pending_breaks = breaks;
                                 }
                                 Err(()) => {
@@ -5331,6 +5381,7 @@ mod tests {
         ConnState {
             conn_id: 1,
             remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            transport: TransportKind::Tcp,
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: tx,
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),

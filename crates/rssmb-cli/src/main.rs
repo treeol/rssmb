@@ -379,6 +379,22 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let quic_handle = if config.quic_enabled {
+        info!(
+            "SMB over QUIC listener starting on {}:{} (UDP)",
+            listen_addr, config.quic_port
+        );
+        let quic_state = state.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = rssmb_server::quic::listen_quic(quic_state.clone()).await {
+                error!("SMB over QUIC listener error: {}", e);
+                quic_state.shutdown().await;
+            }
+        }))
+    } else {
+        None
+    };
+
     info!("SMB listener starting on {}:{}", listen_addr, port);
     rssmb_server::connection::listen_with_state(config, move |_| smb_state)
         .await
@@ -386,6 +402,10 @@ async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             error!("SMB listener error: {}", e);
             e
         })?;
+
+    if let Some(handle) = quic_handle {
+        let _ = handle.await;
+    }
 
     info!("Server shutdown complete");
     Ok(())

@@ -127,6 +127,26 @@ pub struct ServerConfig {
     /// User accounts for authentication.
     #[serde(default)]
     pub users: Vec<UserConfig>,
+
+    /// Whether SMB over QUIC (UDP / TLS 1.3, SMB 3.1.1) is enabled.
+    /// Default: false.
+    #[serde(default)]
+    pub quic_enabled: bool,
+
+    /// UDP port for SMB over QUIC (default: 443).
+    /// Note: binding ports < 1024 on Linux requires root or `CAP_NET_BIND_SERVICE`.
+    #[serde(default = "default_quic_port")]
+    pub quic_port: u16,
+
+    /// Path to PEM-encoded TLS certificate chain for SMB over QUIC.
+    /// Required when `quic_enabled = true`.
+    #[serde(default)]
+    pub quic_cert_path: String,
+
+    /// Path to PEM-encoded TLS private key for SMB over QUIC.
+    /// Required when `quic_enabled = true`.
+    #[serde(default)]
+    pub quic_key_path: String,
 }
 
 /// User account configuration for NTLM authentication.
@@ -177,6 +197,9 @@ fn default_listen_addr() -> String {
 }
 fn default_smb_port() -> u16 {
     445
+}
+fn default_quic_port() -> u16 {
+    443
 }
 fn default_max_frame_size() -> usize {
     1_048_576
@@ -468,12 +491,29 @@ impl ServerConfig {
                 ));
             }
         }
+        // SMB over QUIC validation: requires cert/key paths and SMB 3.1.1.
+        if self.quic_enabled {
+            if self.quic_cert_path.trim().is_empty() {
+                return Err("quic_cert_path must be set when quic_enabled = true".to_string());
+            }
+            if self.quic_key_path.trim().is_empty() {
+                return Err("quic_key_path must be set when quic_enabled = true".to_string());
+            }
+            if self.max_dialect < DialectConfig::Smb311 {
+                return Err(format!(
+                    "quic_enabled = true requires max_dialect = 'smb311' (got {:?}) — \
+                     SMB over QUIC only supports SMB 3.1.1",
+                    self.max_dialect
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// Validate that share paths exist and are directories. Called by
-    /// `rssmb check-config` and server startup (not by `validate()`, which
-    /// is also used by in-memory unit tests with synthetic paths).
+    /// Validate that share paths (and QUIC TLS cert/key files when enabled)
+    /// exist and are valid. Called by `rssmb check-config` and server startup
+    /// (not by `validate()`, which is also used by in-memory unit tests with
+    /// synthetic paths).
     pub fn validate_paths(&self) -> Result<(), String> {
         for share in self.shares.values() {
             if share.path.is_empty() {
@@ -491,6 +531,9 @@ impl ServerConfig {
                     share.name, share.path
                 ));
             }
+        }
+        if self.quic_enabled {
+            crate::quic::validate_tls_files(&self.quic_cert_path, &self.quic_key_path)?;
         }
         Ok(())
     }
@@ -593,6 +636,10 @@ impl ServerConfig {
             server_name: "rssmb".to_string(),
             shutdown_grace_secs: 10,
             users: vec![],
+            quic_enabled: false,
+            quic_port: 0,
+            quic_cert_path: String::new(),
+            quic_key_path: String::new(),
         }
     }
 }
@@ -1111,5 +1158,23 @@ bogus_field = true
             result.is_err(),
             "deny_unknown_fields should reject unknown user keys"
         );
+    }
+
+    #[test]
+    fn test_validate_quic_requires_cert_and_key_and_smb311() {
+        let mut config = ServerConfig::for_testing();
+        config.quic_enabled = true;
+        // Missing cert and key
+        assert!(config.validate().is_err());
+
+        config.quic_cert_path = "/tmp/cert.pem".to_string();
+        assert!(config.validate().is_err());
+
+        config.quic_key_path = "/tmp/key.pem".to_string();
+        assert!(config.validate().is_ok());
+
+        // max_dialect < Smb311 rejected when quic_enabled = true
+        config.max_dialect = DialectConfig::Smb302;
+        assert!(config.validate().is_err());
     }
 }

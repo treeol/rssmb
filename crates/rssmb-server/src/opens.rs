@@ -235,7 +235,10 @@ impl LeaseManager {
         actor_lease: Option<LeaseId>,
         actor_open: Option<OpenId>,
         op: ConflictOp,
-    ) -> (Vec<BreakNotification>, Vec<tokio::sync::oneshot::Receiver<()>>) {
+    ) -> (
+        Vec<BreakNotification>,
+        Vec<tokio::sync::oneshot::Receiver<()>>,
+    ) {
         let mut notifications = Vec::new();
         let mut receivers = Vec::new();
 
@@ -331,16 +334,10 @@ impl LeaseManager {
                 continue;
             }
             let (need_break, new_level, ack_req) = match op {
-                ConflictOp::Read => (
-                    rec.level == 0x08 || rec.level == 0x09,
-                    0x01,
-                    true,
-                ),
-                ConflictOp::Write | ConflictOp::HandleOrDelete | ConflictOp::Lock => (
-                    rec.level != 0,
-                    0x00,
-                    rec.level == 0x08 || rec.level == 0x09,
-                ),
+                ConflictOp::Read => (rec.level == 0x08 || rec.level == 0x09, 0x01, true),
+                ConflictOp::Write | ConflictOp::HandleOrDelete | ConflictOp::Lock => {
+                    (rec.level != 0, 0x00, rec.level == 0x08 || rec.level == 0x09)
+                }
             };
             if !need_break {
                 continue;
@@ -1232,7 +1229,10 @@ impl OpenTable {
         file_id: FileId,
         actor_open_id: Option<OpenId>,
         op: ConflictOp,
-    ) -> (Vec<BreakNotification>, Vec<tokio::sync::oneshot::Receiver<()>>) {
+    ) -> (
+        Vec<BreakNotification>,
+        Vec<tokio::sync::oneshot::Receiver<()>>,
+    ) {
         let mut mgr = self.leases.write().await;
         let actor_lease = actor_open_id.and_then(|oid| {
             mgr.leases

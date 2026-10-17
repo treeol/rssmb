@@ -1,15 +1,20 @@
-//! TCP connection engine.
+//! Connection engine for Direct TCP and SMB over QUIC.
 //!
 //! The connection engine owns the accept loop and the per-connection read/write
 //! task pair:
 //!
-//! - [`listen`] binds a [`tokio::net::TcpListener`] and spawns a task per
-//!   accepted connection, assigning monotonically increasing connection IDs.
-//! - [`Connection::handle`] is the per-connection entry point. It splits the
-//!   stream into read/write halves, spawns a **write task** that drains the
-//!   mpsc write channel onto the socket, and runs a **read loop** that frames
+//! - [`listen`] / [`listen_with_state`] bind a [`tokio::net::TcpListener`] and
+//!   spawn a task per accepted TCP connection, assigning monotonically
+//!   increasing connection IDs.
+//! - [`crate::quic::listen_quic`] / [`crate::quic::listen_quic_on`] do the
+//!   same for SMB over QUIC (UDP / TLS 1.3, ALPN `smb`).
+//! - [`Connection::handle_stream`] is the generic per-connection entry point
+//!   used by both transports. It spawns a **write task** that drains the mpsc
+//!   write channel onto the stream, and runs a **read loop** that frames
 //!   NetBIOS-delimited SMB messages, dispatches them to
 //!   [`crate::dispatch::handle_message`], and enqueues the encoded response.
+//! - [`Connection::handle`] is a thin TCP-only wrapper that calls
+//!   `handle_stream` with `TcpStream::into_split()` halves.
 //! - Graceful shutdown is driven by [`crate::ServerState::shutdown`] (a
 //!   `tokio::sync::Notify`); the read loop `select!`s against it so a shutdown
 //!   request aborts the connection promptly.
@@ -32,7 +37,7 @@ use rssmb_wire_adapter::framing::parse_payload;
 use rssmb_wire_adapter::{encode_response, FramedMessage, FramedResponse, NtStatus};
 
 use crate::config::ServerConfig;
-use crate::dispatch::{handle_message, ConnState};
+use crate::dispatch::{handle_message, ConnState, TransportKind};
 use crate::signing;
 use crate::ServerState;
 
@@ -121,9 +126,21 @@ impl Drop for ConnectionGuard {
 /// big-endian length). This helper reads the header then the body into a
 /// `Vec<u8>` and returns the payload bytes, returning `Err` on EOF or I/O
 /// error.
+#[cfg(test)]
 async fn read_netbios_payload<R>(
     stream: &mut R,
     max_frame_size: usize,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    read_netbios_payload_for_transport(stream, max_frame_size, TransportKind::Tcp).await
+}
+
+async fn read_netbios_payload_for_transport<R>(
+    stream: &mut R,
+    max_frame_size: usize,
+    transport: TransportKind,
 ) -> std::io::Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -156,6 +173,16 @@ where
 
         let msg_type = hdr[0];
         let len = ((hdr[1] as usize) << 16) | ((hdr[2] as usize) << 8) | (hdr[3] as usize);
+
+        // Over QUIC, only the Direct TCP 0x00 stream framing header is valid
+        // (MS-SMB2 2.1); legacy NetBIOS session request (0x81) and keep-alive
+        // (0x85) are not permitted.
+        if transport == TransportKind::Quic && msg_type != 0x00 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid framing header byte 0x{msg_type:02X} on QUIC transport"),
+            ));
+        }
 
         // NetBIOS session request (0x81): read and discard the body, then loop.
         if msg_type == 0x81 {
@@ -226,7 +253,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Per-connection entry point.
+    /// Per-connection entry point for a TCP stream.
     ///
     /// Splits the stream, spawns the write task, and runs the read loop until
     /// the peer disconnects, an I/O error occurs, or the server is shut down.
@@ -237,11 +264,40 @@ impl Connection {
             Ok(addr) => addr,
             Err(e) => {
                 warn!(conn_id, error = %e, "could not determine peer address; closing");
+                state
+                    .metrics
+                    .connections_active
+                    .fetch_sub(1, Ordering::Relaxed);
                 return;
             }
         };
 
-        info!(conn_id, %remote_addr, "connection accepted");
+        let (read_half, write_half) = stream.into_split();
+        Self::handle_stream(
+            state,
+            read_half,
+            write_half,
+            remote_addr,
+            conn_id,
+            TransportKind::Tcp,
+        )
+        .await;
+    }
+
+    /// Generic per-connection entry point over any split async read/write stream
+    /// (used by both Direct TCP and SMB over QUIC).
+    pub async fn handle_stream<R, W>(
+        state: Arc<ServerState>,
+        mut read_half: R,
+        mut write_half: W,
+        remote_addr: std::net::SocketAddr,
+        conn_id: u64,
+        transport: TransportKind,
+    ) where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        info!(conn_id, %remote_addr, ?transport, "connection accepted");
 
         let max_frame_size = state.config.max_frame_size;
         let max_credits = state.config.max_credits;
@@ -250,10 +306,7 @@ impl Connection {
 
         let credits = Arc::new(CreditManager::new(max_credits));
 
-        // Split the stream into read and write halves.
-        let (mut read_half, mut write_half) = stream.into_split();
-
-        // Spawn the write task: drain the channel and write to the socket.
+        // Spawn the write task: drain the channel and write to the stream.
         let write_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             while let Some(frame) = write_rx.recv().await {
@@ -262,8 +315,9 @@ impl Connection {
                     break;
                 }
             }
-            // Best-effort flush on exit.
+            // Best-effort flush and shutdown on exit (sends FIN on QUIC SendStream / TCP).
             let _ = write_half.flush().await;
+            let _ = write_half.shutdown().await;
         });
 
         // Build the per-connection dispatch state. The session is attached
@@ -271,6 +325,7 @@ impl Connection {
         let conn_state = ConnState {
             conn_id,
             remote_addr: remote_addr.ip(),
+            transport,
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: write_tx.clone(),
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),
@@ -347,12 +402,15 @@ impl Connection {
     ///
     /// Selects against the server shutdown signal so a shutdown request
     /// aborts the loop promptly.
-    async fn read_loop(
-        read_half: &mut tokio::net::tcp::OwnedReadHalf,
+    async fn read_loop<R>(
+        read_half: &mut R,
         state: &Arc<ServerState>,
         conn_state: &ConnState,
         max_frame_size: usize,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
         let idle_timeout = std::time::Duration::from_secs(state.config.idle_timeout_secs);
         loop {
             let payload = tokio::select! {
@@ -363,7 +421,10 @@ impl Connection {
                     return Ok(());
                 }
 
-                res = tokio::time::timeout(idle_timeout, read_netbios_payload(read_half, max_frame_size)) => {
+                res = tokio::time::timeout(
+                    idle_timeout,
+                    read_netbios_payload_for_transport(read_half, max_frame_size, conn_state.transport),
+                ) => {
                     match res {
                         Ok(Ok(None)) => {
                             debug!(conn_id = conn_state.conn_id, "peer closed connection");
@@ -1228,7 +1289,6 @@ pub async fn listen_on(
     let addr = listener.local_addr()?;
     info!(addr = %addr, "SMB listener bound (pre-bound)");
 
-    let next_conn_id = Arc::new(AtomicU64::new(1));
     let mut connections = tokio::task::JoinSet::<()>::new();
 
     loop {
@@ -1249,7 +1309,7 @@ pub async fn listen_on(
             },
         };
 
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
         // Enforce connection limits (global + per-IP).
         let ip = remote_addr.ip();
@@ -1307,7 +1367,7 @@ pub async fn listen_on(
 /// all VFS handles for that connection. After the grace period expires,
 /// remaining tasks are aborted (their cleanup may not run, but the OS
 /// closes the sockets).
-async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace_secs: u64) {
+pub(crate) async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, grace_secs: u64) {
     let grace = std::time::Duration::from_secs(grace_secs);
     let deadline = tokio::time::Instant::now() + grace;
 
@@ -1357,8 +1417,6 @@ where
 
     let state = state_fn(config);
 
-    // Connection ID counter — starts at 1.
-    let next_conn_id = Arc::new(AtomicU64::new(1));
     let mut connections = tokio::task::JoinSet::<()>::new();
 
     loop {
@@ -1380,7 +1438,7 @@ where
             },
         };
 
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
         // Enforce connection limits (global + per-IP).
         let ip = remote_addr.ip();
@@ -1564,6 +1622,7 @@ mod tests {
         let conn_state = ConnState {
             conn_id: 77,
             remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            transport: TransportKind::Tcp,
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             write_tx: tx,
             auth_state: Arc::new(tokio::sync::Mutex::new(None)),

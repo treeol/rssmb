@@ -8,6 +8,7 @@ use rand::RngCore;
 use rssmb_proto::negotiate::{
     EncryptionCapabilities, EncryptionCipher, HashAlgorithm, NegotiateContext,
     NegotiateContextType, NegotiateRequest, PreauthIntegrityCapabilities, SigningAlgorithmId,
+    TransportCapabilities,
 };
 use rssmb_wire_adapter::error::NtStatus;
 
@@ -25,6 +26,10 @@ pub struct Negotiated311 {
     pub cipher: Option<EncryptionCipher>,
     /// Signing algorithm (always AES-CMAC for 7c/7d; GMAC deferred).
     pub signing_alg: SigningAlgorithmId,
+    /// Connection.AcceptTransportSecurity (MS-SMB2 3.3.5.4): true when
+    /// client offered `SMB2_ACCEPT_TRANSPORT_LEVEL_SECURITY` on a transport
+    /// that provides transport-layer security (QUIC / TLS 1.3).
+    pub accept_transport_security: bool,
 }
 
 /// The server-side cipher we implement, matched against the client's offer.
@@ -42,6 +47,20 @@ pub fn process_request_contexts(
     req: &NegotiateRequest,
     encryption_policy: EncryptionPolicy,
 ) -> Result<(Negotiated311, Vec<NegotiateContext>), NtStatus> {
+    process_request_contexts_for_transport(req, encryption_policy, false)
+}
+
+/// Process the client's negotiate contexts for SMB 3.1.1 with transport awareness.
+///
+/// When `is_quic` is true and the client includes a `TransportCapabilities`
+/// context with `SMB2_ACCEPT_TRANSPORT_LEVEL_SECURITY`, the server sets
+/// `accept_transport_security = true` and echoes the `TransportCapabilities`
+/// context in the response (MS-SMB2 §2.2.3.1.5, §3.3.5.4).
+pub fn process_request_contexts_for_transport(
+    req: &NegotiateRequest,
+    encryption_policy: EncryptionPolicy,
+    is_quic: bool,
+) -> Result<(Negotiated311, Vec<NegotiateContext>), NtStatus> {
     let contexts = req.negotiate_context_list.as_ref();
 
     // Count context types for duplicate detection.
@@ -49,6 +68,7 @@ pub fn process_request_contexts(
     let mut encryption_count = 0;
     let mut signing_count = 0;
     let mut compression_count = 0;
+    let mut has_transport_ctx = false;
 
     if let Some(ctxs) = contexts {
         for ctx in ctxs {
@@ -57,7 +77,8 @@ pub fn process_request_contexts(
                 NegotiateContextType::EncryptionCapabilities => encryption_count += 1,
                 NegotiateContextType::SigningCapabilities => signing_count += 1,
                 NegotiateContextType::CompressionCapabilities => compression_count += 1,
-                // Unknown, Netname, Transport, RdmaTransform: ignore.
+                NegotiateContextType::TransportCapabilities => has_transport_ctx = true,
+                // Netname, RdmaTransform, Unknown: ignore for duplicate-counting.
                 _ => {}
             }
         }
@@ -148,6 +169,15 @@ pub fn process_request_contexts(
     }
     // Not supported. Don't send a compression context.
 
+    // --- TRANSPORT_CAPABILITIES (optional, at most one; MS-SMB2 2.2.3.1.5 / 3.3.5.4) ---
+    let accept_transport_security = if is_quic && has_transport_ctx {
+        req.get_ctx_transport_capabilities()
+            .map(|tc| tc.accept_transport_layer_security())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     // --- Generate server salt (32 random bytes) ---
     let mut salt = vec![0u8; 32];
     OsRng.fill_bytes(&mut salt);
@@ -157,11 +187,13 @@ pub fn process_request_contexts(
         salt,
         cipher: selected_cipher,
         signing_alg,
+        accept_transport_security,
     };
 
     // --- Build response contexts ---
     // Send: PREAUTH_INTEGRITY_CAPABILITIES (with our salt).
     // Send: ENCRYPTION_CAPABILITIES if we selected a cipher.
+    // Send: TRANSPORT_CAPABILITIES if accept_transport_security is negotiated.
     // Don't send: SIGNING, COMPRESSION.
     let mut response_contexts = vec![PreauthIntegrityCapabilities {
         hash_algorithms: vec![preauth_hash_alg],
@@ -175,6 +207,14 @@ pub fn process_request_contexts(
                 ciphers: vec![cipher],
             }
             .into(),
+        );
+    }
+
+    if accept_transport_security {
+        response_contexts.push(
+            TransportCapabilities::new()
+                .with_accept_transport_layer_security(true)
+                .into(),
         );
     }
 
