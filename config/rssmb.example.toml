@@ -31,6 +31,31 @@ health_port = 8080
 # After this, remaining connections are aborted. Default: 10.
 # shutdown_grace_secs = 10
 
+# ── Leases & multichannel (SMB 2.1+/3.x) ────────────────────────────────
+# File leases and traditional oplocks (client-side caching coordination).
+# Default: true.
+# leases = true
+
+# SMB 3.x multichannel. Advertised only when the server has usable
+# (non-loopback) network interfaces. Default: true.
+# multichannel = true
+
+# Pin the addresses advertised to multichannel clients. Use this in NAT or
+# Kubernetes environments where the container's enumerated addresses are
+# not reachable by clients, e.g.:
+# multichannel_interfaces = ["10.0.0.5", "192.168.7.2"]
+# Empty (default) = enumerate the host's interfaces automatically.
+
+# ── SMB over QUIC (SMB 3.1.1 over TLS 1.3, UDP) ─────────────────────────
+# Serves the same SMB 3.1.1 protocol over QUIC (ALPN "smb"), useful when
+# TCP/445 is blocked. Requires a TLS certificate chain and private key in
+# PEM format. Windows 11 / Server 2022+ clients connect over UDP/443.
+# Default: disabled.
+# quic_enabled = false
+# quic_port = 443
+# quic_cert_path = "/etc/rssmb/tls/cert.pem"
+# quic_key_path = "/etc/rssmb/tls/key.pem"
+
 # ── Shares ──────────────────────────────────────────────────────────────
 # Add your shares here. Each share needs a path, and at minimum
 # read_only and guest_ok settings.

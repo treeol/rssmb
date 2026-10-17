@@ -64,6 +64,11 @@ minimal overhead and maximal security**.
 - `KEY_EXCH` session key derivation (ExportedSessionKey)
 - Large MTU (1 MiB) with multi-credit flow control
 - Durable handles v2 (DH2Q / DH2C) with reconnection
+- File leases v1/v2 (R, RH, RW) and traditional oplocks with break handling
+- Multichannel (SMB 3.x): session binding across connections and
+  `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
+- SMB over QUIC (SMB 3.1.1 over TLS 1.3, ALPN `smb`, UDP/443) — traverse
+  firewalls that block TCP/445
 - `CHANGE_NOTIFY` — inotify-backed directory change notifications
 - Mandatory byte-range locks (all-or-nothing batch)
 - Case-insensitive path lookup (NFC-aware, multi-component)
@@ -191,6 +196,12 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `max_credits` | `1024` | Maximum outstanding credits |
 | `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
+| `leases` | `true` | SMB 2.1+ file leases and traditional oplocks |
+| `multichannel` | `true` | SMB 3.x multichannel (advertised only when usable interfaces exist) |
+| `multichannel_interfaces` | `[]` | Pin advertised addresses for NAT/Kubernetes (empty = enumerate host NICs) |
+| `quic_enabled` | `false` | SMB over QUIC (SMB 3.1.1 over TLS 1.3, UDP) |
+| `quic_port` | `443` | UDP port for SMB over QUIC |
+| `quic_cert_path` / `quic_key_path` | — | PEM TLS certificate chain / private key (required when `quic_enabled`) |
 
 ### Per-share settings (`[shares.<name>]`)
 
@@ -289,11 +300,15 @@ be reused in other SMB tools.
 - ✅ File leases v1/v2 (R, RH, RW) and traditional oplocks (Level II, Exclusive, Batch)
 - ✅ SMB over QUIC transport (TLS 1.3, ALPN `smb`, UDP/443)
 - ✅ Multichannel (SMB 3.x session binding, shared state across channels)
+- ✅ `FSCTL_QUERY_NETWORK_INTERFACE_INFO` — NIC enumeration for multichannel
+  interface discovery, with `multichannel_interfaces` override for NAT/Kubernetes
 
 **Not yet implemented:**
 - Kerberos authentication
 - Persistent handles (TLER resilient)
-- `FSCTL_QUERY_NETWORK_INTERFACE_INFO` NIC enumeration (multichannel capability advertised; interface discovery returns `NotSupported` until real NIC enumeration is added)
+- Multichannel binding hardening (per-channel signing key derivation for
+  SMB 3.1.1; binding works but is not yet hardened against a malicious
+  second channel)
 
 ## License
 

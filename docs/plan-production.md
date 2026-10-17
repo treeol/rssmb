@@ -333,17 +333,11 @@ target use case (Windows + Linux):
 | mDNS / AFP streams / Finder | n/a | n/a | **out of scope** (macOS) |
 | SMB 3.1.1 POSIX extensions | n/a | `mount -o posix` for real Unix modes/symlinks | optional, later |
 
-### 3.1 Leases (and oplocks)
-Correctness is fine with "no oplocks" (current state), but performance on
-Windows/macOS is poor and some apps behave oddly.
-- Start with **leases v2** (RqLs/RqL2 create contexts). They're keyed by
-  client lease key, which maps better than oplocks.
-- State per file in the shared entry (2.1). Break on conflicting open,
-  write, rename, delete. Send LEASE_BREAK notifications via
-  `send_unsolicited`, wait for the ack with a timeout (35 s default), then
-  downgrade.
-- Grant R and RH first (read caching). Add W only after break handling is
-  proven with smbtorture `smb2.lease`.
+### 3.1 Leases (and oplocks) — **DONE** (commit `d76142a`)
+Implemented: file leases v1/v2 (RqLs/RqL2 create contexts) with R/RH/RW
+states, keyed by client lease key in the shared open table; break
+notifications via `send_unsolicited` with ack timeout and staged downgrade;
+traditional oplocks (Level II, Exclusive, Batch) for non-lease clients.
 
 ### 3.2 CHANGE_NOTIFY
 Currently a stub that never completes (`dispatch.rs:2742-2770`).
@@ -398,8 +392,10 @@ buffers.
 - `FSCTL_SRV_COPYCHUNK` / `_WRITE` + `FSCTL_SRV_REQUEST_RESUME_KEY`:
   server-side copy. Windows and macOS use it for copies within a share
   (big UX win). Use `copy_file_range`.
-- `FSCTL_QUERY_NETWORK_INTERFACE_INFO`: return `NOT_SUPPORTED` cleanly, or
-  a real list (only matters for multichannel, which is out of scope).
+- `FSCTL_QUERY_NETWORK_INTERFACE_INFO` — **DONE** (commit `11b33fd`): NIC
+  enumeration via `getifaddrs` (background refresher, fail-closed snapshot)
+  feeding the multichannel interface-discovery response; multichannel is
+  implemented (session binding across connections).
 - RPC: `wkssvc` (NetrWkstaGetInfo) and `lsarpc` (LsarOpenPolicy2 /
   LsarLookupSids2 / name lookup) for `net view`, Finder and the Explorer
   security tab name resolution (pairs with 3.4).
@@ -577,6 +573,8 @@ release-1.0 scope is:**
 6. Phase 5 (all) and Phase 6.1–6.4, plus the Windows 11 + cifs.ko client
    matrix (3.9) passing.
 
-Leases (3.1), copychunk (3.8), AES-256/CCM (3.7), wkssvc/lsarpc and POSIX
-extensions are post-1.0. macOS, Kerberos/AD and multichannel are out of
-scope.
+Copychunk (3.8 remaining), AES-256/CCM (3.7), wkssvc/lsarpc and POSIX
+extensions are post-1.0. macOS and Kerberos/AD remain out of scope.
+Leases (3.1), SMB over QUIC, and multichannel (session binding +
+interface discovery) are **implemented** post-1.0; multichannel binding
+hardening (per-channel signing keys) and persistent handles are pending.

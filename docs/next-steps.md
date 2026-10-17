@@ -1,12 +1,14 @@
 # RSSMB — Next Steps (implementation guide)
 
-Status snapshot: 2026-10-13 (`bd8aca8`). Steps 1–10 are done: SMB 2.1–3.1.1
+Status snapshot: 2026-10-17 (`11b33fd`). Steps 1–10 are done: SMB 2.1–3.1.1
 with signing, AES-128-GCM encryption, NTLMv2 auth, SrvSvc share enumeration,
-and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 339 unit
-tests pass (including 14 TCP integration tests). GNOME Files, `smbclient`,
-and Linux kernel CIFS mounts all work. Steps 9–10 (hygiene, decoupling,
-conformance, testing, fuzzing) complete. Next: Phase 5+ (oplock/lease,
-multichannel, persistent handles).
+and a standalone `rssmb-proto` protocol crate (no smb-rs dependency). 550+
+unit tests pass (including 14 TCP integration tests). GNOME Files, `smbclient`,
+and Linux kernel CIFS mounts all work. Post-1.0 features implemented: file
+leases v1/v2 + traditional oplocks, SMB over QUIC (TLS 1.3, ALPN "smb"), and
+SMB 3.x multichannel (session binding + `FSCTL_QUERY_NETWORK_INTERFACE_INFO`
+NIC enumeration). Remaining: Kerberos, persistent handles, multichannel
+binding hardening (per-channel signing keys).
 
 Reference specs: MS-SMB2 (protocol), MS-FSCC (file/FS info structures),
 MS-SRVS + MS-RPCE (share enumeration), MS-NLMP (NTLM), MS-ERREF (NTSTATUS).
@@ -31,10 +33,12 @@ container and exercises ls/read/write/append/overwrite/mkdir/rename/delete.
 | QUERY_INFO incl. FileAllInformation | working |
 | QUERY_DIRECTORY (cursor, buffer limit, restart) | working |
 | SET_INFO: basic, EOF, rename, disposition (delete-on-close) | working |
-| IOCTL: VALIDATE_NEGOTIATE_INFO, DFS referral, PIPE_TRANSCEIVE | working |
+| IOCTL: VALIDATE_NEGOTIATE_INFO, DFS referral, PIPE_TRANSCEIVE, QUERY_NETWORK_INTERFACE_INFO | working |
 | Compound requests (NextCommand chains) | working |
 | SMB 3.x / encryption | working (3.0/3.0.2/3.1.1; AES-128-GCM; encryption policy enforced) |
-| Oplocks / leases | none granted (requested levels parsed) |
+| Oplocks / leases | **implemented** — file leases v1/v2 (R/RH/RW), traditional oplocks, break notifications |
+| SMB over QUIC (TLS 1.3, ALPN "smb", UDP/443) | implemented |
+| Multichannel (session binding, interface discovery) | implemented; binding hardening pending |
 | SrvSvc share enumeration (NetrShareEnum/GetInfo/ServerGetInfo) | working (impacket) |
 
 **Foundation fixes (post-review):** a request the client had no credits
