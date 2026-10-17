@@ -899,6 +899,7 @@ async fn handle_plain(
         Command::ChangeNotify => Some(handle_change_notify(state, conn_state, req).await),
         Command::Ioctl => Some(handle_ioctl(state, conn_state, req).await),
         Command::Lock => Some(handle_lock(state, conn_state, req).await),
+        Command::OplockBreak => Some(handle_oplock_break(state, conn_state, req).await),
         Command::ServerToClientNotification => None,
         other => {
             debug!(conn_id = conn_state.conn_id, command = %other, "unsupported command");
@@ -956,11 +957,12 @@ async fn handle_negotiate(
 
     let server_guid = Guid::from(state.server_guid);
 
-    // Server capabilities: large_mtu only for 3.0+ (MS-SMB2 3.3.5.4:
-    // capabilities MUST be 0 for 2.0.2). Encryption is not advertised
-    // until Step 7d (encrypt/decrypt is not implemented).
+    // Server capabilities: large_mtu and leasing for 2.1+ (MS-SMB2 3.3.5.4:
+    // capabilities MUST be 0 for 2.0.2).
     let server_capabilities = if selected > DialectConfig::Smb2002 {
-        GlobalCapabilities::new().with_large_mtu(true)
+        GlobalCapabilities::new()
+            .with_large_mtu(true)
+            .with_leasing(state.config.leases)
     } else {
         GlobalCapabilities::new()
     };
@@ -1759,6 +1761,10 @@ async fn handle_logoff(
                 should_delete_on_close =
                     remove_result.was_last && remove_result.any_delete_on_close;
             }
+            state
+                .open_table
+                .remove_open_from_leases(entry.open_id)
+                .await;
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
             }
@@ -2151,6 +2157,10 @@ async fn handle_tree_disconnect(
                 should_delete_on_close =
                     remove_result.was_last && remove_result.any_delete_on_close;
             }
+            state
+                .open_table
+                .remove_open_from_leases(entry.open_id)
+                .await;
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
             }
@@ -2206,12 +2216,14 @@ async fn handle_tree_disconnect(
     FramedResponse::Plain(response)
 }
 
-// ── Durable handle create contexts (MS-SMB2 2.2.13.2.11/2.2.13.2.12) ─────
+// ── Durable handle & Lease create contexts (MS-SMB2 2.2.13.2.8–2.2.13.2.12) ──
 
 /// DH2Q create context name (durable handle v2 request).
 const DH2Q_NAME: &[u8; 4] = b"DH2Q";
 /// DH2C create context name (durable handle v2 reconnect).
 const DH2C_NAME: &[u8; 4] = b"DH2C";
+/// RqLs create context name (lease v1 / v2 request & response).
+const RQLS_NAME: &[u8; 4] = b"RqLs";
 
 /// Parsed DH2Q create context data (32 bytes).
 #[derive(Debug)]
@@ -2237,46 +2249,98 @@ struct Dh2cContext {
     _flags: u32,
 }
 
+/// Parsed RqLs create context data (32 bytes for v1, 52 bytes for v2).
+#[derive(Debug, Clone)]
+struct RqLsContext {
+    lease_key: [u8; 16],
+    lease_state: opens::LeaseCaching,
+    #[allow(dead_code)]
+    lease_flags: u32,
+    parent_lease_key: Option<[u8; 16]>,
+    epoch: u16,
+    is_v2: bool,
+}
+
+#[derive(Debug, Default)]
+struct ParsedCreateContexts {
+    dh2q: Option<Dh2qContext>,
+    dh2c: Option<Dh2cContext>,
+    rqls: Option<RqLsContext>,
+}
+
+/// Serialize a list of `(name, data)` create contexts into an 8-byte aligned
+/// SMB2_CREATE_CONTEXT chain (MS-SMB2 2.2.13.2).
+fn encode_create_contexts(contexts: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (idx, (name, data)) in contexts.iter().enumerate() {
+        let is_last = idx + 1 == contexts.len();
+        let ctx_start = out.len();
+        let name_offset: u16 = 16;
+        let name_len = name.len() as u16;
+        // Pad after name so DataOffset is 8-byte aligned relative to ctx_start.
+        let after_name = 16 + name.len();
+        let data_offset = (after_name + 7) & !7;
+        let data_len = data.len() as u32;
+        let raw_ctx_len = data_offset + data.len();
+        let aligned_ctx_len = if is_last {
+            raw_ctx_len
+        } else {
+            (raw_ctx_len + 7) & !7
+        };
+        let next_offset: u32 = if is_last { 0 } else { aligned_ctx_len as u32 };
+
+        out.extend_from_slice(&next_offset.to_le_bytes());
+        out.extend_from_slice(&name_offset.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+        out.extend_from_slice(&(data_offset as u16).to_le_bytes());
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.extend_from_slice(name);
+        out.resize(ctx_start + data_offset, 0);
+        out.extend_from_slice(data);
+        out.resize(ctx_start + aligned_ctx_len, 0);
+    }
+    out
+}
+
+/// Build the 32-byte (v1) or 52-byte (v2) `RqLs` response context payload.
+fn build_rqls_response_data(grant: &opens::LeaseGrant) -> Vec<u8> {
+    let mut data = Vec::with_capacity(if grant.is_v2 { 52 } else { 32 });
+    data.extend_from_slice(&grant.lease_key);
+    data.extend_from_slice(&grant.state.to_bits().to_le_bytes());
+    data.extend_from_slice(&grant.flags.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // LeaseDuration = 0
+    if grant.is_v2 {
+        let parent = grant.parent_lease_key.unwrap_or([0u8; 16]);
+        data.extend_from_slice(&parent);
+        data.extend_from_slice(&grant.epoch.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    }
+    data
+}
+
 /// Parse create contexts from the raw frame after the CreateRequest body.
-///
-/// Returns `Ok((dh2q, dh2c))` where each is `Option` — `Some` if the
-/// respective context was found, `None` if not. A malformed context is
-/// logged and skipped (the open proceeds without durable).
-///
-/// The create context chain follows the name in the CreateRequest. Each
-/// context starts with:
-/// - NextOffset (u32 LE): offset from this context's start to the next,
-///   or 0 if this is the last context.
-/// - NameOffset (u16 LE): offset from this context's start to the name.
-/// - NameLength (u16 LE): length of the name.
-/// - Reserved (u16 LE).
-/// - DataOffset (u16 LE): offset from this context's start to the data.
-/// - DataLength (u32 LE): length of the data.
-///
-/// The `contexts_offset` is the byte offset in `raw_frame` where the
-/// context chain begins (the CreateRequest's CreateContextsOffset field).
 fn parse_create_contexts(
     raw_frame: &[u8],
     contexts_offset: u32,
     contexts_length: u32,
-) -> (Option<Dh2qContext>, Option<Dh2cContext>) {
-    let mut dh2q = None;
-    let mut dh2c = None;
+) -> ParsedCreateContexts {
+    let mut parsed = ParsedCreateContexts::default();
 
     let start = match usize::try_from(contexts_offset) {
         Ok(s) => s,
-        Err(_) => return (None, None),
+        Err(_) => return parsed,
     };
     let end = match contexts_offset.checked_add(contexts_length) {
         Some(e) => match usize::try_from(e) {
             Ok(u) => u,
-            Err(_) => return (None, None),
+            Err(_) => return parsed,
         },
-        None => return (None, None),
+        None => return parsed,
     };
 
     if start >= raw_frame.len() || end > raw_frame.len() || start > end {
-        return (None, None);
+        return parsed;
     }
 
     let chain = &raw_frame[start..end];
@@ -2298,25 +2362,36 @@ fn parse_create_contexts(
         let data_length =
             u32::from_le_bytes(chain[pos + 12..pos + 16].try_into().unwrap_or([0; 4])) as usize;
 
-        // Name and data offsets are relative to the start of THIS context
-        // (i.e. relative to `pos` in the chain), not the start of the chain.
         let ctx_start = pos;
+        let ctx_bound = if next_offset > 0 {
+            ctx_start.saturating_add(next_offset).min(chain.len())
+        } else {
+            chain.len()
+        };
 
         // Read the name.
         if name_offset >= 16
-            && ctx_start + name_offset + name_length <= chain.len()
+            && ctx_start
+                .checked_add(name_offset)
+                .and_then(|v| v.checked_add(name_length))
+                .is_some_and(|end_off| end_off <= ctx_bound)
             && name_length == 4
         {
             let name = &chain[ctx_start + name_offset..ctx_start + name_offset + 4];
             // Read the data.
-            if data_offset >= 16 && ctx_start + data_offset + data_length <= chain.len() {
+            if data_offset >= 16
+                && ctx_start
+                    .checked_add(data_offset)
+                    .and_then(|v| v.checked_add(data_length))
+                    .is_some_and(|end_off| end_off <= ctx_bound)
+            {
                 let data = &chain[ctx_start + data_offset..ctx_start + data_offset + data_length];
                 if name == DH2Q_NAME && data_length >= 32 {
                     let timeout = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                     let mut create_guid = [0u8; 16];
                     create_guid.copy_from_slice(&data[16..32]);
-                    dh2q = Some(Dh2qContext {
+                    parsed.dh2q = Some(Dh2qContext {
                         timeout,
                         _flags: flags,
                         create_guid,
@@ -2327,13 +2402,40 @@ fn parse_create_contexts(
                     let mut create_guid = [0u8; 16];
                     create_guid.copy_from_slice(&data[16..32]);
                     let flags = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
-                    dh2c = Some(Dh2cContext {
+                    parsed.dh2c = Some(Dh2cContext {
                         file_id: rssmb_proto::create::FileId {
                             persistent,
                             volatile,
                         },
                         create_guid,
                         _flags: flags,
+                    });
+                } else if name == RQLS_NAME && (data_length == 32 || data_length == 52) {
+                    let mut lease_key = [0u8; 16];
+                    lease_key.copy_from_slice(&data[0..16]);
+                    let state_bits = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                    let lease_flags = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+                    let is_v2 = data_length == 52;
+                    let (parent_lease_key, epoch) = if is_v2 {
+                        let parent = if lease_flags & 0x0000_0004 != 0 {
+                            let mut pk = [0u8; 16];
+                            pk.copy_from_slice(&data[32..48]);
+                            Some(pk)
+                        } else {
+                            None
+                        };
+                        let ep = u16::from_le_bytes([data[48], data[49]]);
+                        (parent, ep)
+                    } else {
+                        (None, 0)
+                    };
+                    parsed.rqls = Some(RqLsContext {
+                        lease_key,
+                        lease_state: opens::LeaseCaching::from_bits(state_bits),
+                        lease_flags,
+                        parent_lease_key,
+                        epoch,
+                        is_v2,
                     });
                 }
             }
@@ -2342,13 +2444,17 @@ fn parse_create_contexts(
         if next_offset == 0 {
             break;
         }
-        pos += next_offset;
-        if pos >= chain.len() {
+        // NextOffset must be 8-byte aligned and non-zero.
+        if next_offset % 8 != 0 {
             break;
         }
+        pos = match pos.checked_add(next_offset) {
+            Some(p) if p < chain.len() => p,
+            _ => break,
+        };
     }
 
-    (dh2q, dh2c)
+    parsed
 }
 
 /// CREATE — open or create a file.
@@ -2387,11 +2493,11 @@ async fn handle_create(
     }
     let vfs = tree_entry.vfs.clone();
 
-    // Parse create contexts for durable handle support (DH2Q/DH2C).
+    // Parse create contexts for durable handle (DH2Q/DH2C) and lease (RqLs) support.
     // The CreateContextsOffset (u32 at body+48) and CreateContextsLength
     // (u32 at body+52) are relative to the start of the SMB2 header.
     // The SMB2 header is 64 bytes, so body starts at offset 64.
-    let (dh2q, dh2c) = {
+    let ParsedCreateContexts { dh2q, dh2c, rqls } = {
         let ctx_offset = if raw_frame.len() >= 64 + 52 + 4 {
             u32::from_le_bytes(raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]))
         } else {
@@ -2405,7 +2511,7 @@ async fn handle_create(
         if ctx_offset > 0 && ctx_length > 0 {
             parse_create_contexts(raw_frame, ctx_offset, ctx_length)
         } else {
-            (None, None)
+            ParsedCreateContexts::default()
         }
     };
 
@@ -2567,6 +2673,7 @@ async fn handle_create(
             endof_file: info.size,
             file_attributes: crate::fsinfo::file_attributes_to_fscc(&info.attributes),
             file_id,
+            create_contexts: Vec::new(),
         };
         let response = build_response(&req.header, ResponseContent::Create(create_response));
         debug!(
@@ -2616,6 +2723,7 @@ async fn handle_create(
             endof_file: 0,
             file_attributes: rssmb_proto::fscc::FileAttributes::new().with_normal(true),
             file_id,
+            create_contexts: Vec::new(),
         };
         let response = build_response(&req.header, ResponseContent::Create(create_response));
         return FramedResponse::Plain(response);
@@ -2816,8 +2924,121 @@ async fn handle_create(
                     file_name: file_path.clone(),
                 });
 
+            // Grant file lease (RqLs v1/v2) or traditional oplock on non-directory opens.
+            let mut granted_oplock = rssmb_proto::oplock::OplockLevel::None;
+            let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
+            let mut pending_breaks: Vec<opens::BreakNotification> = Vec::new();
+
+            if state.config.leases && !info.attributes.directory {
+                if let Some(fid) = vfs_file_id {
+                    let (dialect, client_guid) = {
+                        let rec = conn_state.negotiate_record.lock().await;
+                        match &*rec {
+                            Some(r) => {
+                                let mut cg = [0u8; 16];
+                                cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                                cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                                cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                                cg[8..16].copy_from_slice(&r.client_guid.3);
+                                (r.dialect, cg)
+                            }
+                            None => (DialectConfig::Smb21, [0u8; 16]),
+                        }
+                    };
+
+                    if create_req.requested_oplock_level == rssmb_proto::oplock::OplockLevel::Lease
+                        && dialect >= DialectConfig::Smb21
+                    {
+                        if let Some(rqls) = &rqls {
+                            let is_v2 = rqls.is_v2 && dialect >= DialectConfig::Smb30;
+                            match state
+                                .open_table
+                                .request_lease(
+                                    fid,
+                                    open_id,
+                                    client_guid,
+                                    rqls.lease_key,
+                                    rqls.lease_state,
+                                    is_v2,
+                                    rqls.parent_lease_key,
+                                    rqls.epoch,
+                                    conn_state.write_tx.clone(),
+                                )
+                                .await
+                            {
+                                Ok((grant, breaks)) => {
+                                    granted_oplock = rssmb_proto::oplock::OplockLevel::Lease;
+                                    resp_ctx_items.push((RQLS_NAME, build_rqls_response_data(&grant)));
+                                    pending_breaks = breaks;
+                                }
+                                Err(()) => {
+                                    // Lease key collision with a different underlying file.
+                                    let _ = state.open_table.remove(fid, open_id).await;
+                                    conn_state.opens.write().await.remove(&file_id.volatile);
+                                    if let Some(guid) = durable_guid {
+                                        state.durable_table.forget(&guid).await;
+                                    }
+                                    let _ = vfs.close(open_id).await;
+                                    return error_response_for(
+                                        Command::Create,
+                                        NtStatus::InvalidParameter,
+                                        &req.header,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let req_level = match create_req.requested_oplock_level {
+                            rssmb_proto::oplock::OplockLevel::Batch => 0x09,
+                            rssmb_proto::oplock::OplockLevel::Exclusive => 0x08,
+                            rssmb_proto::oplock::OplockLevel::II => 0x01,
+                            _ => 0x00,
+                        };
+                        if req_level != 0x00 {
+                            let (granted, breaks) = state
+                                .open_table
+                                .request_oplock(
+                                    fid,
+                                    open_id,
+                                    file_id,
+                                    req_level,
+                                    conn_state.write_tx.clone(),
+                                )
+                                .await;
+                            granted_oplock = match granted {
+                                0x09 => rssmb_proto::oplock::OplockLevel::Batch,
+                                0x08 => rssmb_proto::oplock::OplockLevel::Exclusive,
+                                0x01 => rssmb_proto::oplock::OplockLevel::II,
+                                _ => rssmb_proto::oplock::OplockLevel::None,
+                            };
+                            pending_breaks = breaks;
+                        } else {
+                            // Non-leased open still breaks any existing Write lease/oplock on this file.
+                            let (breaks, _waiters) = state
+                                .open_table
+                                .break_for_op(fid, Some(open_id), opens::ConflictOp::Read)
+                                .await;
+                            pending_breaks = breaks;
+                        }
+                    }
+                }
+            }
+
+            // Deliver any triggered break notifications to other lease/oplock holders.
+            send_break_notifications(&pending_breaks).await;
+
+            let create_contexts = if resp_ctx_items.is_empty() {
+                Vec::new()
+            } else {
+                let refs: Vec<(&[u8], &[u8])> = resp_ctx_items
+                    .iter()
+                    .map(|(n, d)| (*n, d.as_slice()))
+                    .collect();
+                encode_create_contexts(&refs)
+            };
+
             let create_response = rssmb_proto::create::CreateResponse {
-                oplock_level: rssmb_proto::oplock::OplockLevel::None,
+                oplock_level: granted_oplock,
                 flags: Default::default(),
                 create_action: rssmb_proto::create::CreateAction::Opened,
                 creation_time: FileTime::from(info.creation_time),
@@ -2828,6 +3049,7 @@ async fn handle_create(
                 endof_file: info.size,
                 file_attributes: crate::fsinfo::file_attributes_to_fscc(&info.attributes),
                 file_id,
+                create_contexts,
             };
 
             let response = build_response(&req.header, ResponseContent::Create(create_response));
@@ -2987,6 +3209,10 @@ async fn handle_close(
                         .release_all_locks_for_open(entry.open_id)
                         .await;
                 }
+                state
+                    .open_table
+                    .remove_open_from_leases(entry.open_id)
+                    .await;
 
                 // If this was a durable open, remove it from the durable
                 // table. The VFS handle is closed below — `forget` does not
@@ -3122,6 +3348,12 @@ async fn handle_read(
                 &req.header,
             );
         }
+        // Break any Write lease/oplock held by another client on this file.
+        let (breaks, _waiters) = state
+            .open_table
+            .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Read)
+            .await;
+        send_break_notifications(&breaks).await;
     }
 
     // Read from VFS
@@ -3306,6 +3538,12 @@ async fn handle_write(
                 &req.header,
             );
         }
+        // Break any Read or Write lease/oplock held by another client on this file.
+        let (breaks, _waiters) = state
+            .open_table
+            .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
+            .await;
+        send_break_notifications(&breaks).await;
     }
 
     match entry
@@ -3867,6 +4105,13 @@ async fn handle_set_info(
             let mut cursor = std::io::Cursor::new(&raw_data[..]);
             match rssmb_proto::fscc::FileEndOfFileInformation::read_le(&mut cursor) {
                 Ok(eof) => {
+                    if let Some(fid) = entry.file_id {
+                        let (breaks, _waiters) = state
+                            .open_table
+                            .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
+                            .await;
+                        send_break_notifications(&breaks).await;
+                    }
                     let mut info = match entry
                         .vfs
                         .query_info(entry.open_id, rssmb_vfs::InfoClass::FileStandardInfo)
@@ -3935,6 +4180,19 @@ async fn handle_set_info(
                             &req.header,
                         );
                     }
+                    if delete_pending {
+                        if let Some(fid) = entry.file_id {
+                            let (breaks, _waiters) = state
+                                .open_table
+                                .break_for_op(
+                                    fid,
+                                    Some(entry.open_id),
+                                    opens::ConflictOp::HandleOrDelete,
+                                )
+                                .await;
+                            send_break_notifications(&breaks).await;
+                        }
+                    }
                     match entry
                         .vfs
                         .set_delete_on_close(entry.open_id, delete_pending)
@@ -3988,6 +4246,17 @@ async fn handle_set_info(
             let mut cursor = std::io::Cursor::new(&raw_data[..]);
             match rssmb_proto::fscc::FileRenameInformation::read_le(&mut cursor) {
                 Ok(rename) => {
+                    if let Some(fid) = entry.file_id {
+                        let (breaks, _waiters) = state
+                            .open_table
+                            .break_for_op(
+                                fid,
+                                Some(entry.open_id),
+                                opens::ConflictOp::HandleOrDelete,
+                            )
+                            .await;
+                        send_break_notifications(&breaks).await;
+                    }
                     let new_name = rename.file_name.to_string();
                     debug!(conn_id = conn_state.conn_id, new_name = %new_name, "set_info rename");
                     match entry
@@ -4540,7 +4809,174 @@ async fn handle_lock(
         &req.header,
         ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
     );
+    if !acquired.is_empty() {
+        let (breaks, _waiters) = state
+            .open_table
+            .break_for_op(file_id, Some(entry.open_id), opens::ConflictOp::Lock)
+            .await;
+        send_break_notifications(&breaks).await;
+    }
     FramedResponse::Plain(response)
+}
+
+/// Encode and send unsolicited SMB2 OPLOCK_BREAK / LEASE_BREAK notifications
+/// (MS-SMB2 2.2.23.1 / 2.2.23.2: `Command = OplockBreak`, `Flags = SERVER_TO_REDIR`,
+/// `MessageId = 0xFFFFFFFFFFFFFFFF`, `SessionId = 0`, `TreeId = 0`).
+async fn send_break_notifications(breaks: &[opens::BreakNotification]) {
+    for b in breaks {
+        let (tx, content) = match b {
+            opens::BreakNotification::Lease {
+                notify_tx,
+                lease_key,
+                current_state,
+                new_state,
+                new_epoch,
+                ack_required,
+            } => (
+                notify_tx,
+                ResponseContent::LeaseBreakNotify(rssmb_proto::create::LeaseBreakNotify {
+                    new_epoch: *new_epoch,
+                    ack_required: u32::from(*ack_required),
+                    lease_key: Guid::from(*lease_key),
+                    current_lease_state: current_state.to_proto(),
+                    new_lease_state: new_state.to_proto(),
+                }),
+            ),
+            opens::BreakNotification::Oplock {
+                notify_tx,
+                smb_file_id,
+                new_oplock_level,
+            } => (
+                notify_tx,
+                ResponseContent::OplockBreakNotify(rssmb_proto::create::OplockBreakMsg {
+                    oplock_level: *new_oplock_level,
+                    reserved: 0,
+                    _reserved2: 0,
+                    file_id: *smb_file_id,
+                }),
+            ),
+        };
+        let plain = PlainResponse {
+            header: Header {
+                credit_charge: 0,
+                status: NtStatus::Success.to_u32(),
+                command: Command::OplockBreak,
+                credit_request: 0,
+                flags: HeaderFlags::new().with_server_to_redir(true),
+                next_command: 0,
+                message_id: u64::MAX,
+                tree_id: Some(0),
+                async_id: None,
+                session_id: 0,
+                signature: 0,
+            },
+            content,
+        };
+        let encoded = rssmb_wire_adapter::encode_response(&FramedResponse::Plain(plain));
+        if !encoded.is_empty() {
+            let _ = tx.send(encoded).await;
+        }
+    }
+}
+
+/// OPLOCK_BREAK — handle a client Oplock Break Acknowledgment or Lease Break
+/// Acknowledgment (MS-SMB2 3.3.5.19.1 / 3.3.5.19.2).
+async fn handle_oplock_break(
+    state: &ServerState,
+    conn_state: &ConnState,
+    req: rssmb_proto::plain::PlainRequest,
+) -> FramedResponse {
+    // Validate that the session exists on this connection.
+    let session_id = req.header.session_id;
+    let session_exists = {
+        let sessions = conn_state.sessions.read().await;
+        sessions.iter().any(|s| s.id == session_id)
+    };
+    if !session_exists {
+        return error_response_for(
+            Command::OplockBreak,
+            NtStatus::UserSessionDeleted,
+            &req.header,
+        );
+    }
+
+    match &req.content {
+        RequestContent::LeaseBreakAck(ack) => {
+            let client_guid = {
+                let rec = conn_state.negotiate_record.lock().await;
+                match &*rec {
+                    Some(r) => {
+                        let mut cg = [0u8; 16];
+                        cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                        cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                        cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                        cg[8..16].copy_from_slice(&r.client_guid.3);
+                        cg
+                    }
+                    None => [0u8; 16],
+                }
+            };
+            let mut lease_key = [0u8; 16];
+            lease_key[0..4].copy_from_slice(&ack.lease_key.0.to_le_bytes());
+            lease_key[4..6].copy_from_slice(&ack.lease_key.1.to_le_bytes());
+            lease_key[6..8].copy_from_slice(&ack.lease_key.2.to_le_bytes());
+            lease_key[8..16].copy_from_slice(&ack.lease_key.3);
+
+            let acked = opens::LeaseCaching::from_proto(ack.lease_state);
+            match state
+                .open_table
+                .ack_lease_break(client_guid, lease_key, acked)
+                .await
+            {
+                Ok((new_state, followup)) => {
+                    if let Some(notif) = followup {
+                        send_break_notifications(&[notif]).await;
+                    }
+                    let resp = rssmb_proto::create::LeaseBreakAckResponse {
+                        reserved: 0,
+                        _reserved2: 0,
+                        lease_key: ack.lease_key,
+                        lease_state: new_state.to_proto(),
+                        _reserved3: 0,
+                    };
+                    FramedResponse::Plain(build_response(
+                        &req.header,
+                        ResponseContent::LeaseBreak(resp),
+                    ))
+                }
+                Err(status) => error_response_for(Command::OplockBreak, status, &req.header),
+            }
+        }
+        RequestContent::OplockBreakAck(ack) => {
+            match state
+                .open_table
+                .ack_oplock_break(ack.file_id, ack.oplock_level)
+                .await
+            {
+                Ok((new_level, followup)) => {
+                    if let Some(notif) = followup {
+                        send_break_notifications(&[notif]).await;
+                    }
+                    let resp = rssmb_proto::create::OplockBreakMsg {
+                        oplock_level: new_level,
+                        reserved: 0,
+                        _reserved2: 0,
+                        file_id: ack.file_id,
+                    };
+                    FramedResponse::Plain(build_response(
+                        &req.header,
+                        ResponseContent::OplockBreak(resp),
+                    ))
+                }
+                Err(status) => error_response_for(Command::OplockBreak, status, &req.header),
+            }
+        }
+        _ => error_response_for(
+            Command::OplockBreak,
+            NtStatus::InvalidParameter,
+            &req.header,
+        ),
+    }
 }
 
 /// CANCEL — cancel a pending async operation (MS-SMB2 3.3.5.16).
@@ -5067,7 +5503,7 @@ mod tests {
                         assert_eq!(neg.dialect_revision, NegotiateDialect::Smb021);
                         assert_eq!(neg.max_transact_size, 1024 * 1024);
                         assert!(neg.capabilities.large_mtu());
-                        assert!(!neg.capabilities.leasing());
+                        assert!(neg.capabilities.leasing());
                         assert!(!neg.capabilities.encryption());
                         assert!(*neg.system_time != 0);
                     }
@@ -5778,6 +6214,52 @@ mod tests {
             visible.iter().any(|s| s.name == "alpha"),
             "case-insensitive read_users match should work"
         );
+    }
+
+    #[test]
+    fn test_encode_and_parse_rqls_v1_and_v2_create_contexts() {
+        let lease_key = [0x11u8; 16];
+        let parent_key = [0x22u8; 16];
+        let grant_v1 = opens::LeaseGrant {
+            lease_key,
+            state: opens::LeaseCaching::from_bits(0x03), // RH
+            flags: 0,
+            epoch: 0,
+            parent_lease_key: None,
+            is_v2: false,
+        };
+        let v1_data = build_rqls_response_data(&grant_v1);
+        assert_eq!(v1_data.len(), 32);
+        let ctx_bytes = encode_create_contexts(&[(RQLS_NAME, &v1_data)]);
+        // Put at offset 120 in a synthetic frame
+        let mut raw = vec![0u8; 120];
+        raw.extend_from_slice(&ctx_bytes);
+        let parsed = parse_create_contexts(&raw, 120, ctx_bytes.len() as u32);
+        let rqls = parsed.rqls.expect("should parse RqLs v1");
+        assert_eq!(rqls.lease_key, lease_key);
+        assert_eq!(rqls.lease_state, opens::LeaseCaching::from_bits(0x03));
+        assert!(!rqls.is_v2);
+
+        let grant_v2 = opens::LeaseGrant {
+            lease_key,
+            state: opens::LeaseCaching::from_bits(0x07), // RWH
+            flags: 0x0000_0004,
+            epoch: 5,
+            parent_lease_key: Some(parent_key),
+            is_v2: true,
+        };
+        let v2_data = build_rqls_response_data(&grant_v2);
+        assert_eq!(v2_data.len(), 52);
+        let ctx_bytes_v2 = encode_create_contexts(&[(RQLS_NAME, &v2_data)]);
+        let mut raw2 = vec![0u8; 120];
+        raw2.extend_from_slice(&ctx_bytes_v2);
+        let parsed2 = parse_create_contexts(&raw2, 120, ctx_bytes_v2.len() as u32);
+        let rqls2 = parsed2.rqls.expect("should parse RqLs v2");
+        assert_eq!(rqls2.lease_key, lease_key);
+        assert_eq!(rqls2.lease_state, opens::LeaseCaching::from_bits(0x07));
+        assert!(rqls2.is_v2);
+        assert_eq!(rqls2.parent_lease_key, Some(parent_key));
+        assert_eq!(rqls2.epoch, 5);
     }
 }
 

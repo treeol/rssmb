@@ -1098,6 +1098,10 @@ impl Connection {
                 should_delete_on_close =
                     remove_result.was_last && remove_result.any_delete_on_close;
             }
+            state
+                .open_table
+                .remove_open_from_leases(entry.open_id)
+                .await;
             let released = state
                 .open_table
                 .release_all_locks_for_open(entry.open_id)

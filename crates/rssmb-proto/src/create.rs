@@ -2,6 +2,7 @@
 //!
 //! MS-SMB2 2.2.13–2.2.16, 2.2.23–2.2.25.
 
+use binrw::io::TakeSeekExt;
 use binrw::prelude::*;
 use modular_bitfield::prelude::*;
 
@@ -38,9 +39,9 @@ impl std::fmt::Debug for FileId {
 #[derive(Default)]
 pub enum OplockLevel {
     #[default]
-    None = 0,
-    II = 1,
-    Exclusive = 2,
+    None = 0x00,
+    II = 0x01,
+    Exclusive = 0x08,
     Batch = 0x09,
     Lease = 0xFF,
 }
@@ -253,13 +254,19 @@ pub struct CreateResponse {
     reserved: u32,
     /// File identifier.
     pub file_id: FileId,
-    // Create contexts in the response are not parsed by the server.
     #[bw(calc = PosMarker::default())]
     #[br(temp)]
     _create_contexts_offset: PosMarker<u32>,
     #[bw(calc = PosMarker::default())]
     #[br(temp)]
     _create_contexts_length: PosMarker<u32>,
+    /// Serialized create context chain (empty if no create contexts are returned).
+    #[br(if(_create_contexts_offset.value > 0 && _create_contexts_length.value > 0))]
+    #[br(seek_before = std::io::SeekFrom::Start(_create_contexts_offset.value.into()))]
+    #[br(map_stream = |s| s.take_seek(_create_contexts_length.value.into()), parse_with = binrw::helpers::until_eof)]
+    #[bw(if(!create_contexts.is_empty()))]
+    #[bw(write_with = PosMarker::write_aoff_size, args(&_create_contexts_offset, &_create_contexts_length))]
+    pub create_contexts: Vec<u8>,
 }
 
 /// Response flags for CREATE.
@@ -343,15 +350,16 @@ pub struct CloseFlags {
 ///
 /// MS-SMB2 2.2.23.1, 2.2.24.1, 2.2.25.1
 #[binrw::binrw]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[brw(little)]
 pub struct OplockBreakMsg {
     #[bw(calc = 24)]
-    structure_size: u16,
-    oplock_level: u8,
-    reserved: u8,
-    _reserved2: u32,
-    file_id: FileId,
+    #[br(assert(structure_size == 24))]
+    pub structure_size: u16,
+    pub oplock_level: u8,
+    pub reserved: u8,
+    pub _reserved2: u32,
+    pub file_id: FileId,
 }
 
 pub use OplockBreakMsg as OplockBreakAck;
@@ -362,16 +370,17 @@ pub use OplockBreakMsg as OplockBreakResponse;
 ///
 /// MS-SMB2 2.2.23.2
 #[binrw::binrw]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[brw(little)]
 pub struct LeaseBreakNotify {
     #[bw(calc = 44)]
-    structure_size: u16,
-    new_epoch: u16,
-    ack_required: u32,
-    lease_key: Guid,
-    current_lease_state: LeaseState,
-    new_lease_state: LeaseState,
+    #[br(assert(structure_size == 44))]
+    pub structure_size: u16,
+    pub new_epoch: u16,
+    pub ack_required: u32,
+    pub lease_key: Guid,
+    pub current_lease_state: LeaseState,
+    pub new_lease_state: LeaseState,
     #[bw(calc = 0)]
     #[br(temp)]
     break_reason: u32,
@@ -387,16 +396,17 @@ pub struct LeaseBreakNotify {
 ///
 /// MS-SMB2 2.2.24.2, 2.2.25.2
 #[binrw::binrw]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[brw(little)]
 pub struct LeaseBreakAckResponse {
     #[bw(calc = 36)]
-    structure_size: u16,
-    reserved: u16,
-    _reserved2: u32,
-    lease_key: Guid,
-    lease_state: LeaseState,
-    _reserved3: u64,
+    #[br(assert(structure_size == 36))]
+    pub structure_size: u16,
+    pub reserved: u16,
+    pub _reserved2: u32,
+    pub lease_key: Guid,
+    pub lease_state: LeaseState,
+    pub _reserved3: u64,
 }
 
 pub use LeaseBreakAckResponse as LeaseBreakAck;
@@ -560,6 +570,7 @@ mod tests {
                 persistent: 0xCAFE,
                 volatile: 0xBABE,
             },
+            create_contexts: Vec::new(),
         };
         let mut buf = Cursor::new(Vec::new());
         resp.write_le(&mut buf).unwrap();
@@ -713,5 +724,140 @@ mod tests {
         assert!(decoded.read_caching());
         assert!(decoded.write_caching());
         assert!(!decoded.handle_caching());
+    }
+
+    #[test]
+    fn test_create_response_with_contexts_full_message_offsets() {
+        use crate::header::{Command, Header, HeaderFlags};
+        use crate::plain::{PlainResponse, ResponseContent};
+
+        let ctx_bytes = vec![0x11u8; 56]; // e.g. 16-byte header + 8-byte name + 32-byte RqLs data
+        let resp = PlainResponse {
+            header: Header {
+                credit_charge: 1,
+                status: 0,
+                command: Command::Create,
+                credit_request: 1,
+                flags: HeaderFlags::new().with_server_to_redir(true),
+                next_command: 0,
+                message_id: 1,
+                tree_id: Some(1),
+                async_id: None,
+                session_id: 1,
+                signature: 0,
+            },
+            content: ResponseContent::Create(CreateResponse {
+                oplock_level: OplockLevel::Lease,
+                flags: CreateResponseFlags::new(),
+                create_action: CreateAction::Created,
+                creation_time: FileTime::ZERO,
+                last_access_time: FileTime::ZERO,
+                last_write_time: FileTime::ZERO,
+                change_time: FileTime::ZERO,
+                allocation_size: 0,
+                endof_file: 0,
+                file_attributes: FileAttributes::new().with_normal(true),
+                file_id: FileId {
+                    persistent: 1,
+                    volatile: 2,
+                },
+                create_contexts: ctx_bytes.clone(),
+            }),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        // 64-byte SMB2 header + 88-byte fixed CreateResponse + 56-byte contexts = 208
+        assert_eq!(bytes.len(), 64 + 88 + 56);
+        // CreateContextsOffset at header(64) + 80 = 144..148 should be 152 (64 + 88)
+        let offset = u32::from_le_bytes(bytes[144..148].try_into().unwrap());
+        let length = u32::from_le_bytes(bytes[148..152].try_into().unwrap());
+        assert_eq!(offset, 152);
+        assert_eq!(length, 56);
+
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded = PlainResponse::read_le(&mut cursor).unwrap();
+        match decoded.content {
+            ResponseContent::Create(cr) => {
+                assert_eq!(cr.oplock_level, OplockLevel::Lease);
+                assert_eq!(cr.create_contexts, ctx_bytes);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_oplock_and_lease_break_content_discrimination() {
+        use crate::header::{Command, Header, HeaderFlags};
+        use crate::plain::{PlainRequest, RequestContent};
+
+        // 1. OplockBreakAck (24 bytes)
+        let oplock_req = PlainRequest {
+            header: Header {
+                credit_charge: 1,
+                status: 0,
+                command: Command::OplockBreak,
+                credit_request: 1,
+                flags: HeaderFlags::new(),
+                next_command: 0,
+                message_id: 5,
+                tree_id: Some(1),
+                async_id: None,
+                session_id: 2,
+                signature: 0,
+            },
+            content: RequestContent::OplockBreakAck(OplockBreakMsg {
+                oplock_level: 1,
+                reserved: 0,
+                _reserved2: 0,
+                file_id: FileId {
+                    persistent: 10,
+                    volatile: 20,
+                },
+            }),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        oplock_req.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded = PlainRequest::read_le(&mut cursor).unwrap();
+        assert!(matches!(decoded.content, RequestContent::OplockBreakAck(_)));
+
+        // 2. LeaseBreakAck (36 bytes)
+        let lease_req = PlainRequest {
+            header: Header {
+                credit_charge: 1,
+                status: 0,
+                command: Command::OplockBreak,
+                credit_request: 1,
+                flags: HeaderFlags::new(),
+                next_command: 0,
+                message_id: 6,
+                tree_id: Some(0),
+                async_id: None,
+                session_id: 2,
+                signature: 0,
+            },
+            content: RequestContent::LeaseBreakAck(LeaseBreakAckResponse {
+                reserved: 0,
+                _reserved2: 0,
+                lease_key: Guid::from([0x55u8; 16]),
+                lease_state: LeaseState::new().with_read_caching(true),
+                _reserved3: 0,
+            }),
+        };
+        let mut buf2 = Cursor::new(Vec::new());
+        lease_req.write_le(&mut buf2).unwrap();
+        let bytes2 = buf2.into_inner();
+        let mut cursor2 = Cursor::new(&bytes2[..]);
+        let decoded2 = PlainRequest::read_le(&mut cursor2).unwrap();
+        match decoded2.content {
+            RequestContent::LeaseBreakAck(ack) => {
+                assert_eq!(ack.lease_key, Guid::from([0x55u8; 16]));
+                assert!(ack.lease_state.read_caching());
+            }
+            other => panic!("expected LeaseBreakAck, got {other:?}"),
+        }
     }
 }

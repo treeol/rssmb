@@ -110,6 +110,11 @@ pub struct ServerConfig {
     #[serde(default = "default_durable_timeout_secs")]
     pub durable_timeout_secs: u64,
 
+    /// Whether SMB 2.1+ file leases and traditional oplocks are enabled.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub leases: bool,
+
     /// Server name (for SrvSvc NetrServerGetInfo). Defaults to "rssmb" if empty.
     #[serde(default)]
     pub server_name: String,
@@ -584,6 +589,7 @@ impl ServerConfig {
             auth_max_failures_per_conn: 10,
             ntlm_require_timestamp: false,
             durable_timeout_secs: 900,
+            leases: true,
             server_name: "rssmb".to_string(),
             shutdown_grace_secs: 10,
             users: vec![],

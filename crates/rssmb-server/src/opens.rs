@@ -24,6 +24,359 @@ use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 use thiserror::Error;
 use tracing::{debug, instrument};
 
+/// Sender handle for delivering unsolicited lease/oplock break notifications
+/// on the owning connection.
+pub type LeaseNotifySender = tokio::sync::mpsc::Sender<bytes::Bytes>;
+
+/// File caching state for SMB 2.1+ Leases (MS-SMB2 2.2.13.2.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeaseCaching {
+    pub read: bool,
+    pub handle: bool,
+    pub write: bool,
+}
+
+impl LeaseCaching {
+    pub const NONE: Self = Self {
+        read: false,
+        handle: false,
+        write: false,
+    };
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            read: bits & 0x01 != 0,
+            handle: bits & 0x02 != 0,
+            write: bits & 0x04 != 0,
+        }
+    }
+
+    pub fn to_bits(self) -> u32 {
+        let mut bits = 0u32;
+        if self.read {
+            bits |= 0x01;
+        }
+        if self.handle {
+            bits |= 0x02;
+        }
+        if self.write {
+            bits |= 0x04;
+        }
+        bits
+    }
+
+    pub fn to_proto(self) -> rssmb_proto::create::LeaseState {
+        rssmb_proto::create::LeaseState::new()
+            .with_read_caching(self.read)
+            .with_handle_caching(self.handle)
+            .with_write_caching(self.write)
+    }
+
+    pub fn from_proto(s: rssmb_proto::create::LeaseState) -> Self {
+        Self {
+            read: s.read_caching(),
+            handle: s.handle_caching(),
+            write: s.write_caching(),
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            read: self.read || other.read,
+            handle: self.handle || other.handle,
+            write: self.write || other.write,
+        }
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        (self.to_bits() & !other.to_bits()) == 0
+    }
+}
+
+/// Unique identifier for a Lease in the global lease table: `(ClientGuid, LeaseKey)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeaseId {
+    pub client_guid: [u8; 16],
+    pub lease_key: [u8; 16],
+}
+
+/// Result of granting or upgrading a lease on `CREATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseGrant {
+    pub lease_key: [u8; 16],
+    pub state: LeaseCaching,
+    pub flags: u32,
+    pub epoch: u16,
+    pub parent_lease_key: Option<[u8; 16]>,
+    pub is_v2: bool,
+}
+
+/// Operation kind that may conflict with existing leases or oplocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictOp {
+    /// Another handle is reading from the file (breaks W).
+    Read,
+    /// Another handle is writing or truncating the file (breaks R and W).
+    Write,
+    /// Another handle is renaming or setting delete-on-close (breaks H and W, or R/H/W).
+    HandleOrDelete,
+    /// Byte-range lock acquired on the file (breaks R/H/W).
+    Lock,
+}
+
+/// An unsolicited break notification to be sent to a client connection.
+#[derive(Debug, Clone)]
+pub enum BreakNotification {
+    Lease {
+        notify_tx: LeaseNotifySender,
+        lease_key: [u8; 16],
+        current_state: LeaseCaching,
+        new_state: LeaseCaching,
+        new_epoch: u16,
+        ack_required: bool,
+    },
+    Oplock {
+        notify_tx: LeaseNotifySender,
+        smb_file_id: rssmb_proto::create::FileId,
+        new_oplock_level: u8,
+    },
+}
+
+#[derive(Debug)]
+struct LeaseRecord {
+    file_id: FileId,
+    state: LeaseCaching,
+    breaking: bool,
+    break_to: LeaseCaching,
+    pending_break_to: Option<LeaseCaching>,
+    epoch: u16,
+    is_v2: bool,
+    parent_lease_key: Option<[u8; 16]>,
+    handles: HashSet<OpenId>,
+    notify_tx: LeaseNotifySender,
+    break_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct OplockRecord {
+    file_id: FileId,
+    open_id: OpenId,
+    smb_file_id: rssmb_proto::create::FileId,
+    level: u8,
+    breaking_to: Option<u8>,
+    pending_breaking_to: Option<u8>,
+    notify_tx: LeaseNotifySender,
+    break_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[derive(Debug, Default)]
+struct LeaseManager {
+    leases: HashMap<LeaseId, LeaseRecord>,
+    oplocks: HashMap<OpenId, OplockRecord>,
+}
+
+impl LeaseManager {
+    /// Break other lease/oplock holders when a new open arrives on `file_id`.
+    fn break_other_holders_on_open(
+        &mut self,
+        file_id: FileId,
+        actor_lease: Option<LeaseId>,
+        actor_open: OpenId,
+        _requested: LeaseCaching,
+    ) -> Vec<BreakNotification> {
+        let mut out = Vec::new();
+        for (id, rec) in self.leases.iter_mut() {
+            if rec.file_id != file_id || Some(*id) == actor_lease || rec.handles.is_empty() {
+                continue;
+            }
+            if rec.state.write {
+                let current = rec.state;
+                let target = LeaseCaching {
+                    read: rec.state.read,
+                    handle: rec.state.handle,
+                    write: false,
+                };
+                if !rec.breaking {
+                    rec.breaking = true;
+                    rec.break_to = target;
+                    if rec.is_v2 {
+                        rec.epoch = rec.epoch.wrapping_add(1);
+                    }
+                    out.push(BreakNotification::Lease {
+                        notify_tx: rec.notify_tx.clone(),
+                        lease_key: id.lease_key,
+                        current_state: current,
+                        new_state: target,
+                        new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
+                        ack_required: true,
+                    });
+                }
+            }
+        }
+        for (oid, rec) in self.oplocks.iter_mut() {
+            if rec.file_id != file_id || *oid == actor_open {
+                continue;
+            }
+            if (rec.level == 0x08 || rec.level == 0x09) && rec.breaking_to.is_none() {
+                rec.breaking_to = Some(0x01);
+                out.push(BreakNotification::Oplock {
+                    notify_tx: rec.notify_tx.clone(),
+                    smb_file_id: rec.smb_file_id,
+                    new_oplock_level: 0x01,
+                });
+            }
+        }
+        out
+    }
+
+    fn trigger_breaks(
+        &mut self,
+        file_id: FileId,
+        actor_lease: Option<LeaseId>,
+        actor_open: Option<OpenId>,
+        op: ConflictOp,
+    ) -> (Vec<BreakNotification>, Vec<tokio::sync::oneshot::Receiver<()>>) {
+        let mut notifications = Vec::new();
+        let mut receivers = Vec::new();
+
+        for (id, rec) in self.leases.iter_mut() {
+            if rec.file_id != file_id || Some(*id) == actor_lease || rec.handles.is_empty() {
+                continue;
+            }
+
+            let target = match op {
+                ConflictOp::Read => {
+                    if !rec.state.write {
+                        continue;
+                    }
+                    LeaseCaching {
+                        read: rec.state.read,
+                        handle: rec.state.handle,
+                        write: false,
+                    }
+                }
+                ConflictOp::Write => {
+                    if !rec.state.read && !rec.state.write {
+                        continue;
+                    }
+                    LeaseCaching::NONE
+                }
+                ConflictOp::HandleOrDelete | ConflictOp::Lock => {
+                    if rec.state == LeaseCaching::NONE {
+                        continue;
+                    }
+                    LeaseCaching::NONE
+                }
+            };
+
+            if rec.state == target {
+                continue;
+            }
+
+            // MS-SMB2 3.3.4.7: Ack is required if the lease currently holds H or W,
+            // and is NOT required if breaking from R-only to None.
+            let ack_required = rec.state.handle || rec.state.write;
+
+            if !rec.breaking {
+                let current = rec.state;
+                if rec.is_v2 {
+                    rec.epoch = rec.epoch.wrapping_add(1);
+                }
+                if ack_required {
+                    rec.breaking = true;
+                    rec.break_to = target;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rec.break_waiters.push(tx);
+                    receivers.push(rx);
+                } else {
+                    rec.state = target;
+                }
+                notifications.push(BreakNotification::Lease {
+                    notify_tx: rec.notify_tx.clone(),
+                    lease_key: id.lease_key,
+                    current_state: current,
+                    new_state: target,
+                    new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
+                    ack_required,
+                });
+            } else {
+                // Already breaking: record stricter pending target for follow-up break
+                // once the client acknowledges the currently advertised break_to.
+                let narrower = LeaseCaching {
+                    read: rec.break_to.read && target.read,
+                    handle: rec.break_to.handle && target.handle,
+                    write: rec.break_to.write && target.write,
+                };
+                if narrower != rec.break_to {
+                    rec.pending_break_to = Some(match rec.pending_break_to {
+                        Some(p) => LeaseCaching {
+                            read: p.read && narrower.read,
+                            handle: p.handle && narrower.handle,
+                            write: p.write && narrower.write,
+                        },
+                        None => narrower,
+                    });
+                }
+                if ack_required {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rec.break_waiters.push(tx);
+                    receivers.push(rx);
+                }
+            }
+        }
+
+        let mut oplocks_to_remove = Vec::new();
+        for (oid, rec) in self.oplocks.iter_mut() {
+            if rec.file_id != file_id || Some(*oid) == actor_open {
+                continue;
+            }
+            let (need_break, new_level, ack_req) = match op {
+                ConflictOp::Read => (
+                    rec.level == 0x08 || rec.level == 0x09,
+                    0x01,
+                    true,
+                ),
+                ConflictOp::Write | ConflictOp::HandleOrDelete | ConflictOp::Lock => (
+                    rec.level != 0,
+                    0x00,
+                    rec.level == 0x08 || rec.level == 0x09,
+                ),
+            };
+            if !need_break {
+                continue;
+            }
+            if rec.breaking_to.is_none() {
+                if ack_req {
+                    rec.breaking_to = Some(new_level);
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rec.break_waiters.push(tx);
+                    receivers.push(rx);
+                } else {
+                    rec.level = 0x00;
+                    oplocks_to_remove.push(*oid);
+                }
+                notifications.push(BreakNotification::Oplock {
+                    notify_tx: rec.notify_tx.clone(),
+                    smb_file_id: rec.smb_file_id,
+                    new_oplock_level: new_level,
+                });
+            } else if ack_req {
+                if new_level == 0x00 && rec.breaking_to == Some(0x01) {
+                    rec.pending_breaking_to = Some(0x00);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rec.break_waiters.push(tx);
+                receivers.push(rx);
+            }
+        }
+        for oid in oplocks_to_remove {
+            self.oplocks.remove(&oid);
+        }
+
+        (notifications, receivers)
+    }
+}
+
 /// A byte-range lock held by a specific open handle.
 ///
 /// Locks are identified by `(session_id, tree_id, open_id)` — the SMB lock
@@ -179,8 +532,10 @@ pub struct OpenTable {
     /// Files with at least one open that has delete_on_close = true.
     /// Survives entry removal until the last close clears it.
     delete_pending: RwLock<HashSet<FileId>>,
-    /// Per-file byte-range locks, keyed by file identity.
+    ///Per-file byte-range locks, keyed by file identity.
     range_locks: RwLock<HashMap<FileId, Vec<RangeLock>>>,
+    /// Per-file lease and traditional oplock state.
+    leases: RwLock<LeaseManager>,
 }
 
 impl OpenTable {
@@ -190,6 +545,7 @@ impl OpenTable {
             opens: RwLock::new(HashMap::new()),
             delete_pending: RwLock::new(HashSet::new()),
             range_locks: RwLock::new(HashMap::new()),
+            leases: RwLock::new(LeaseManager::default()),
         }
     }
 
@@ -662,6 +1018,403 @@ impl OpenTable {
             locks.remove(&key);
         }
         released
+    }
+
+    // ---- Lease & Oplock management (MS-SMB2 3.3.5.9.8 / 3.3.5.9.11 / 3.3.5.19) ----
+
+    /// Request a Lease (v1 or v2) on `file_id` for `open_id`.
+    ///
+    /// Returns `Err(())` if the `(client_guid, lease_key)` is already bound to
+    /// a *different* `file_id` (MS-SMB2: `STATUS_INVALID_PARAMETER`), or if the
+    /// requested state is granted/upgraded along with any break notifications
+    /// that must be sent to other lease/oplock holders on `file_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_lease(
+        &self,
+        file_id: FileId,
+        open_id: OpenId,
+        client_guid: [u8; 16],
+        lease_key: [u8; 16],
+        requested: LeaseCaching,
+        is_v2: bool,
+        parent_lease_key: Option<[u8; 16]>,
+        client_epoch: u16,
+        notify_tx: LeaseNotifySender,
+    ) -> Result<(LeaseGrant, Vec<BreakNotification>), ()> {
+        let total_opens = self.count(file_id).await;
+        let mut mgr = self.leases.write().await;
+        let id = LeaseId {
+            client_guid,
+            lease_key,
+        };
+
+        // 1. Check if this (client_guid, lease_key) already exists.
+        if let Some(existing) = mgr.leases.get(&id) {
+            if existing.file_id != file_id {
+                // LeaseKey already bound to a different underlying file!
+                return Err(());
+            }
+        }
+
+        // 2. Break any conflicting leases/oplocks held by OTHER owners on `file_id`
+        //    if our requested state requires exclusivity or if existing holders
+        //    hold Write caching.
+        let mut breaks = Vec::new();
+        let other_leases_exist = mgr
+            .leases
+            .iter()
+            .any(|(k, v)| *k != id && v.file_id == file_id && !v.handles.is_empty());
+        let other_oplocks_exist = mgr
+            .oplocks
+            .values()
+            .any(|o| o.file_id == file_id && o.open_id != open_id && o.level != 0);
+
+        // Count opens belonging to THIS lease (plus the new `open_id` if not yet recorded).
+        let this_lease_opens = mgr
+            .leases
+            .get(&id)
+            .map(|e| {
+                let mut c = e.handles.len();
+                if !e.handles.contains(&open_id) {
+                    c += 1;
+                }
+                c
+            })
+            .unwrap_or(1);
+        let non_leased_other_opens = total_opens > this_lease_opens && !other_leases_exist;
+
+        // Opening a file from another lease key breaks Write caching on existing leases/oplocks.
+        breaks.extend(mgr.break_other_holders_on_open(file_id, Some(id), open_id, requested));
+
+        // 3. Compute the maximum caching we can grant for `requested`.
+        //    - Write caching (W) requires R (or RH) and NO other opens outside this lease.
+        //    - Handle caching (H) requires R.
+        //    - Read caching (R) can be shared across multiple readers if no other open has W.
+        let can_grant_write = requested.write
+            && requested.read
+            && !other_leases_exist
+            && !other_oplocks_exist
+            && !non_leased_other_opens;
+        let can_grant_read = requested.read;
+        let can_grant_handle = requested.handle && can_grant_read;
+
+        let candidate = LeaseCaching {
+            read: can_grant_read,
+            handle: can_grant_handle,
+            write: can_grant_write,
+        };
+
+        let entry = mgr.leases.entry(id).or_insert_with(|| LeaseRecord {
+            file_id,
+            state: LeaseCaching::NONE,
+            breaking: false,
+            break_to: LeaseCaching::NONE,
+            pending_break_to: None,
+            epoch: if is_v2 {
+                client_epoch.wrapping_add(1)
+            } else {
+                0
+            },
+            is_v2,
+            parent_lease_key,
+            handles: HashSet::new(),
+            notify_tx: notify_tx.clone(),
+            break_waiters: Vec::new(),
+        });
+
+        entry.handles.insert(open_id);
+        entry.notify_tx = notify_tx;
+        if is_v2 && !entry.is_v2 {
+            entry.is_v2 = true;
+        }
+        if parent_lease_key.is_some() {
+            entry.parent_lease_key = parent_lease_key;
+        }
+
+        // MS-SMB2 3.3.5.9.8: if the lease is currently breaking, we cannot
+        // upgrade it; return its current state with BREAK_IN_PROGRESS flag.
+        let (granted_state, flags) = if entry.breaking {
+            (entry.state, 0x0000_0002) // SMB2_LEASE_FLAG_BREAK_IN_PROGRESS
+        } else {
+            let merged = entry.state.union(candidate);
+            if merged != entry.state {
+                if entry.is_v2 {
+                    entry.epoch = entry.epoch.wrapping_add(1);
+                }
+                entry.state = merged;
+            }
+            (entry.state, 0)
+        };
+
+        let grant = LeaseGrant {
+            lease_key,
+            state: granted_state,
+            flags: if entry.parent_lease_key.is_some() {
+                flags | 0x0000_0004 // SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET
+            } else {
+                flags
+            },
+            epoch: if entry.is_v2 { entry.epoch } else { 0 },
+            parent_lease_key: entry.parent_lease_key,
+            is_v2: entry.is_v2,
+        };
+
+        Ok((grant, breaks))
+    }
+
+    /// Request a traditional Oplock (`0x01` Level II, `0x08` Exclusive, `0x09` Batch)
+    /// for `open_id` on `file_id`.
+    pub async fn request_oplock(
+        &self,
+        file_id: FileId,
+        open_id: OpenId,
+        smb_file_id: rssmb_proto::create::FileId,
+        requested_level: u8,
+        notify_tx: LeaseNotifySender,
+    ) -> (u8, Vec<BreakNotification>) {
+        let total_opens = self.count(file_id).await;
+        let mut mgr = self.leases.write().await;
+
+        let breaks = mgr.break_other_holders_on_open(
+            file_id,
+            None,
+            open_id,
+            LeaseCaching {
+                read: true,
+                handle: requested_level == 0x09,
+                write: requested_level == 0x08 || requested_level == 0x09,
+            },
+        );
+
+        let granted = if total_opens <= 1
+            && !mgr
+                .leases
+                .values()
+                .any(|l| l.file_id == file_id && !l.handles.is_empty())
+        {
+            match requested_level {
+                0x09 | 0x08 | 0x01 => requested_level,
+                _ => 0x00,
+            }
+        } else if requested_level == 0x01 || requested_level == 0x08 || requested_level == 0x09 {
+            // Multiple readers can share a Level II oplock if no one holds write caching.
+            0x01
+        } else {
+            0x00
+        };
+
+        if granted != 0x00 {
+            mgr.oplocks.insert(
+                open_id,
+                OplockRecord {
+                    file_id,
+                    open_id,
+                    smb_file_id,
+                    level: granted,
+                    breaking_to: None,
+                    pending_breaking_to: None,
+                    notify_tx,
+                    break_waiters: Vec::new(),
+                },
+            );
+        }
+
+        (granted, breaks)
+    }
+
+    /// Trigger breaks on `file_id` before an operation (`op`) performed by `actor_open_id`.
+    ///
+    /// Returns any `BreakNotification`s to send immediately and `oneshot::Receiver`s
+    /// to await (with the 35s lease break timeout) when an ACK is required before
+    /// the conflicting operation proceeds.
+    pub async fn break_for_op(
+        &self,
+        file_id: FileId,
+        actor_open_id: Option<OpenId>,
+        op: ConflictOp,
+    ) -> (Vec<BreakNotification>, Vec<tokio::sync::oneshot::Receiver<()>>) {
+        let mut mgr = self.leases.write().await;
+        let actor_lease = actor_open_id.and_then(|oid| {
+            mgr.leases
+                .iter()
+                .find(|(_, rec)| rec.handles.contains(&oid))
+                .map(|(id, _)| *id)
+        });
+        mgr.trigger_breaks(file_id, actor_lease, actor_open_id, op)
+    }
+
+    /// Process a client `LeaseBreakAck` (MS-SMB2 3.3.5.19.2).
+    ///
+    /// Validates that a lease is currently breaking and that the acknowledged
+    /// `lease_state` is a subset of `break_to` (`lease_state & !break_to == 0`).
+    /// Returns `Ok((acked_state, optional_followup_break))` on success or `Err(NtStatus)` on error.
+    pub async fn ack_lease_break(
+        &self,
+        client_guid: [u8; 16],
+        lease_key: [u8; 16],
+        acked_state: LeaseCaching,
+    ) -> Result<(LeaseCaching, Option<BreakNotification>), rssmb_wire_adapter::NtStatus> {
+        let mut mgr = self.leases.write().await;
+        let id = LeaseId {
+            client_guid,
+            lease_key,
+        };
+        let Some(rec) = mgr.leases.get_mut(&id) else {
+            return Err(rssmb_wire_adapter::NtStatus::ObjectNameNotFound);
+        };
+        if !rec.breaking {
+            return Err(rssmb_wire_adapter::NtStatus::Other(0xC000_0001)); // STATUS_UNSUCCESSFUL
+        }
+        // MS-SMB2 3.3.5.19.2: Client must acknowledge a state <= BreakToLeaseState.
+        if !acked_state.is_subset_of(rec.break_to) {
+            return Err(rssmb_wire_adapter::NtStatus::InvalidParameter);
+        }
+        rec.state = acked_state;
+        // Check if a stricter break was queued while the first break was in flight.
+        if let Some(next_target) = rec.pending_break_to.take() {
+            if !rec.state.is_subset_of(next_target) {
+                let target = LeaseCaching {
+                    read: rec.state.read && next_target.read,
+                    handle: rec.state.handle && next_target.handle,
+                    write: rec.state.write && next_target.write,
+                };
+                let ack_req = rec.state.handle || rec.state.write;
+                if rec.is_v2 {
+                    rec.epoch = rec.epoch.wrapping_add(1);
+                }
+                let notif = BreakNotification::Lease {
+                    notify_tx: rec.notify_tx.clone(),
+                    lease_key: id.lease_key,
+                    current_state: rec.state,
+                    new_state: target,
+                    new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
+                    ack_required: ack_req,
+                };
+                if ack_req {
+                    rec.breaking = true;
+                    rec.break_to = target;
+                    return Ok((acked_state, Some(notif)));
+                }
+                rec.state = target;
+                rec.breaking = false;
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+                return Ok((acked_state, Some(notif)));
+            }
+        }
+        rec.breaking = false;
+        let waiters = std::mem::take(&mut rec.break_waiters);
+        for tx in waiters {
+            let _ = tx.send(());
+        }
+        Ok((acked_state, None))
+    }
+
+    /// Process a client `OplockBreakAck` (MS-SMB2 3.3.5.19.1).
+    pub async fn ack_oplock_break(
+        &self,
+        smb_file_id: rssmb_proto::create::FileId,
+        acked_level: u8,
+    ) -> Result<(u8, Option<BreakNotification>), rssmb_wire_adapter::NtStatus> {
+        let mut mgr = self.leases.write().await;
+        let Some(rec) = mgr
+            .oplocks
+            .values_mut()
+            .find(|o| o.smb_file_id == smb_file_id)
+        else {
+            return Err(rssmb_wire_adapter::NtStatus::InvalidHandle);
+        };
+        let Some(target) = rec.breaking_to else {
+            return Err(rssmb_wire_adapter::NtStatus::Other(0xC000_0184)); // STATUS_INVALID_DEVICE_STATE
+        };
+        // Allowed acked levels: 0x00 (None) or 0x01 (Level II) if target was 0x01.
+        if acked_level != 0x00 && !(target == 0x01 && acked_level == 0x01) {
+            return Err(rssmb_wire_adapter::NtStatus::InvalidParameter);
+        }
+        rec.level = acked_level;
+        rec.breaking_to = None;
+        let followup = if rec.pending_breaking_to.take() == Some(0x00) && rec.level == 0x01 {
+            // Level II -> None break does not require ACK; transition immediately and notify.
+            rec.level = 0x00;
+            Some(BreakNotification::Oplock {
+                notify_tx: rec.notify_tx.clone(),
+                smb_file_id: rec.smb_file_id,
+                new_oplock_level: 0x00,
+            })
+        } else {
+            None
+        };
+        let waiters = std::mem::take(&mut rec.break_waiters);
+        for tx in waiters {
+            let _ = tx.send(());
+        }
+        let open_id = rec.open_id;
+        if rec.level == 0x00 {
+            mgr.oplocks.remove(&open_id);
+        }
+        Ok((acked_level, followup))
+    }
+
+    /// Force-downgrade any breaking lease/oplock on `file_id` whose break timer expired.
+    pub async fn expire_breaks(&self, file_id: FileId) {
+        let mut mgr = self.leases.write().await;
+        for rec in mgr.leases.values_mut() {
+            if rec.file_id == file_id && rec.breaking {
+                rec.state = LeaseCaching::NONE;
+                rec.breaking = false;
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let mut to_remove = Vec::new();
+        for (oid, rec) in mgr.oplocks.iter_mut() {
+            if rec.file_id == file_id && rec.breaking_to.is_some() {
+                rec.level = 0;
+                rec.breaking_to = None;
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+                to_remove.push(*oid);
+            }
+        }
+        for oid in to_remove {
+            mgr.oplocks.remove(&oid);
+        }
+    }
+
+    /// Remove `open_id` from lease/oplock tracking on close.
+    pub async fn remove_open_from_leases(&self, open_id: OpenId) {
+        let mut mgr = self.leases.write().await;
+        if let Some(rec) = mgr.oplocks.remove(&open_id) {
+            for tx in rec.break_waiters {
+                let _ = tx.send(());
+            }
+        }
+        let mut empty_leases = Vec::new();
+        for (id, rec) in mgr.leases.iter_mut() {
+            if rec.handles.remove(&open_id) && rec.handles.is_empty() {
+                // If all handles under this lease are closed and it lacks Handle caching
+                // (or is breaking to a state without Handle caching), clear it.
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+                empty_leases.push(*id);
+            }
+        }
+        for id in empty_leases {
+            mgr.leases.remove(&id);
+        }
+    }
+
+    /// Look up the lease key and state associated with `open_id` (used for DH2Q/DH2C validation).
+    pub async fn lease_for_open(&self, open_id: OpenId) -> Option<([u8; 16], LeaseCaching)> {
+        let mgr = self.leases.read().await;
+        mgr.leases
+            .iter()
+            .find(|(_, rec)| rec.handles.contains(&open_id))
+            .map(|(id, rec)| (id.lease_key, rec.state))
     }
 }
 
@@ -1612,6 +2365,222 @@ mod tests {
             .check_range_lock(fid(1), oid(2), 0, 0)
             .await
             .expect("zero-length read never conflicts");
+    }
+
+    // ---- Lease & Oplock unit tests ----
+
+    #[tokio::test]
+    async fn lease_grant_r_rh_rw_and_same_key_upgrade() {
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client_guid = [1u8; 16];
+        let lease_key = [2u8; 16];
+
+        table
+            .check_and_add(fid(10), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+
+        // First open requests R -> granted R
+        let (grant1, breaks1) = table
+            .request_lease(
+                fid(10),
+                oid(1),
+                client_guid,
+                lease_key,
+                LeaseCaching::from_bits(0x01), // R
+                false,
+                None,
+                0,
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant1.state, LeaseCaching::from_bits(0x01));
+        assert!(breaks1.is_empty());
+
+        // Second open with same lease key requests RW (0x05) -> upgraded to RW without self-break
+        table
+            .check_and_add(fid(10), entry(2, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let (grant2, breaks2) = table
+            .request_lease(
+                fid(10),
+                oid(2),
+                client_guid,
+                lease_key,
+                LeaseCaching::from_bits(0x07), // RWH
+                true,
+                None,
+                1,
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant2.state, LeaseCaching::from_bits(0x07));
+        assert!(breaks2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_collision_different_file_rejected() {
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client_guid = [1u8; 16];
+        let lease_key = [9u8; 16];
+
+        table
+            .check_and_add(fid(1), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        table
+            .request_lease(
+                fid(1),
+                oid(1),
+                client_guid,
+                lease_key,
+                LeaseCaching::from_bits(0x01),
+                false,
+                None,
+                0,
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Same (client_guid, lease_key) on fid(2) must fail
+        table
+            .check_and_add(fid(2), entry(2, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let err = table
+            .request_lease(
+                fid(2),
+                oid(2),
+                client_guid,
+                lease_key,
+                LeaseCaching::from_bits(0x01),
+                false,
+                None,
+                0,
+                tx,
+            )
+            .await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn lease_break_and_ack_lifecycle() {
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client1 = [1u8; 16];
+        let key1 = [0xAAu8; 16];
+
+        table
+            .check_and_add(fid(5), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let (grant, _) = table
+            .request_lease(
+                fid(5),
+                oid(1),
+                client1,
+                key1,
+                LeaseCaching::from_bits(0x07), // RWH
+                true,
+                None,
+                1,
+                tx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.state, LeaseCaching::from_bits(0x07));
+
+        // Conflicting write from another handle triggers break to NONE with ack_required = true
+        let (breaks, mut waiters) = table
+            .break_for_op(fid(5), Some(oid(99)), ConflictOp::Write)
+            .await;
+        assert_eq!(breaks.len(), 1);
+        assert_eq!(waiters.len(), 1);
+        match &breaks[0] {
+            BreakNotification::Lease {
+                lease_key,
+                current_state,
+                new_state,
+                ack_required,
+                ..
+            } => {
+                assert_eq!(*lease_key, key1);
+                assert_eq!(*current_state, LeaseCaching::from_bits(0x07));
+                assert_eq!(*new_state, LeaseCaching::NONE);
+                assert!(*ack_required);
+            }
+            _ => panic!("expected lease break"),
+        }
+
+        // Invalid ACK (e.g. acknowledging R when break_to is NONE) is rejected
+        let bad_ack = table
+            .ack_lease_break(client1, key1, LeaseCaching::from_bits(0x01))
+            .await;
+        assert!(bad_ack.is_err());
+
+        // Valid ACK to NONE succeeds and wakes waiter
+        let (acked, followup) = table
+            .ack_lease_break(client1, key1, LeaseCaching::NONE)
+            .await
+            .unwrap();
+        assert_eq!(acked, LeaseCaching::NONE);
+        assert!(followup.is_none());
+        assert!(waiters.pop().unwrap().try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn lease_staged_break_escalation_emits_followup_break() {
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client1 = [1u8; 16];
+        let key1 = [0xBBu8; 16];
+
+        table
+            .check_and_add(fid(6), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        table
+            .request_lease(
+                fid(6),
+                oid(1),
+                client1,
+                key1,
+                LeaseCaching::from_bits(0x05), // RW
+                true,
+                None,
+                1,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        // 1. Another handle reads -> break RW -> R
+        let (breaks1, _waiters1) = table
+            .break_for_op(fid(6), Some(oid(2)), ConflictOp::Read)
+            .await;
+        assert_eq!(breaks1.len(), 1);
+
+        // 2. While RW -> R break is in flight, a Write arrives -> escalates pending target to NONE
+        let (breaks2, mut waiters2) = table
+            .break_for_op(fid(6), Some(oid(2)), ConflictOp::Write)
+            .await;
+        assert!(breaks2.is_empty());
+
+        // 3. Client acknowledges R (the originally advertised break target) -> accepted,
+        //    and since R -> NONE does not require ACK, follow-up notification is returned and waiters wake.
+        let (acked, followup) = table
+            .ack_lease_break(client1, key1, LeaseCaching::from_bits(0x01))
+            .await
+            .unwrap();
+        assert_eq!(acked, LeaseCaching::from_bits(0x01));
+        assert!(followup.is_some());
+        assert!(waiters2.pop().unwrap().try_recv().is_ok());
     }
 
     // ---- Property tests (Phase 6.4) ----
