@@ -5,6 +5,42 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.1.3] - 2026-10-18
+
+### Changed
+
+- **READ throughput: requests are dispatched concurrently.** Independent
+  READ and ECHO requests now run in per-request tasks (bounded by the credit
+  window), responses are encrypted in place, and full-size reads use
+  positional `pread` on pooled buffers — no per-handle lock across the disk
+  read and no per-read 1 MiB zeroed allocation. Measured (Linux CIFS 3.1.1,
+  sealed, 1 MiB, direct, iodepth 16): 391 → ~550 MiB/s; iodepth 4:
+  333 → ~889 MiB/s; unsealed iodepth 16: ~775 → ~1533 MiB/s. Compound
+  requests and related-operation chains stay strictly sequential; response
+  ordering is unchanged (out-of-order only for independent requests, which
+  MS-SMB2 permits). The read-path profile and flamegraphs live in
+  `tests/perf/`.
+
+### Fixed
+
+- **smbtorture nightly job failed every suite with
+  NT_STATUS_OBJECT_NAME_NOT_FOUND.** The harness passed an empty host into
+  the share UNC (environment variables were never exported to the job), and
+  `--option=torture:port` is ignored by smbtorture 4.19.5 — the suite always
+  dialed port 445. The harness now validates RSSMB_HOST/PORT/SHARE, uses the
+  real `-p/--smb-ports` flag, and records per-subtest results; a baseline
+  against 0.1.2 is committed at `tests/conformance/results.md`
+  (115 passing / 190 failing subtests, with names).
+
+### Documentation
+
+- Features and roadmap now match the smbtorture baseline; durable handles v2
+  and leases are marked partial with links to the conformance results, and
+  the README gains a "Conformance status" section (115/305, four largest
+  gaps listed).
+
 ## [0.1.2] - 2026-10-18
 
 ### Fixed
