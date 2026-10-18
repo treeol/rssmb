@@ -744,6 +744,165 @@ mod tests {
         );
     }
 
+    // --- Per-class layout tests against hand-built MS-FSCC byte vectors ---
+
+    /// Two entries with distinct per-field values so a field-order error
+    /// shows up as a byte mismatch. Names are 5 and 2 UTF-16 chars.
+    fn layout_entries() -> Vec<DirEntry> {
+        let mk = |name: &str, base: u64, ino: u64| DirEntry {
+            file_name: name.to_string(),
+            short_name: None,
+            attributes: rssmb_vfs::FileAttributes {
+                archive: true,
+                ..Default::default()
+            },
+            size: base + 5,
+            allocation_size: base + 6,
+            file_id: Some(VfsFileId { dev: 0, ino }),
+            creation_time: base + 1,
+            last_access_time: base + 2,
+            last_write_time: base + 3,
+            change_time: base + 4,
+        };
+        vec![mk("a.txt", 0x100, 0x77), mk("bc", 0x200, 0x88)]
+    }
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    /// Hand-encode one entry (without NextEntryOffset) per MS-FSCC §2.4.
+    fn expected_entry(class: u8, idx: u32, e: &DirEntry) -> Vec<u8> {
+        let name = utf16(&e.file_name);
+        let mut v = Vec::new();
+        v.extend_from_slice(&idx.to_le_bytes()); // FileIndex
+        if class == 12 {
+            // §2.4.33 FileNamesInformation
+            v.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            v.extend_from_slice(&name);
+            return v;
+        }
+        for t in [
+            e.creation_time,
+            e.last_access_time,
+            e.last_write_time,
+            e.change_time,
+            e.size,            // EndOfFile
+            e.allocation_size, // AllocationSize
+        ] {
+            v.extend_from_slice(&t.to_le_bytes());
+        }
+        v.extend_from_slice(&0x20u32.to_le_bytes()); // FILE_ATTRIBUTE_ARCHIVE
+        v.extend_from_slice(&(name.len() as u32).to_le_bytes()); // FileNameLength
+        match class {
+            1 => {}                                        // §2.4.10
+            2 => v.extend_from_slice(&0u32.to_le_bytes()), // §2.4.17 EaSize
+            3 | 37 => {
+                // §2.4.8 / §2.4.22: EaSize, ShortNameLength, Reserved, ShortName[24]
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.push(0);
+                v.push(0);
+                v.extend_from_slice(&[0u8; 24]);
+                if class == 37 {
+                    v.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
+                    v.extend_from_slice(&e.file_id.unwrap().ino.to_le_bytes()); // FileId
+                }
+            }
+            38 => {
+                // §2.4.24: EaSize, Reserved(4), FileId
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&e.file_id.unwrap().ino.to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+        v.extend_from_slice(&name);
+        v
+    }
+
+    /// Chain entries: NextEntryOffset = 8-byte-aligned distance to the
+    /// next entry, 0 on the last; padding is zero-filled.
+    fn expected_buffer(class: u8, entries: &[DirEntry]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let body = expected_entry(class, i as u32, e);
+            let last = i == entries.len() - 1;
+            let len = 4 + body.len();
+            let padded = if last { len } else { len.div_ceil(8) * 8 };
+            let next = if last { 0 } else { padded as u32 };
+            out.extend_from_slice(&next.to_le_bytes());
+            out.extend_from_slice(&body);
+            out.resize(out.len() + (padded - len), 0);
+        }
+        out
+    }
+
+    /// (class, offset of FileNameLength, offset of FileName) per MS-FSCC.
+    const DIR_CLASS_LAYOUT: [(u8, usize, usize); 6] = [
+        (1, 60, 64),
+        (2, 60, 68),
+        (3, 60, 94),
+        (12, 8, 12),
+        (37, 60, 104),
+        (38, 60, 80),
+    ];
+
+    #[test]
+    fn test_directory_buffer_layout_per_class() {
+        let entries = layout_entries();
+        for (class, name_len_off, name_off) in DIR_CLASS_LAYOUT {
+            let buf = build_directory_buffer(&entries, class)
+                .unwrap_or_else(|| panic!("class {class} unsupported"));
+            assert_eq!(buf, expected_buffer(class, &entries), "class {class} bytes");
+
+            // Explicit layout checks, independent of the helper above.
+            let first_len = name_off + 10; // "a.txt" = 10 bytes UTF-16
+            let next = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+            assert_eq!(
+                next,
+                first_len.div_ceil(8) * 8,
+                "class {class} NextEntryOffset"
+            );
+            assert_eq!(next % 8, 0, "class {class} entries must be 8-byte aligned");
+            let nl = u32::from_le_bytes(buf[name_len_off..name_len_off + 4].try_into().unwrap());
+            assert_eq!(nl, 10, "class {class} FileNameLength");
+            assert_eq!(
+                &buf[name_off..name_off + 10],
+                utf16("a.txt"),
+                "class {class} FileName"
+            );
+
+            let second = &buf[next..];
+            assert_eq!(
+                u32::from_le_bytes(second[0..4].try_into().unwrap()),
+                0,
+                "class {class} last NextEntryOffset"
+            );
+            let nl2 =
+                u32::from_le_bytes(second[name_len_off..name_len_off + 4].try_into().unwrap());
+            assert_eq!(nl2, 4, "class {class} second FileNameLength");
+            assert_eq!(
+                &second[name_off..],
+                utf16("bc"),
+                "class {class} second FileName"
+            );
+        }
+    }
+
+    /// Every protocol-level directory class must have an encoder, keyed
+    /// on the same numeric value.
+    #[test]
+    fn test_every_query_directory_class_has_encoder() {
+        let entries = layout_entries();
+        for class in rssmb_proto::query_dir::QueryDirectoryInfoClass::ALL {
+            assert!(
+                build_directory_buffer(&entries, class as u8).is_some(),
+                "{class:?} ({}) has no encoder",
+                class as u8
+            );
+        }
+    }
+
     #[test]
     fn test_directory_buffer_unknown_class() {
         let entries = vec![];

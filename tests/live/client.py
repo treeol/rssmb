@@ -8,6 +8,7 @@ Usage: client.py <scenario> [<scenario> ...]
   guestpriv   guest -> private must be denied
   signed      alice with client-side signing required
   rename      alice -> put/rename/get/delete (exercises SET_INFO rename)
+  dirclasses  alice -> QUERY_DIRECTORY with each MS-FSCC directory info class
   enum_guest  anonymous -> NetrShareEnum (level 1) via IPC$
   enum_user   alice -> NetrShareEnum + NetrShareGetInfo + NetrServerGetInfo
   bigwrite    alice 2.1 -> WRITE exactly MaxWriteSize OK; MaxWriteSize+1 rejected,
@@ -115,6 +116,73 @@ def scenario(name):
         assert get(c, "public", "upload.txt") == data
         c.deleteFile("public", "upload.txt")
         assert "upload.txt" not in ls(c, "public"), "delete did not take effect"
+        c.logoff()
+    elif name == "dirclasses":
+        # QUERY_DIRECTORY with every MS-FSCC §2.4 directory class; each
+        # response is decoded with impacket's own per-class parser, so a
+        # wrong class number or layout shows up as missing/garbled names.
+        from impacket import smb as smb1
+        from impacket.smb3structs import (FILE_DIRECTORY_INFORMATION, FILE_FULL_DIRECTORY_INFORMATION,
+                                          FILE_BOTH_DIRECTORY_INFORMATION, FILENAMES_INFORMATION,
+                                          FILEID_BOTH_DIRECTORY_INFORMATION,
+                                          FILEID_FULL_DIRECTORY_INFORMATION, FILE_READ_DATA,
+                                          FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_DIRECTORY_FILE,
+                                          FILE_OPEN, FILE_LIST_DIRECTORY)
+        classes = [
+            ("FileDirectoryInformation", FILE_DIRECTORY_INFORMATION, smb1.SMBFindFileDirectoryInfo),
+            ("FileFullDirectoryInformation", FILE_FULL_DIRECTORY_INFORMATION, smb1.SMBFindFileFullDirectoryInfo),
+            ("FileBothDirectoryInformation", FILE_BOTH_DIRECTORY_INFORMATION, smb1.SMBFindFileBothDirectoryInfo),
+            ("FileNamesInformation", FILENAMES_INFORMATION, smb1.SMBFindFileNamesInfo),
+            ("FileIdBothDirectoryInformation", FILEID_BOTH_DIRECTORY_INFORMATION, smb1.SMBFindFileIdBothDirectoryInfo),
+            ("FileIdFullDirectoryInformation", FILEID_FULL_DIRECTORY_INFORMATION, smb1.SMBFindFileIdFullDirectoryInfo),
+        ]
+        c = connect()
+        c.login("alice", "TestPass123")
+        smb = c._SMBConnection
+        payload = b"dirclasses\n"
+        c.putFile("public", "dirclass-probe.txt", io.BytesIO(payload).read)
+        tid = smb.connectTree("public")
+        expected = {".", "..", "README.txt", "dirclass-probe.txt"}
+        try:
+            for label, code, parser in classes:
+                fid = smb.create(tid, "", FILE_READ_DATA | FILE_LIST_DIRECTORY,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, FILE_OPEN, 0)
+                buf = smb.queryDirectory(tid, fid, "*", informationClass=code, maxBufferSize=65536)
+                smb.close(tid, fid)
+                names, sizes, off = set(), {}, 0
+                while True:
+                    e = parser(smb1.SMB.FLAGS2_UNICODE, data=buf[off:])
+                    n = e["FileName"].decode("utf-16le")
+                    names.add(n)
+                    if "EndOfFile" in e.fields:
+                        sizes[n] = e["EndOfFile"]
+                    if e["NextEntryOffset"] == 0:
+                        break
+                    assert e["NextEntryOffset"] % 8 == 0, f"{label}: unaligned NextEntryOffset"
+                    off += e["NextEntryOffset"]
+                assert expected <= names, f"{label} (0x{code:02x}): got {sorted(names)}"
+                if sizes:
+                    assert sizes.get("dirclass-probe.txt") == len(payload), \
+                        f"{label}: EndOfFile {sizes.get('dirclass-probe.txt')}"
+                print(f"  {label} (0x{code:02x}): {sorted(names)}")
+            # Non-directory classes: 14 = FilePositionInformation, 200 =
+            # undefined. MS-SMB2 3.3.5.18 -> STATUS_INVALID_INFO_CLASS.
+            from impacket.smb3 import SessionError
+            from impacket.nt_errors import STATUS_INVALID_INFO_CLASS
+            for code in (14, 200):
+                fid = smb.create(tid, "", FILE_READ_DATA | FILE_LIST_DIRECTORY,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, FILE_OPEN, 0)
+                try:
+                    smb.queryDirectory(tid, fid, "*", informationClass=code, maxBufferSize=65536)
+                    raise AssertionError(f"class {code} unexpectedly succeeded")
+                except SessionError as e:
+                    assert e.get_error_code() == STATUS_INVALID_INFO_CLASS, \
+                        f"class {code}: 0x{e.get_error_code():08x}"
+                    print(f"  class {code}: STATUS_INVALID_INFO_CLASS (expected)")
+                finally:
+                    smb.close(tid, fid)
+        finally:
+            c.deleteFile("public", "dirclass-probe.txt")
         c.logoff()
     elif name == "badpass":
         c = connect()
