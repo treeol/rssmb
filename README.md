@@ -261,6 +261,12 @@ tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privile
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
 ```
 
+`tests/live/mount.sh` is **not run in CI**: it mounts with the host kernel's
+`cifs` module from a `docker run --privileged` container, which GitHub-hosted
+runners don't offer reliably. Run it locally before releases. It is the only
+test that drives a real kernel client, including sealed (`seal`) 1 MiB
+O_DIRECT writes.
+
 ### CI
 
 Every push and PR runs:
