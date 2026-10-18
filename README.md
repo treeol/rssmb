@@ -63,8 +63,13 @@ minimal overhead and maximal security**.
 - NTLMv2 authentication via SPNEGO with AUTHENTICATE message MIC verification
 - `KEY_EXCH` session key derivation (ExportedSessionKey)
 - Large MTU (1 MiB) with multi-credit flow control
-- Durable handles v2 (DH2Q / DH2C) with reconnection
-- File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break handling
+- Durable handles v2 (DH2Q / DH2C) — **partial**: open-time flags accepted,
+  but durable *reconnect* does not survive the smbtorture suite; see
+  [tests/conformance/results.md](tests/conformance/results.md)
+- File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break
+  handling — **partial**: basic grant/upgrade paths work; break,
+  re-grant, and epoch semantics fail large parts of the lease suite; see
+  [tests/conformance/results.md](tests/conformance/results.md)
 - Multichannel (SMB 3.x): session binding across connections and
   `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
 - SMB over QUIC (SMB 3.1.1 over TLS 1.3, ALPN `smb`, UDP/443) — traverse
@@ -267,6 +272,20 @@ runners don't offer reliably. Run it locally before releases. It is the only
 test that drives a real kernel client, including sealed (`seal`) 1 MiB
 O_DIRECT writes.
 
+### Conformance status
+
+The recorded smbtorture 4.19.5 baseline against rssmb 0.1.2 stands at
+**115 passing / 190 failing** subtests (0 of 18 suites green) — see
+[tests/conformance/results.md](tests/conformance/results.md) for the
+per-subtest list. The four largest gaps:
+
+- durable handles v2 reconnect (0/15 — every `reopen` variant fails)
+- lease break / epoch state machine (3/36)
+- `FSCTL_SRV_COPYCHUNK` ioctl family (~23 subtests)
+- session reauth / reconnect and dialect-transition binding rules (22)
+
+The suite runs nightly in CI; regressions are visible in the workflow logs.
+
 ### CI
 
 Every push and PR runs:
@@ -311,7 +330,9 @@ be reused in other SMB tools.
 
 **Implemented (1.0 scope):**
 - ✅ SMB 2.1 – 3.1.1 with encryption, signing, and NTLMv2
-- ✅ Durable handles v2, byte-range locks, change notify
+- ✅ Durable handles v2 (partial — reconnect gaps, see
+  [tests/conformance/results.md](tests/conformance/results.md)), byte-range
+  locks, change notify
 - ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
 - ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 
