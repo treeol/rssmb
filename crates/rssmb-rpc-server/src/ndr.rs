@@ -292,11 +292,13 @@ pub fn encode_netr_share_enum_response(shares: &[ShareInfo], level: u32) -> Vec<
 pub fn encode_netr_share_get_info_response(share: Option<&ShareInfo>, level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
 
+    // MS-SRVS 3.1.4.10: [out, switch_is(Level)] LPSHARE_INFO InfoStruct.
+    // A non-encapsulated union parameter is marshalled as its discriminant
+    // followed by the arm — here a unique pointer to SHARE_INFO_1. There is
+    // no separate Level field in the reply (unlike SHARE_ENUM_STRUCT).
     if let Some(s) = share {
-        // SHARE_INFO_STRUCT: Level (u32) + SHARE_INFO_UNION {tag (u32), ptr (u32)}
-        w.write_u32(level); // Level (switch_is)
-        w.write_u32(level); // Union tag (discriminant)
-        let info_ptr = w.write_unique_ptr(true); // union ptr
+        w.write_u32(level); // union discriminant
+        let info_ptr = w.write_unique_ptr(true); // arm: LPSHARE_INFO_1
         if info_ptr != 0 {
             // SHARE_INFO_1: fixed part, then netname and remark (always
             // present; empty comment = "").
@@ -305,9 +307,8 @@ pub fn encode_netr_share_get_info_response(share: Option<&ShareInfo>, level: u32
         // WERROR
         w.write_u32(WERR_SUCCESS);
     } else {
-        // No share found — null union pointer.
+        // No share found — discriminant + NULL arm pointer.
         w.write_u32(level);
-        w.write_u32(level); // tag
         w.write_unique_ptr(false);
         w.write_u32(WERR_NERR_NETNAMENOTFOUND);
     }
@@ -388,9 +389,10 @@ pub fn parse_netr_share_get_info_request(stub: &[u8]) -> Option<(u32, String)> {
     if server_present {
         r.skip_wstr_conformant()?;
     }
-    // NetName: reference pointer (always present) to conformant wstr
-    let _netname_ptr = r.read_u32()?; // reference pointer (always non-null)
-                                      // Read the conformant wstr (max_count, offset, actual_count, chars...)
+    // NetName: `[in, string] WCHAR*` — a top-level [ref] pointer, which has
+    // no wire representation (C706 §14.3.11.1): the conformant varying
+    // string (max_count, offset, actual_count, chars) follows directly.
+    r.align(4);
     let max_count = r.read_u32()?;
     let _offset = r.read_u32()?;
     let actual_count = r.read_u32()?;
@@ -566,20 +568,40 @@ mod tests {
 
     #[test]
     fn parse_get_info_request() {
-        // Build a minimal NetrShareGetInfo request stub.
-        let mut w = NdrWriter::new();
-        // ServerName: unique ptr + conformant wstr
-        w.write_unique_ptr(true);
-        w.write_wstr_conformant("\\rssmb");
-        // NetName: reference ptr (always 1) + conformant wstr "public\0"
-        w.write_u32(1); // reference pointer
-        w.write_wstr_conformant("public");
-        // Level (u32)
-        w.write_u32(1);
+        // Exact stubs sent by impacket's NetrShareGetInfo (hNetrShareGetInfo)
+        // for NetName "public", Level 1. NetName is a top-level [ref]
+        // pointer, so it has no referent ID on the wire — the conformant
+        // string follows ServerName directly (C706 §14.3.11.1).
+        #[rustfmt::skip]
+        let null_server: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00,                         // ServerName: NULL
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max=7 off=0
+            0x07, 0x00, 0x00, 0x00,                         // actual=7
+            b'p', 0, b'u', 0, b'b', 0, b'l', 0, b'i', 0, b'c', 0, 0, 0,
+            0xbf, 0xbf,                                     // pad to 4
+            0x01, 0x00, 0x00, 0x00,                         // Level
+        ];
+        assert_eq!(
+            parse_netr_share_get_info_request(null_server),
+            Some((1, "public".to_string()))
+        );
 
-        let (level, name) = parse_netr_share_get_info_request(&w.into_vec()).unwrap();
-        assert_eq!(level, 1);
-        assert_eq!(name, "public");
+        #[rustfmt::skip]
+        let empty_server: &[u8] = &[
+            0xd8, 0x0d, 0x00, 0x00,                         // ServerName: referent
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max=1 off=0
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00,             // actual=1, "\0"
+            0xab, 0xab,                                     // pad to 4
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // NetName max=7 off=0
+            0x07, 0x00, 0x00, 0x00,                         // actual=7
+            b'p', 0, b'u', 0, b'b', 0, b'l', 0, b'i', 0, b'c', 0, 0, 0,
+            0xbf, 0xbf,
+            0x01, 0x00, 0x00, 0x00,                         // Level
+        ];
+        assert_eq!(
+            parse_netr_share_get_info_request(empty_server),
+            Some((1, "public".to_string()))
+        );
     }
 
     #[test]
@@ -840,18 +862,12 @@ mod tests {
         assert_eq!(w.write_unique_ptr(true), 0x0002_0008);
     }
 
-    /// NetrShareGetInfo level 1 SHARE_INFO_1 body, against Samba 4.17.12
-    /// for public "Pub", with Samba's referent IDs (0x00020004, +4) shifted
-    /// to start at 0x00020000.
-    ///
-    /// KNOWN DIVERGENCE (pre-existing, out of scope for this fix): Samba's
-    /// reply starts with the union discriminant only (`01 00 00 00`, then
-    /// the info pointer). rssmb writes Level *and* the discriminant, i.e.
-    /// one extra u32 before the pointer, so its NetrShareGetInfo reply does
-    /// not match MS-SRVS 3.1.4.10. This test compares from rssmb offset 4
-    /// (its discriminant) to pin the SHARE_INFO_1 body this change touches.
+    /// NetrShareGetInfo level 1 reply, against Samba 4.17.12 for public
+    /// "Pub": discriminant + LPSHARE_INFO_1 arm + WERROR (MS-SRVS 3.1.4.10),
+    /// no separate Level field. Samba's referent IDs (0x00020004, +4) are
+    /// shifted to rssmb's 0x00020000 start; nothing else is normalized.
     #[test]
-    fn netr_share_get_info_body_matches_samba_layout() {
+    fn netr_share_get_info_matches_samba_layout() {
         #[rustfmt::skip]
         let expected: Vec<u8> = [
             "01 00 00 00 00 00 02 00 04 00 02 00 00 00 00 00",
@@ -871,7 +887,7 @@ mod tests {
             encrypt_data: false,
         };
         let data = encode_netr_share_get_info_response(Some(&share), 1);
-        assert_eq!(&data[4..], &expected[..]);
+        assert_eq!(data, expected);
     }
 
     #[test]
@@ -884,8 +900,7 @@ mod tests {
         };
         let data = encode_netr_share_get_info_response(Some(&share), 1);
         let mut r = NdrReader::new(&data);
-        r.read_u32().unwrap(); // level
-        r.read_u32().unwrap(); // switch
+        assert_eq!(r.read_u32().unwrap(), 1); // discriminant
         assert!(r.read_unique_ptr().unwrap()); // info
         assert!(r.read_unique_ptr().unwrap()); // netname
         assert_eq!(r.read_u32().unwrap(), STYPE_IPC_SPECIAL);
@@ -907,11 +922,17 @@ mod tests {
             encrypt_data: false,
         };
         let data = encode_netr_share_get_info_response(Some(&share), 1);
-        // Level + tag + union_ptr(non-null) + netname_ptr(non-null) + type + remark_ptr(non-null)
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
-        assert_ne!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // UnionPtr
-                                                                            // WERROR at the end
+        // Discriminant + arm ptr(non-null) + netname_ptr + type + remark_ptr
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // discriminant
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            FIRST_REFERENT_ID
+        ); // arm ptr
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            FIRST_REFERENT_ID + 4
+        ); // shi1_netname ptr
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 0); // shi1_type
         let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         assert_eq!(werr, WERR_SUCCESS);
     }
@@ -919,12 +940,16 @@ mod tests {
     #[test]
     fn netr_share_get_info_golden_bytes_not_found() {
         let data = encode_netr_share_get_info_response(None, 1);
-        // Level + tag + null_ptr + WERROR
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // null union ptr
-        let werr = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(werr, WERR_NERR_NETNAMENOTFOUND);
+        // Discriminant + NULL arm pointer + WERROR — exactly 12 bytes.
+        assert_eq!(
+            data,
+            [
+                1u32.to_le_bytes(),
+                0u32.to_le_bytes(),
+                WERR_NERR_NETNAMENOTFOUND.to_le_bytes()
+            ]
+            .concat()
+        );
     }
 
     // --- Golden-byte fixture: NetrServerGetInfo (opnum 21, level 100) ---

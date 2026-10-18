@@ -15,6 +15,7 @@ Usage: client.py <scenario> [<scenario> ...]
               connection stays open
   bigwrite_311  same over SMB 3.1.1 (unsealed: impacket has no AES-GCM)
   share_comments  alice -> NetrShareEnum (name, type, remark) triples match config
+  share_get_info  alice -> NetrShareGetInfo(public) == (public, Pub, 0); unknown share fails
 """
 import io
 import os
@@ -68,17 +69,21 @@ def rpc_enum_shares(username, password, level=1):
 
 
 def rpc_share_get_info(username, password, netname, level=1):
-    """Use DCE/RPC over IPC$ to call NetrShareGetInfo via SMBConnection."""
+    """DCE/RPC over \\pipe\\srvsvc (IPC$): NetrShareGetInfo via impacket."""
     from impacket.smbconnection import SMBConnection
+    from impacket.dcerpc.v5 import transport, srvs
     c = SMBConnection(HOST, HOST, sess_port=PORT,
                       preferredDialect=smb3structs.SMB2_DIALECT_21, timeout=10)
     c.login(username, password)
-    from impacket.dcerpc.v5 import srvs
-    dce = c._SMBConnection.getDCE()
-    dce.bind(srvs.MSRPC_UUID_SRVSVC)
-    resp = srvs.hNetrShareGetInfo(dce, f'\\\\{HOST}', netname, level)
-    c.logoff()
-    return resp
+    t = transport.SMBTransport(HOST, PORT, r'\srvsvc', smb_connection=c)
+    dce = t.get_dce_rpc()
+    dce.connect()
+    try:
+        dce.bind(srvs.MSRPC_UUID_SRVS)
+        return srvs.hNetrShareGetInfo(dce, netname, level)
+    finally:
+        dce.disconnect()
+        c.logoff()
 
 
 def rpc_server_get_info(username, password, level=100):
@@ -299,6 +304,22 @@ def scenario(name):
             ("private", 0, "Priv"),
             ("IPC$", 0x80000003, ""),
         ]), pairs
+    elif name == "share_get_info":
+        # NetrShareGetInfo level 1 (MS-SRVS 3.1.4.10), decoded by impacket's
+        # hNetrShareGetInfo: (name, remark, type) for "public" must match
+        # the config; an unknown share must fail with NERR_NetNameNotFound.
+        r = rpc_share_get_info("alice", "TestPass123", "public\x00")
+        info = r['InfoStruct']['ShareInfo1']
+        got = (info['shi1_netname'][:-1], info['shi1_remark'][:-1], info['shi1_type'])
+        print(f"  NetrShareGetInfo(public): {got}")
+        assert got == ("public", "Pub", 0), got
+        from impacket.dcerpc.v5.rpcrt import DCERPCException
+        try:
+            rpc_share_get_info("alice", "TestPass123", "nosuchshare\x00")
+            raise AssertionError("NetrShareGetInfo(nosuchshare) unexpectedly succeeded")
+        except DCERPCException as e:
+            assert e.get_error_code() == 2310, hex(e.get_error_code())  # NERR_NetNameNotFound
+            print("  NetrShareGetInfo(nosuchshare): NERR_NetNameNotFound (expected)")
     elif name == "encrypted":
         # SMB 3.1.1 with encryption = "desired": negotiate 3.1.1 and
         # check that the session works (encryption is accepted if the
