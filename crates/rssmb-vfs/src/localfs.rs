@@ -22,10 +22,55 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::*;
+
+/// Maximum pooled read-buffer size (matches the largest READ the server
+/// advertises; see `rssmb_server::limits::MAX_IO_SIZE`).
+const MAX_READ_BUFFER: usize = 1024 * 1024;
+
+/// Pool of reusable read buffers.
+///
+/// The old path allocated a zeroed 1 MiB `vec![0u8; len]` per READ; the
+/// kernel then faulted in and zeroed 256 pages on every request (~40% of
+/// all cycles in the read-path profile — see tests/perf/). Here each
+/// buffer is allocated and zeroed once, then reused. Buffers are capped
+/// at `MAX_READ_BUFFER`; smaller reads borrow the head of a max-size
+/// buffer so the pool stays homogeneous.
+///
+/// A read takes a buffer out of the pool (`Mutex<Vec<Vec<u8>>>`), preads
+/// into `buf[..len]`, copies the read range into a `Bytes` for the
+/// response, and returns the buffer. Under concurrency the pool is
+/// briefly locked per take/put only; the pread itself holds no lock.
+static READ_POOL: Mutex<Vec<Vec<u8>>> = Mutex::const_new(Vec::new());
+
+/// Take a buffer from the pool, or allocate a fresh one.
+async fn take_read_buffer() -> Vec<u8> {
+    READ_POOL
+        .lock()
+        .await
+        .pop()
+        .unwrap_or_else(|| vec![0u8; MAX_READ_BUFFER])
+}
+
+/// Return a buffer to the pool, truncating back to max size. Bounded to
+/// 64 entries (one per plausible concurrent read at max credits) so a
+/// burst cannot pin unbounded memory.
+async fn return_read_buffer(mut buf: Vec<u8>) {
+    if buf.capacity() > MAX_READ_BUFFER {
+        // Grown beyond the cap (shouldn't happen — reads never exceed
+        // max_io_size); drop the oversized allocation instead of pooling.
+        return;
+    }
+    let mut pool = READ_POOL.lock().await;
+    if pool.len() < 64 {
+        buf.clear();
+        buf.resize(MAX_READ_BUFFER, 0);
+        pool.push(buf);
+    }
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -88,6 +133,11 @@ fn file_id_from_metadata(_meta: &std::fs::Metadata) -> FileId {
 struct FileHandle {
     /// The async file handle (fd obtained from cap-std's confined open).
     file: TokioFile,
+    /// A dup'd `std::fs::File` of the same open, for positional
+    /// (`pread`-style) reads via `spawn_blocking`. `pread` does not touch
+    /// the file offset, so concurrent reads on the same open need no
+    /// per-handle lock.
+    pread_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     /// Relative path from the share root (for Dir-based operations).
     rel_path: PathBuf,
     /// The last path component (file name) for reporting.
@@ -492,6 +542,18 @@ impl Vfs for LocalFs {
 
         // Convert to tokio for async I/O. The fd was obtained from a
         // confined open; the tokio File wraps the same fd.
+        // Duplicate the fd first for positional reads: `try_clone` dups
+        // (the original stays with the tokio File), and pread on the dup
+        // never touches the tokio File's offset, so concurrent reads on
+        // the same open need no per-handle lock. Directories never pread.
+        let pread_file = if target_is_dir {
+            None
+        } else {
+            let dup = cap_file
+                .try_clone()
+                .map_err(|e| VfsError::from_io("dup fd for pread", e))?;
+            Some(Arc::new(std::sync::Mutex::new(dup.into_std())))
+        };
         let file = TokioFile::from_std(cap_file.into_std());
 
         let file_name = Self::file_name_from_rel(&effective_rel);
@@ -502,6 +564,7 @@ impl Vfs for LocalFs {
             open_id,
             Arc::new(Mutex::new(FileHandle {
                 file,
+                pread_file,
                 rel_path: effective_rel,
                 file_name,
                 is_directory: target_is_dir,
@@ -516,23 +579,62 @@ impl Vfs for LocalFs {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
         };
-        let mut handle = handle.lock().await;
-        if handle.is_directory {
+        if handle.lock().await.is_directory {
             return Err(VfsError::IsDirectory);
         }
-        handle
-            .file
-            .seek(std::io::SeekFrom::Start(offset))
+        // Positional read on the dup'd fd via the blocking pool: no shared
+        // file offset, no per-handle lock held across the disk read, and
+        // the tokio worker is not blocked. The buffer comes from the
+        // READ_POOL (zeroed once, reused — see pool docs). The std Mutex
+        // on the fd is only taken to clone the Arc'd file out; the pread
+        // itself runs lock-free (pread is positional).
+        let std_file: std::sync::Arc<std::sync::Mutex<std::fs::File>> = {
+            let guard = handle.lock().await;
+            match guard.pread_file.as_ref() {
+                Some(f) => f.clone(),
+                None => return Err(VfsError::IsDirectory),
+            }
+        };
+        let mut buf = take_read_buffer().await;
+        let read_len = len as usize;
+        let (read, buf) = {
+            let mut buf = std::mem::take(&mut buf);
+            let res = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
+                // pread is positional: no shared file offset, so no lock is
+                // needed across the disk read. The std Mutex on the fd is
+                // not taken here at all. The buffer travels with the
+                // result so it can be returned to the pool afterwards.
+                let read = {
+                    let f = std_file.lock().unwrap();
+                    let slice = &mut buf[..read_len];
+                    match f.read_exact_at(slice, offset) {
+                        Ok(()) => Ok(read_len),
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            // Partial read at EOF: read_exact_at gives no
+                            // count on short read; a single positional read
+                            // returns the available byte count instead.
+                            f.read_at(&mut buf[..read_len], offset)
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                (read, buf)
+            })
             .await
-            .map_err(|e| VfsError::from_io("seek", e))?;
-        let mut buf = vec![0u8; len as usize];
-        let n = handle
-            .file
-            .read(&mut buf)
-            .await
-            .map_err(|e| VfsError::from_io("read", e))?;
-        buf.truncate(n);
-        Ok(Bytes::from(buf))
+            .map_err(|e| VfsError::from_io("pread join", e.into()))?;
+            let (read, buf) = match res {
+                (Ok(n), buf) => (n, buf),
+                (Err(e), buf) => {
+                    return_read_buffer(buf).await;
+                    return Err(VfsError::from_io("pread", e));
+                }
+            };
+            (read, buf)
+        };
+        let data = Bytes::copy_from_slice(&buf[..read]);
+        return_read_buffer(buf).await;
+        Ok(data)
     }
 
     async fn write_at(&self, open: OpenId, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
