@@ -14,7 +14,6 @@
 const SPNEGO_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
 /// NTLMSSP OID: 1.3.6.1.4.1.311.2.2.10
-#[allow(dead_code)]
 const NTLMSSP_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
 /// NTLMSSP signature: "NTLMSSP\0"
@@ -308,27 +307,32 @@ pub fn parse_authenticate(token: &[u8]) -> Option<AuthenticateSummary> {
 // ---------------------------------------------------------------------------
 // SPNEGO response wrapping
 
-/// Wrap an NTLMSSP response token in a SPNEGO negTokenResp.
+/// Wrap an NTLMSSP CHALLENGE token in the acceptor's first SPNEGO
+/// negTokenResp.
 ///
-/// This is a minimal SPNEGO negTokenResp wrapper:
+/// RFC 4178 §4.2.2 requires the acceptor's first negTokenResp to carry
+/// both `negState` and `supportedMech`. Strict initiators (go-smb2 /
+/// rclone, Windows) reject the response if `supportedMech` is absent.
+///
+/// Structure (DER SEQUENCE order is mandatory):
 /// ```text
-/// SEQUENCE {
-///   [1] negTokenResp {
-///     [2] responseToken (OCTET STRING)
+/// A1 {                                  -- [1] negTokenResp
+///   30 {                                -- SEQUENCE
+///     A0 { 0A 01 01 }                   -- [0] negState = accept-incomplete (1)
+///     A1 { 06 <NTLMSSP OID> }           -- [1] supportedMech = 1.3.6.1.4.1.311.2.2.10
+///     A2 { 04 <ntlm_token> }            -- [2] responseToken
 ///   }
 /// }
 /// ```
 pub fn wrap_ntlm_response(ntlm_token: &[u8]) -> Vec<u8> {
-    // Minimal SPNEGO negTokenResp:
-    // 0xA1 (CONTEXT [1] CONSTRUCTED) + length
-    //   0x30 (SEQUENCE) + length
-    //     0xA2 (CONTEXT [2] CONSTRUCTED) + length
-    //       0x04 (OCTET STRING) + length + token
+    // [0] negState = accept-incomplete (ENUMERATED 1)
+    let mut inner = der_tlv(0xA0, &der_tlv(0x0A, &[0x01]));
+    // [1] supportedMech = NTLMSSP OID
+    inner.extend_from_slice(&der_tlv(0xA1, &der_tlv(0x06, NTLMSSP_OID)));
+    // [2] responseToken
+    inner.extend_from_slice(&der_tlv(0xA2, &der_tlv(0x04, ntlm_token)));
 
-    let inner_octet = der_tlv(0x04, ntlm_token);
-    let ctx2 = der_tlv(0xA2, &inner_octet);
-    let seq = der_tlv(0x30, &ctx2);
-
+    let seq = der_tlv(0x30, &inner);
     der_tlv(0xA1, &seq)
 }
 
@@ -675,6 +679,56 @@ mod tests {
         let wrapped = wrap_ntlm_response(ntlm);
         assert_eq!(wrapped[0], 0xA1);
         assert!(find_subslice(&wrapped, ntlm).is_some());
+    }
+
+    #[test]
+    fn test_wrap_ntlm_response_first_leg_has_neg_state_and_supported_mech() {
+        let ntlm = b"NTLMSSP\0\x02\x00\x00\x00challenge-body";
+        let wrapped = wrap_ntlm_response(ntlm);
+
+        // [1] negTokenResp — nothing after it
+        let (resp, rest) = der_expect(&wrapped, 0xA1).expect("outer [1]");
+        assert!(rest.is_empty(), "trailing bytes after negTokenResp");
+        // SEQUENCE — nothing after it
+        let (seq, rest) = der_expect(resp, 0x30).expect("SEQUENCE");
+        assert!(rest.is_empty(), "trailing bytes after SEQUENCE");
+
+        // [0] negState = accept-incomplete
+        let (tag, ctx0, seq) = der_tlv_split(seq).expect("[0]");
+        assert_eq!(tag, 0xA0);
+        let (enum_content, rest) = der_expect(ctx0, 0x0A).expect("ENUMERATED");
+        assert_eq!(enum_content, &[0x01]);
+        assert!(rest.is_empty());
+
+        // [1] supportedMech = NTLMSSP OID
+        let (tag, ctx1, seq) = der_tlv_split(seq).expect("[1]");
+        assert_eq!(tag, 0xA1);
+        let (oid, rest) = der_expect(ctx1, 0x06).expect("OID");
+        assert_eq!(oid, NTLMSSP_OID);
+        assert!(rest.is_empty());
+
+        // [2] responseToken = input token
+        let (tag, ctx2, seq) = der_tlv_split(seq).expect("[2]");
+        assert_eq!(tag, 0xA2);
+        let (token, rest) = der_octet_string(ctx2).expect("OCTET STRING");
+        assert_eq!(token, ntlm);
+        assert!(rest.is_empty());
+
+        assert!(seq.is_empty(), "unexpected elements after [2]");
+    }
+
+    #[test]
+    fn test_wrap_ntlm_response_roundtrips_through_extract() {
+        let ntlm = b"NTLMSSP\0\x02\x00\x00\x00challenge-body";
+        let wrapped = wrap_ntlm_response(ntlm);
+        assert_eq!(extract_from_neg_token_resp(&wrapped).unwrap(), ntlm);
+        assert_eq!(extract_ntlm_token(&wrapped).unwrap(), ntlm);
+
+        // Long token (> 255 bytes) exercises the 0x82 length form.
+        let mut long = b"NTLMSSP\0\x02\x00\x00\x00".to_vec();
+        long.extend(std::iter::repeat_n(0x5Au8, 400));
+        let wrapped = wrap_ntlm_response(&long);
+        assert_eq!(extract_ntlm_token(&wrapped).unwrap(), long);
     }
 
     #[test]

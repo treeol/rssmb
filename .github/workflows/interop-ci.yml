@@ -87,6 +87,37 @@ jobs:
         if: always()
         run: kill "$(cat /tmp/rssmb.pid)" 2>/dev/null || true
 
+  # Job 3b: rclone (go-smb2) interop (always on push/PR, nightly too).
+  # go-smb2 is a strict SPNEGO initiator; it must gate PRs because every
+  # other PR-gating client tolerates RFC 4178 deviations.
+  rclone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build server
+        run: cargo build --bin rssmb
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+      - name: Start server
+        run: |
+          rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private
+          echo "hello from rssmb" > /tmp/rssmb-live/public/README.txt
+          echo "secret" > /tmp/rssmb-live/private/s.txt
+          ./target/debug/rssmb --config tests/live/rssmb-live-encrypted.toml &
+          echo $! > /tmp/rssmb.pid
+          sleep 1
+      - name: Run rclone interop
+        run: tests/live/rclone.sh
+      - name: Stop server
+        if: always()
+        run: kill "$(cat /tmp/rssmb.pid)" 2>/dev/null || true
+
   # Job 4: smbtorture baseline (nightly only — too slow for PR gating).
   smbtorture:
     if: github.event_name == 'schedule'
