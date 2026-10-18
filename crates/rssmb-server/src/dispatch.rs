@@ -3678,6 +3678,10 @@ async fn handle_read(
             if data.is_empty() {
                 return error_response_for(Command::Read, NtStatus::EndOfFile, &req.header);
             }
+            // `data` is a Bytes over the pooled read buffer; `to_vec` here
+            // would copy the payload a second time. Into the response we
+            // move the Bytes itself (the wire encoder copies it exactly
+            // once, into the outgoing frame).
             let read_response = rssmb_proto::file::ReadResponse {
                 buffer: data.to_vec(),
             };

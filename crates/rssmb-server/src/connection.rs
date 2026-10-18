@@ -848,6 +848,52 @@ impl Connection {
             // dispatch); replies to anything else (SMB1 negotiate, encrypted,
             // compressed) must not grant any, or the ledgers diverge.
             let ledgered = matches!(framed, FramedMessage::Plain(_) | FramedMessage::Compound(_));
+
+            // Concurrent dispatch (perf): independent READ and ECHO requests
+            // are handled in their own tasks so multiple cores can serve one
+            // connection while the socket keeps being read. MS-SMB2 permits
+            // responses in any order; the client matches by MessageId.
+            // Everything else — negotiate, session setup, compounds, state-
+            // coupled ops — stays strictly sequential, so related-operation
+            // ordering is preserved (compounds never take this path).
+            let spawnable = match &framed {
+                FramedMessage::Plain(req) => {
+                    matches!(req.header.command, Command::Read | Command::Echo)
+                }
+                _ => false,
+            };
+
+            if spawnable {
+                let state = state.clone();
+                let conn_state = conn_state.clone();
+                tokio::spawn(async move {
+                    let response =
+                        handle_message(&state, &conn_state, framed, &payload, was_encrypted).await;
+                    if matches!(response, Some(FramedResponse::Disconnect)) {
+                        warn!(
+                            conn_id = conn_state.conn_id,
+                            "spawned request violated the credit window"
+                        );
+                        return;
+                    }
+                    if let Err(e) = Self::finish_response(
+                        &state,
+                        &conn_state,
+                        response,
+                        ledgered,
+                        &client_signed,
+                        was_encrypted,
+                        true,
+                    )
+                    .await
+                    {
+                        debug!(conn_id = conn_state.conn_id, error = %e,
+                            "spawned response finish failed");
+                    }
+                });
+                continue;
+            }
+
             let response = handle_message(state, conn_state, framed, &payload, was_encrypted).await;
 
             // A fatal protocol violation: no reply, no credit grant, end the
@@ -859,287 +905,325 @@ impl Connection {
                 ));
             }
 
-            if let Some(mut resp) = response {
-                // Grant credits and write the actual grant into the response
-                // header's credit_request field. The client uses this to track
-                // its available credits; if we don't write it, the client and
-                // server disagree on the credit balance.
-                let requested = match &resp {
-                    FramedResponse::Plain(p) => p.header.credit_request,
-                    FramedResponse::Compound(ps) => {
-                        ps.last().map(|p| p.header.credit_request).unwrap_or(1)
-                    }
-                    _ => 1,
-                };
-                let granted = if ledgered {
-                    conn_state.credits.grant(requested.max(1) as u32)
-                } else {
-                    0
-                };
+            Self::finish_response(
+                state,
+                conn_state,
+                response,
+                ledgered,
+                &client_signed,
+                was_encrypted,
+                false,
+            )
+            .await?;
+        }
+    }
 
-                // Write the granted amount into every response header.
-                match &mut resp {
-                    FramedResponse::Plain(p) => {
-                        p.header.credit_request = granted as u16;
-                    }
-                    FramedResponse::Compound(ps) => {
-                        // Grant credits only on the last response in the chain;
-                        // intermediate responses get 0 (MS-SMB2 3.2.4.1.3).
-                        if let Some(last) = ps.last_mut() {
-                            last.header.credit_request = granted as u16;
-                        }
-                        for p in ps.iter_mut().rev().skip(1) {
-                            p.header.credit_request = 0;
-                        }
-                    }
-                    _ => {}
+    /// Post-process a dispatched response: grant credits into the header,
+    /// sign, hash preauth, encrypt, and enqueue on the write channel.
+    /// Extracted from the read loop so the spawned-request path (concurrent
+    /// dispatch) shares it verbatim. `from_spawn` marks responses produced
+    /// by a spawned request task: those must not terminate the read loop
+    /// (it has already moved on), so errors are reported to the caller,
+    /// which only logs them.
+    async fn finish_response(
+        state: &Arc<ServerState>,
+        conn_state: &ConnState,
+        response: Option<FramedResponse>,
+        ledgered: bool,
+        client_signed: &[bool],
+        was_encrypted: Option<u64>,
+        from_spawn: bool,
+    ) -> std::io::Result<()> {
+        let mut resp = match response {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let _ = from_spawn; // behavior identical; only the caller's error
+                            // handling differs (logged, not fatal)
+        {
+            // Grant credits and write the actual grant into the response
+            // header's credit_request field. The client uses this to track
+            // its available credits; if we don't write it, the client and
+            // server disagree on the credit balance.
+            let requested = match &resp {
+                FramedResponse::Plain(p) => p.header.credit_request,
+                FramedResponse::Compound(ps) => {
+                    ps.last().map(|p| p.header.credit_request).unwrap_or(1)
                 }
+                _ => 1,
+            };
+            let granted = if ledgered {
+                conn_state.credits.grant(requested.max(1) as u32)
+            } else {
+                0
+            };
 
-                let mut encoded = encode_response(&resp).to_vec();
-                if encoded.is_empty() {
-                    // Nothing can be sent, and the grant above would then
-                    // exist only on our side. End the connection instead of
-                    // letting the ledgers diverge.
-                    warn!(
-                        conn_id = conn_state.conn_id,
-                        "encode_response returned empty — terminating connection"
-                    );
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "response encoding failed",
-                    ));
+            // Write the granted amount into every response header.
+            match &mut resp {
+                FramedResponse::Plain(p) => {
+                    p.header.credit_request = granted as u16;
                 }
-                // Error replies are pre-built with CreditResponse = 1. Write
-                // the amount actually granted into the last message of the
-                // frame (earlier compound members already carry 0), so the
-                // client never counts a credit the server did not grant.
-                if let FramedResponse::Error { .. } = resp {
-                    set_last_credit_response(&mut encoded, granted as u16);
+                FramedResponse::Compound(ps) => {
+                    // Grant credits only on the last response in the chain;
+                    // intermediate responses get 0 (MS-SMB2 3.2.4.1.3).
+                    if let Some(last) = ps.last_mut() {
+                        last.header.credit_request = granted as u16;
+                    }
+                    for p in ps.iter_mut().rev().skip(1) {
+                        p.header.credit_request = 0;
+                    }
                 }
-                signing::sign_response_frame(
-                    &mut encoded,
-                    &client_signed,
-                    |sid| conn_state.signing_ref().read().unwrap().get(&sid).cloned(),
-                    |sid| {
-                        if let Some(st) = conn_state.signing_ref().write().unwrap().get_mut(&sid) {
-                            st.force_sign_once = false;
-                        }
-                    },
+                _ => {}
+            }
+
+            let mut encoded = encode_response(&resp).to_vec();
+            if encoded.is_empty() {
+                // Nothing can be sent, and the grant above would then
+                // exist only on our side. End the connection instead of
+                // letting the ledgers diverge.
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    "encode_response returned empty — terminating connection"
                 );
-                // SMB 3.1.1 preauth hash: hash the encoded+signed response
-                // into the connection or session hash. The handler set
-                // preauth_hash_response to indicate which target.
-                // The response bytes are encoded[4..] (no NetBIOS header).
-                if let Some(target) = conn_state.preauth_hash_response.lock().unwrap().take() {
-                    if encoded.len() > 4 {
-                        let msg_bytes = &encoded[4..];
-                        use crate::dispatch::PreauthTarget;
-                        match target {
-                            PreauthTarget::Conn => {
-                                if let Some(h) = conn_state.preauth_conn.lock().unwrap().as_mut() {
-                                    *h = crate::crypto::preauth_update(h, msg_bytes);
-                                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "response encoding failed",
+                ));
+            }
+            // Error replies are pre-built with CreditResponse = 1. Write
+            // the amount actually granted into the last message of the
+            // frame (earlier compound members already carry 0), so the
+            // client never counts a credit the server did not grant.
+            if let FramedResponse::Error { .. } = resp {
+                set_last_credit_response(&mut encoded, granted as u16);
+            }
+            signing::sign_response_frame(
+                &mut encoded,
+                client_signed,
+                |sid| conn_state.signing_ref().read().unwrap().get(&sid).cloned(),
+                |sid| {
+                    if let Some(st) = conn_state.signing_ref().write().unwrap().get_mut(&sid) {
+                        st.force_sign_once = false;
+                    }
+                },
+            );
+            // SMB 3.1.1 preauth hash: hash the encoded+signed response
+            // into the connection or session hash. The handler set
+            // preauth_hash_response to indicate which target.
+            // The response bytes are encoded[4..] (no NetBIOS header).
+            if let Some(target) = conn_state.preauth_hash_response.lock().unwrap().take() {
+                if encoded.len() > 4 {
+                    let msg_bytes = &encoded[4..];
+                    use crate::dispatch::PreauthTarget;
+                    match target {
+                        PreauthTarget::Conn => {
+                            if let Some(h) = conn_state.preauth_conn.lock().unwrap().as_mut() {
+                                *h = crate::crypto::preauth_update(h, msg_bytes);
                             }
-                            PreauthTarget::Session(sid) => {
-                                if let Some(h) =
-                                    conn_state.preauth_sessions.lock().unwrap().get_mut(&sid)
-                                {
-                                    *h = crate::crypto::preauth_update(h, msg_bytes);
-                                }
+                        }
+                        PreauthTarget::Session(sid) => {
+                            if let Some(h) =
+                                conn_state.preauth_sessions.lock().unwrap().get_mut(&sid)
+                            {
+                                *h = crate::crypto::preauth_update(h, msg_bytes);
                             }
                         }
                     }
                 }
-                // LOGOFF'd sessions keep their key only long enough to sign
-                // the LOGOFF response itself. But don't retire encryption
-                // state yet — it's needed to encrypt the response below.
-                conn_state
-                    .signing_ref()
-                    .write()
-                    .unwrap()
-                    .retain(|_, st| !st.retiring);
+            }
+            // LOGOFF'd sessions keep their key only long enough to sign
+            // the LOGOFF response itself. But don't retire encryption
+            // state yet — it's needed to encrypt the response below.
+            conn_state
+                .signing_ref()
+                .write()
+                .unwrap()
+                .retain(|_, st| !st.retiring);
 
-                // --- SMB 3.x encryption: encrypt the response if required ---
-                //
-                // Encrypt when:
-                // 1. The request arrived encrypted (encrypt with the same
-                //    SessionId — MS-SMB2 3.3.4.1.4).
-                // 2. The session has encrypt_data set.
-                // Never encrypt: NEGOTIATE, SESSION_SETUP responses, or
-                // responses with SessionId 0 (no encryption state).
-                // When encrypting, the SIGNED flag and signature are
-                // meaningless (the AEAD provides integrity) — clear the flag
-                // and zero the signature before encryption.
-                let response_command = match &resp {
-                    FramedResponse::Plain(p) => Some(p.header.command),
-                    FramedResponse::Compound(ps) => ps.first().map(|p| p.header.command),
-                    _ => None,
-                };
-                let is_handshake = matches!(
-                    response_command,
-                    Some(Command::Negotiate) | Some(Command::SessionSetup)
-                );
+            // --- SMB 3.x encryption: encrypt the response if required ---
+            //
+            // Encrypt when:
+            // 1. The request arrived encrypted (encrypt with the same
+            //    SessionId — MS-SMB2 3.3.4.1.4).
+            // 2. The session has encrypt_data set.
+            // Never encrypt: NEGOTIATE, SESSION_SETUP responses, or
+            // responses with SessionId 0 (no encryption state).
+            // When encrypting, the SIGNED flag and signature are
+            // meaningless (the AEAD provides integrity) — clear the flag
+            // and zero the signature before encryption.
+            let response_command = match &resp {
+                FramedResponse::Plain(p) => Some(p.header.command),
+                FramedResponse::Compound(ps) => ps.first().map(|p| p.header.command),
+                _ => None,
+            };
+            let is_handshake = matches!(
+                response_command,
+                Some(Command::Negotiate) | Some(Command::SessionSetup)
+            );
 
-                let encrypt_sid = if is_handshake {
-                    None // Never encrypt handshake responses
-                } else {
-                    was_encrypted.or_else(|| {
-                        let sid = match &resp {
-                            FramedResponse::Plain(p) => p.header.session_id,
-                            FramedResponse::Compound(ps) => {
-                                ps.first().map(|p| p.header.session_id).unwrap_or(0)
-                            }
-                            _ => return None,
-                        };
-                        if sid == 0 {
-                            return None;
+            let encrypt_sid = if is_handshake {
+                None // Never encrypt handshake responses
+            } else {
+                was_encrypted.or_else(|| {
+                    let sid = match &resp {
+                        FramedResponse::Plain(p) => p.header.session_id,
+                        FramedResponse::Compound(ps) => {
+                            ps.first().map(|p| p.header.session_id).unwrap_or(0)
                         }
-                        let enc_arc = conn_state.encryption_ref();
-                        let enc_map = enc_arc.read().unwrap();
-                        enc_map
-                            .get(&sid)
-                            .map(|st| st.encrypt_data)
-                            .unwrap_or(false)
-                            .then_some(sid)
-                    })
-                };
-
-                let encoded = if let Some(sid) = encrypt_sid {
-                    // Clear the SIGNED flag and zero the signature on every
-                    // message in the encoded frame before encryption.
-                    let body = &mut encoded[4..];
-                    let ranges = rssmb_wire_adapter::framing::message_ranges(body);
-                    for (s, e) in &ranges {
-                        let msg = &mut body[*s..*e];
-                        // Clear SIGNED flag (bit 3 of Flags at offset 16).
-                        let flags = u32::from_le_bytes(msg[16..20].try_into().unwrap());
-                        let flags = flags & !0x0000_0008;
-                        msg[16..20].copy_from_slice(&flags.to_le_bytes());
-                        // Zero the signature (offset 48..64).
-                        let sig_end = 64.min(msg.len());
-                        msg[48..sig_end].fill(0);
+                        _ => return None,
+                    };
+                    if sid == 0 {
+                        return None;
                     }
-
-                    let enc_state = conn_state
-                        .encryption_ref()
-                        .read()
-                        .unwrap()
+                    let enc_arc = conn_state.encryption_ref();
+                    let enc_map = enc_arc.read().unwrap();
+                    enc_map
                         .get(&sid)
-                        .cloned();
-                    match enc_state {
-                        Some(st) => {
-                            // Strip the 4-byte NetBIOS header, encrypt the
-                            // SMB2 body, and re-frame with a new NetBIOS
-                            // length.
-                            let smb2_body = &encoded[4..];
-                            let mut plaintext = smb2_body.to_vec();
-                            let nonce = match st.nonce_source.next() {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    warn!(conn_id = conn_state.conn_id,
+                        .map(|st| st.encrypt_data)
+                        .unwrap_or(false)
+                        .then_some(sid)
+                })
+            };
+
+            let encoded = if let Some(sid) = encrypt_sid {
+                // Clear the SIGNED flag and zero the signature on every
+                // message in the encoded frame before encryption.
+                let body = &mut encoded[4..];
+                let ranges = rssmb_wire_adapter::framing::message_ranges(body);
+                for (s, e) in &ranges {
+                    let msg = &mut body[*s..*e];
+                    // Clear SIGNED flag (bit 3 of Flags at offset 16).
+                    let flags = u32::from_le_bytes(msg[16..20].try_into().unwrap());
+                    let flags = flags & !0x0000_0008;
+                    msg[16..20].copy_from_slice(&flags.to_le_bytes());
+                    // Zero the signature (offset 48..64).
+                    let sig_end = 64.min(msg.len());
+                    msg[48..sig_end].fill(0);
+                }
+
+                let enc_state = conn_state
+                    .encryption_ref()
+                    .read()
+                    .unwrap()
+                    .get(&sid)
+                    .cloned();
+                match enc_state {
+                    Some(st) => {
+                        // Encrypt the SMB2 body IN PLACE inside `encoded`
+                        // (encrypt_in_place_detached reuses the buffer) —
+                        // one encryption, zero payload copies. `encoded`
+                        // is owned and dead after this.
+                        let mut plaintext = encoded;
+                        let nonce = match st.nonce_source.next() {
+                            Ok(n) => n,
+                            Err(e) => {
+                                warn!(conn_id = conn_state.conn_id,
                                         error = %e, "nonce exhausted — disconnecting");
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "nonce space exhausted",
-                                    ));
-                                }
-                            };
-                            let orig_len = plaintext.len() as u32;
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "nonce space exhausted",
+                                ));
+                            }
+                        };
+                        let orig_len = plaintext.len() as u32 - 4;
+                        let (hdr, tag) = {
+                            let (_, smb2_body) = plaintext.split_at_mut(4);
                             match crate::crypto::encrypt_message(
                                 &st.enc_key,
                                 &nonce,
                                 orig_len,
                                 sid,
-                                &mut plaintext,
+                                smb2_body,
                             ) {
-                                Ok((hdr, tag)) => {
-                                    let mut wire = Vec::with_capacity(4 + 52 + plaintext.len());
-                                    // NetBIOS header: 52 (transform header) + ciphertext.
-                                    let nb_len = (52 + plaintext.len()) as u32;
-                                    wire.push(0x00);
-                                    wire.push((nb_len >> 16) as u8);
-                                    wire.push((nb_len >> 8) as u8);
-                                    wire.push(nb_len as u8);
-                                    // Transform header with signature filled in.
-                                    let mut full_hdr = hdr;
-                                    full_hdr[4..20].copy_from_slice(&tag);
-                                    wire.extend_from_slice(&full_hdr);
-                                    // Ciphertext.
-                                    wire.extend_from_slice(&plaintext);
-                                    debug!(
-                                        conn_id = conn_state.conn_id,
-                                        session_id = sid,
-                                        resp_len = wire.len(),
-                                        "encrypted response"
-                                    );
-                                    Bytes::from(wire)
-                                }
+                                Ok((h, t)) => (h, t),
                                 Err(e) => {
                                     warn!(conn_id = conn_state.conn_id,
-                                        error = %e, "encryption failed — disconnecting");
+                                            error = %e, "encryption failed — disconnecting");
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
                                         "encryption failed",
                                     ));
                                 }
                             }
-                        }
-                        None => {
-                            // encrypt_data was set but the session has no
-                            // encryption state — never downgrade to plaintext.
-                            warn!(
-                                conn_id = conn_state.conn_id,
-                                session_id = sid,
-                                "encrypt_data set but no encryption state — disconnecting"
-                            );
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "missing encryption state for encrypt_data session",
-                            ));
-                        }
-                    }
-                } else {
-                    Bytes::from(encoded)
-                };
-
-                // Now retire encryption state (after the response has been
-                // encrypted or sent as plaintext).
-                conn_state
-                    .encryption_ref()
-                    .write()
-                    .unwrap()
-                    .retain(|_, st| !st.retiring);
-
-                debug!(
-                    conn_id = conn_state.conn_id,
-                    resp_len = encoded.len(),
-                    credits_granted = granted,
-                    "encoded response"
-                );
-                // If the write channel is closed (peer gone / write task
-                // exited) or shutdown is signaled, end the loop. Use a
-                // timeout race so a full channel can't block indefinitely
-                // and prevent shutdown from aborting the loop (finding 6).
-                let send_result = tokio::select! {
-                    biased;
-                    _ = state.shutdown.notified() => {
+                        };
+                        // Final wire frame: NetBIOS header (4) +
+                        // transform header (52) + ciphertext.
+                        // `drain(0..4)` drops the old NetBIOS header
+                        // in place; the ciphertext stays put.
+                        plaintext.drain(0..4);
+                        let mut full_wire = Vec::with_capacity(4 + 52 + plaintext.len());
+                        let nb_len = (52 + plaintext.len()) as u32;
+                        full_wire.push(0x00);
+                        full_wire.push((nb_len >> 16) as u8);
+                        full_wire.push((nb_len >> 8) as u8);
+                        full_wire.push(nb_len as u8);
+                        let mut full_hdr = hdr;
+                        full_hdr[4..20].copy_from_slice(&tag);
+                        full_wire.extend_from_slice(&full_hdr);
+                        full_wire.extend_from_slice(&plaintext);
                         debug!(
                             conn_id = conn_state.conn_id,
-                            "shutdown signaled during response enqueue; ending read loop"
+                            session_id = sid,
+                            resp_len = full_wire.len(),
+                            "encrypted response"
                         );
-                        return Ok(());
+                        Bytes::from(full_wire)
                     }
-                    res = conn_state.write_tx.send(encoded) => res,
-                };
-                if send_result.is_err() {
-                    warn!(
+                    None => {
+                        // encrypt_data was set but the session has no
+                        // encryption state — never downgrade to plaintext.
+                        warn!(
+                            conn_id = conn_state.conn_id,
+                            session_id = sid,
+                            "encrypt_data set but no encryption state — disconnecting"
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "missing encryption state for encrypt_data session",
+                        ));
+                    }
+                }
+            } else {
+                Bytes::from(encoded)
+            };
+
+            // Now retire encryption state (after the response has been
+            // encrypted or sent as plaintext).
+            conn_state
+                .encryption_ref()
+                .write()
+                .unwrap()
+                .retain(|_, st| !st.retiring);
+
+            debug!(
+                conn_id = conn_state.conn_id,
+                resp_len = encoded.len(),
+                credits_granted = granted,
+                "encoded response"
+            );
+            // If the write channel is closed (peer gone / write task
+            // exited) or shutdown is signaled, stop. Inline callers
+            // treat this as end-of-loop; spawned callers only log.
+            let send_result = tokio::select! {
+                biased;
+                _ = state.shutdown.notified() => {
+                    debug!(
                         conn_id = conn_state.conn_id,
-                        "write channel closed; ending read loop"
+                        "shutdown signaled during response enqueue; ending read loop"
                     );
                     return Ok(());
                 }
+                res = conn_state.write_tx.send(encoded) => res,
+            };
+            if send_result.is_err() {
+                warn!(
+                    conn_id = conn_state.conn_id,
+                    "write channel closed; ending read loop"
+                );
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     /// Remove all sessions owned by this connection from the shared state,
