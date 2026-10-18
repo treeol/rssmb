@@ -45,7 +45,12 @@ pub struct ServerConfig {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
 
-    /// Maximum frame size (bytes)
+    /// Maximum SMB2 *payload* size in bytes. This is the advertised
+    /// MaxTransactSize / MaxReadSize / MaxWriteSize (capped at 1 MiB) and
+    /// is enforced per READ/WRITE. The accepted wire frame is this plus a
+    /// fixed header allowance (`limits::FRAME_OVERHEAD`, 64 KiB) covering
+    /// the SMB2 header, request header, TRANSFORM_HEADER and compound
+    /// padding. Must be >= 65536. Default: 1048576 (1 MiB).
     #[serde(default = "default_max_frame_size")]
     pub max_frame_size: usize,
 

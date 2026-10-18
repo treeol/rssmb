@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Full-size WRITE requests dropped the connection.** The server advertised MaxWriteSize = 1 MiB but rejected any frame larger than `max_frame_size` (1 MiB), so a compliant client's 1 MiB WRITE (payload + SMB2/WRITE/transform headers) was treated as oversized and the connection closed. The wire limit now allows fixed header headroom above `max_frame_size`, and the advertised I/O sizes are derived from `max_frame_size`.
+
 ## [0.1.1] - 2026-10-18
 
 ### Fixed

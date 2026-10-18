@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 PY=${PY:-/tmp/smbvenv/bin/python}
-SCEN=${*:-"guest guestpriv alice badpass signed rename encrypted enum_guest enum_user"}
+SCEN=${*:-"guest guestpriv alice badpass signed rename bigwrite encrypted enum_guest enum_user"}
 LOG=/tmp/rssmb-live-server.log
 
 rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private
@@ -74,7 +74,7 @@ fi
 # Tier 3: encryption=desired config (SMB 3.1.1 with GCM).
 if [ -n "$encrypted" ]; then
   start_server tests/live/rssmb-live-encrypted.toml "$LOG.encrypted"
-  run_scenarios encrypted
+  run_scenarios encrypted bigwrite_311
   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 fi
 

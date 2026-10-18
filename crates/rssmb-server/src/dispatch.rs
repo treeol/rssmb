@@ -32,11 +32,11 @@ use crate::opens;
 use crate::session::Session;
 use crate::ServerState;
 
-/// Negotiated MaxTransact/MaxRead/MaxWriteSize. Now 1 MiB: multi-credit
-/// accounting (CreditCharge = ceil(len/64K) validated against the MessageId
-/// window) was added in Phase 1.5, so larger I/O sizes are safe. The credit
-/// window itself is enforced in `charge_credits` via `CreditManager`.
-const MAX_IO_SIZE: u32 = 1024 * 1024;
+// Negotiated MaxTransact/MaxRead/MaxWriteSize = min(1 MiB, max_frame_size),
+// see `crate::limits::max_io_size`. 1 MiB is safe: multi-credit accounting
+// (CreditCharge = ceil(len/64K) validated against the MessageId window) was
+// added in Phase 1.5; the credit window is enforced in `charge_credits`.
+use crate::limits::max_io_size;
 
 /// A per-connection open handle entry.
 #[derive(Clone)]
@@ -1136,14 +1136,15 @@ async fn handle_negotiate(
         ]
     };
 
+    let max_io = max_io_size(&state.config);
     let negotiate_response = NegotiateResponse {
         security_mode: server_security_mode,
         dialect_revision: dialect_config_to_negotiate(selected),
         server_guid,
         capabilities: server_capabilities,
-        max_transact_size: MAX_IO_SIZE,
-        max_read_size: MAX_IO_SIZE,
-        max_write_size: MAX_IO_SIZE,
+        max_transact_size: max_io,
+        max_read_size: max_io,
+        max_write_size: max_io,
         system_time: current_filetime(),
         server_start_time: FileTime::ZERO,
         buffer: spnego_token,
@@ -3640,7 +3641,7 @@ async fn handle_read(
     }
 
     // Bound the allocation by the negotiated MaxReadSize.
-    if read_req.length > MAX_IO_SIZE {
+    if read_req.length > max_io_size(&state.config) {
         return error_response_for(Command::Read, NtStatus::InvalidParameter, &req.header);
     }
 
@@ -3730,7 +3731,7 @@ async fn handle_write(
     // Pipe opens: feed RPC input bytes to the pipe state machine.
     if entry.is_pipe {
         // Extract write data (same logic as disk path below).
-        const MAX_WRITE_SIZE: u32 = MAX_IO_SIZE;
+        let max_write_size = max_io_size(&state.config);
         let write_data_offset: usize = match raw_frame.get(66..68) {
             Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
             None => {
@@ -3740,7 +3741,7 @@ async fn handle_write(
         if write_data_offset < 64 + 48 {
             return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header);
         }
-        if write_req.length > MAX_WRITE_SIZE {
+        if write_req.length > max_write_size {
             return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header);
         }
         let data_len = write_req.length as usize;
@@ -3794,7 +3795,7 @@ async fn handle_write(
     // dispatcher slices compound members), and DataOffset (u16 at body+2) is
     // relative to this message's header — so it is correct in any compound
     // position. smb-msg drops DataOffset after parsing, so read it here.
-    const MAX_WRITE_SIZE: u32 = MAX_IO_SIZE;
+    let max_write_size = max_io_size(&state.config);
     let write_data_offset: usize = match raw_frame.get(66..68) {
         Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
         None => return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header),
@@ -3804,11 +3805,11 @@ async fn handle_write(
     }
 
     // Validate length against negotiated max_write_size.
-    if write_req.length > MAX_WRITE_SIZE {
+    if write_req.length > max_write_size {
         debug!(
             conn_id = conn_state.conn_id,
             length = write_req.length,
-            max = MAX_WRITE_SIZE,
+            max = max_write_size,
             "write: exceeds max_write_size"
         );
         return error_response_for(Command::Write, NtStatus::InvalidParameter, &req.header);
@@ -6259,6 +6260,42 @@ mod tests {
             }
             other => panic!("expected Plain response, got {:?}", other),
         }
+    }
+
+    async fn negotiated_io_sizes(state: &Arc<ServerState>) -> (u32, u32, u32) {
+        let conn = make_conn_state();
+        let resp = handle_message(
+            state,
+            &conn,
+            FramedMessage::Plain(make_negotiate_request()),
+            &[],
+            None,
+        )
+        .await;
+        match resp {
+            Some(FramedResponse::Plain(PlainResponse {
+                content: ResponseContent::Negotiate(neg),
+                ..
+            })) => (neg.max_transact_size, neg.max_read_size, neg.max_write_size),
+            other => panic!("expected Negotiate response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_negotiate_io_sizes_default_1mib() {
+        let state = make_test_state();
+        assert_eq!(
+            negotiated_io_sizes(&state).await,
+            (1_048_576, 1_048_576, 1_048_576)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negotiate_io_sizes_follow_max_frame_size() {
+        let mut cfg = crate::config::ServerConfig::for_testing();
+        cfg.max_frame_size = 65_536;
+        let state = Arc::new(ServerState::new(cfg));
+        assert_eq!(negotiated_io_sizes(&state).await, (65_536, 65_536, 65_536));
     }
 
     #[tokio::test]

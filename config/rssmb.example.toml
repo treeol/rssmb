@@ -16,6 +16,10 @@ signing = "required"
 encryption = "desired"
 
 # Connection limits
+# max_frame_size: maximum SMB2 payload size in bytes (= advertised
+# MaxRead/MaxWrite/MaxTransactSize, capped at 1 MiB). The wire frame limit
+# is this plus a fixed 64 KiB header allowance (SMB2 + request + transform
+# headers). Must be >= 65536.
 max_frame_size = 1048576
 max_credits = 1024
 

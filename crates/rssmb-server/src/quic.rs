@@ -101,7 +101,7 @@ pub fn build_quinn_server_config(
     }
 
     let window = quinn::VarInt::from_u32(
-        (max_frame_size.saturating_add(64 * 1024)).min(u32::MAX as usize) as u32,
+        crate::limits::max_wire_frame_for(max_frame_size).min(u32::MAX as usize) as u32,
     );
     transport.stream_receive_window(window);
     transport.receive_window(window);
