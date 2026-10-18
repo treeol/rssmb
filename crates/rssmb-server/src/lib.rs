@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod dispatch;
 pub mod durable;
 pub mod fsinfo;
+pub mod limits;
 pub mod metrics;
 pub mod negotiate_ctx;
 pub mod netinfo;

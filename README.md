@@ -205,7 +205,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `encryption` | `desired` | `required` · `desired` · `disabled` (SMB 3.1.1 AES-128-GCM) |
 | `guest_access` | `false` | Allow anonymous guest logons (only `guest_ok` shares) |
 | `max_connections_per_ip` | `0` (`100` in example config) | Per-IP connection limit (`0` = unlimited) |
-| `max_frame_size` | `1048576` | Maximum SMB frame size (1 MiB) |
+| `max_frame_size` | `1048576` | Maximum SMB2 payload size = advertised MaxRead/MaxWrite/MaxTransactSize (capped at 1 MiB, min 65536); the wire frame limit adds a fixed 64 KiB header allowance |
 | `max_credits` | `1024` | Maximum outstanding credits |
 | `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
@@ -260,6 +260,12 @@ tests/live/run.sh               # impacket-based interop (needs Python)
 tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privileged)
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
 ```
+
+`tests/live/mount.sh` is **not run in CI**: it mounts with the host kernel's
+`cifs` module from a `docker run --privileged` container, which GitHub-hosted
+runners don't offer reliably. Run it locally before releases. It is the only
+test that drives a real kernel client, including sealed (`seal`) 1 MiB
+O_DIRECT writes.
 
 ### CI
 
@@ -325,4 +331,4 @@ be reused in other SMB tools.
 
 ## License
 
-[Apache-2.0](LICENSE) · Copyright 2024–2026 RSSMB Contributors
+[Apache-2.0](LICENSE) · Copyright 2026 Valon Mamudi

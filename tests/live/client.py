@@ -10,6 +10,9 @@ Usage: client.py <scenario> [<scenario> ...]
   rename      alice -> put/rename/get/delete (exercises SET_INFO rename)
   enum_guest  anonymous -> NetrShareEnum (level 1) via IPC$
   enum_user   alice -> NetrShareEnum + NetrShareGetInfo + NetrServerGetInfo
+  bigwrite    alice 2.1 -> WRITE exactly MaxWriteSize OK; MaxWriteSize+1 rejected,
+              connection stays open
+  bigwrite_311  same over SMB 3.1.1 (unsealed: impacket has no AES-GCM)
 """
 import io
 import os
@@ -172,6 +175,47 @@ def scenario(name):
         assert "public" in names, "public must be in enum"
         assert "private" in names, "private must be in enum for authenticated user"
         assert "IPC$" in names, "IPC$ must be in enum"
+        c.logoff()
+    elif name in ("bigwrite", "bigwrite_311"):
+        # WRITE of exactly the advertised MaxWriteSize must succeed;
+        # MaxWriteSize + 1 must be rejected with STATUS_INVALID_PARAMETER
+        # and the connection must stay usable. Unencrypted only: impacket
+        # offers AES-CCM, rssmb implements AES-GCM, so impacket cannot seal.
+        # Sealed full-size writes are covered by tests/live/mount.sh (seal).
+        from impacket.smb3structs import (FILE_READ_DATA, FILE_WRITE_DATA, FILE_SHARE_READ,
+                                          FILE_OVERWRITE_IF, FILE_NON_DIRECTORY_FILE)
+        from impacket.smb3 import SessionError
+        from impacket.nt_errors import STATUS_INVALID_PARAMETER
+        c = connect_311() if name == "bigwrite_311" else connect()
+        c.login("alice", "TestPass123")
+        smb = c._SMBConnection
+        maxw = smb._Connection["MaxWriteSize"]
+        print(f"  dialect=0x{smb._Connection['Dialect']:04x} MaxWriteSize={maxw}")
+        assert maxw == 1024 * 1024, f"expected 1 MiB MaxWriteSize, got {maxw}"
+        tid = smb.connectTree("public")
+        fid = smb.create(tid, "bigwrite.bin", FILE_READ_DATA | FILE_WRITE_DATA, FILE_SHARE_READ,
+                         FILE_NON_DIRECTORY_FILE, FILE_OVERWRITE_IF, 0)
+        data = bytes(range(256)) * (maxw // 256)
+        n = smb.write(tid, fid, data, 0, maxw)
+        assert n == maxw, f"full-size write returned {n}"
+        print(f"  WRITE {maxw} bytes: OK")
+        # Oversized by one byte: lift the client-side clamp to send it.
+        smb._Connection["MaxWriteSize"] = maxw + 1
+        try:
+            smb.write(tid, fid, data + b"X", 0, maxw + 1)
+            raise AssertionError("WRITE of MaxWriteSize+1 unexpectedly succeeded")
+        except SessionError as e:
+            assert e.get_error_code() == STATUS_INVALID_PARAMETER, hex(e.get_error_code())
+            print("  WRITE MaxWriteSize+1: STATUS_INVALID_PARAMETER (expected)")
+        finally:
+            smb._Connection["MaxWriteSize"] = maxw
+        # Connection still alive and data intact.
+        smb.close(tid, fid)
+        buf = io.BytesIO()
+        c.getFile("public", "bigwrite.bin", buf.write)
+        assert buf.getvalue() == data, "read-back mismatch"
+        print(f"  read-back {len(buf.getvalue())} bytes: OK (connection still open)")
+        c.deleteFile("public", "bigwrite.bin")
         c.logoff()
     elif name == "encrypted":
         # SMB 3.1.1 with encryption = "desired": negotiate 3.1.1 and

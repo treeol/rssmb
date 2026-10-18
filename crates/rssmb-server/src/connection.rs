@@ -220,7 +220,10 @@ where
             ));
         }
 
-        if len > max_frame_size {
+        // SMB2 frames: `max_frame_size` bounds the payload (advertised
+        // MaxRead/WriteSize); the wire frame may additionally carry the
+        // SMB2/request/transform headers.
+        if len > crate::limits::max_wire_frame_for(max_frame_size) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("oversized NetBIOS frame: {len} bytes"),
@@ -1602,6 +1605,48 @@ mod tests {
         // Read should eventually yield None.
         let result = read_netbios_payload(&mut server, 1_048_576).await;
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// Build a Direct-TCP (0x00) frame with a `len`-byte body.
+    fn smb2_frame(len: usize) -> Vec<u8> {
+        let mut f = vec![0x00, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        f.resize(4 + len, 0xAB);
+        f
+    }
+
+    #[tokio::test]
+    async fn test_full_size_encrypted_write_frame_accepted() {
+        // 1 MiB payload + SMB2 header (64) + WRITE request (48) +
+        // TRANSFORM_HEADER (52): what a compliant client sends at
+        // MaxWriteSize. Must not be rejected as oversized.
+        let max = 1_048_576;
+        let len = max + 64 + 48 + 52;
+        let frame = smb2_frame(len);
+        let mut rd = &frame[..];
+        let body = read_netbios_payload(&mut rd, max)
+            .await
+            .expect("full-size write frame must be accepted")
+            .expect("frame body");
+        assert_eq!(body.len(), len);
+    }
+
+    #[tokio::test]
+    async fn test_frame_over_wire_limit_rejected() {
+        let max = 1_048_576;
+        let len = max + crate::limits::FRAME_OVERHEAD + 1;
+        // Header only: the length check must fire before the body is read.
+        let hdr = [0x00, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        let mut rd = &hdr[..];
+        let err = read_netbios_payload(&mut rd, max)
+            .await
+            .expect_err("frame above wire limit must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("oversized NetBIOS frame"));
+
+        // Exactly at the wire limit is still accepted.
+        let at_limit = smb2_frame(max + crate::limits::FRAME_OVERHEAD);
+        let mut rd = &at_limit[..];
+        assert!(read_netbios_payload(&mut rd, max).await.unwrap().is_some());
     }
 
     #[tokio::test]
