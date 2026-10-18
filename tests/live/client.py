@@ -14,6 +14,7 @@ Usage: client.py <scenario> [<scenario> ...]
   bigwrite    alice 2.1 -> WRITE exactly MaxWriteSize OK; MaxWriteSize+1 rejected,
               connection stays open
   bigwrite_311  same over SMB 3.1.1 (unsealed: impacket has no AES-GCM)
+  share_comments  alice -> NetrShareEnum (name, type, remark) triples match config
 """
 import io
 import os
@@ -285,6 +286,19 @@ def scenario(name):
         print(f"  read-back {len(buf.getvalue())} bytes: OK (connection still open)")
         c.deleteFile("public", "bigwrite.bin")
         c.logoff()
+    elif name == "share_comments":
+        # NetrShareEnum level 1: every (name, remark) pair must match the
+        # config exactly (tests/live/rssmb-live*.toml: public "Pub",
+        # private "Priv"; IPC$ has an empty remark). Catches deferred-string
+        # ordering errors and NULL-vs-empty remark pointers.
+        shares = rpc_enum_shares("alice", "TestPass123")
+        pairs = [(s['shi1_netname'][:-1], s['shi1_type'], s['shi1_remark'][:-1]) for s in shares]
+        print(f"  NetrShareEnum: {pairs}")
+        assert sorted(pairs) == sorted([
+            ("public", 0, "Pub"),
+            ("private", 0, "Priv"),
+            ("IPC$", 0x80000003, ""),
+        ]), pairs
     elif name == "encrypted":
         # SMB 3.1.1 with encryption = "desired": negotiate 3.1.1 and
         # check that the session works (encryption is accepted if the

@@ -13,11 +13,13 @@ max_credits = 1024
 
 [shares.public]
 name = "public"
+comment = "Pub"
 path = "/tmp/rssmb-live/public"
 guest_ok = true
 
 [shares.private]
 name = "private"
+comment = "Priv"
 path = "/tmp/rssmb-live/private"
 guest_ok = false
 valid_users = ["alice"]
