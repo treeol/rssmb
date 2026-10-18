@@ -4154,8 +4154,23 @@ async fn handle_query_directory(
         );
     }
 
+    // MS-SMB2 3.3.5.18: an unsupported FileInformationClass fails with
+    // STATUS_INVALID_INFO_CLASS (after the handle checks above).
+    let Some(info_class) = qd_req.info_class() else {
+        debug!(
+            conn_id = conn_state.conn_id,
+            class = qd_req.file_information_class,
+            "unsupported directory info class"
+        );
+        return error_response_for(
+            Command::QueryDirectory,
+            NtStatus::InvalidInfoClass,
+            &req.header,
+        );
+    };
+    let class_id = u8::from(info_class);
+
     let pattern = qd_req.file_name.to_string();
-    let class_id = qd_req.file_information_class as u8;
     let restart = qd_req.flags.restart_scans() || qd_req.flags.reopen();
     let single = qd_req.flags.return_single_entry();
     let max_len = qd_req.output_buffer_length as usize;

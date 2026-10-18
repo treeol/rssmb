@@ -165,6 +165,22 @@ def scenario(name):
                     assert sizes.get("dirclass-probe.txt") == len(payload), \
                         f"{label}: EndOfFile {sizes.get('dirclass-probe.txt')}"
                 print(f"  {label} (0x{code:02x}): {sorted(names)}")
+            # Non-directory classes: 14 = FilePositionInformation, 200 =
+            # undefined. MS-SMB2 3.3.5.18 -> STATUS_INVALID_INFO_CLASS.
+            from impacket.smb3 import SessionError
+            from impacket.nt_errors import STATUS_INVALID_INFO_CLASS
+            for code in (14, 200):
+                fid = smb.create(tid, "", FILE_READ_DATA | FILE_LIST_DIRECTORY,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, FILE_OPEN, 0)
+                try:
+                    smb.queryDirectory(tid, fid, "*", informationClass=code, maxBufferSize=65536)
+                    raise AssertionError(f"class {code} unexpectedly succeeded")
+                except SessionError as e:
+                    assert e.get_error_code() == STATUS_INVALID_INFO_CLASS, \
+                        f"class {code}: 0x{e.get_error_code():08x}"
+                    print(f"  class {code}: STATUS_INVALID_INFO_CLASS (expected)")
+                finally:
+                    smb.close(tid, fid)
         finally:
             c.deleteFile("public", "dirclass-probe.txt")
         c.logoff()

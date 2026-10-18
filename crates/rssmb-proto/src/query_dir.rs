@@ -20,8 +20,12 @@ use crate::dtyp::{PosMarker, SizedStringSize, SizedWideString};
 pub struct QueryDirectoryRequest {
     #[bw(calc = 33)]
     structure_size: u16,
-    /// Directory information class.
-    pub file_information_class: QueryDirectoryInfoClass,
+    /// Directory information class, as the raw FileInformationClass byte.
+    ///
+    /// Kept raw so that a request with an unknown class still decodes and
+    /// the server can answer STATUS_INVALID_INFO_CLASS (MS-SMB2 3.3.5.18)
+    /// instead of failing the whole message. Use [`Self::info_class`].
+    pub file_information_class: u8,
     /// Flags for the query.
     pub flags: QueryDirectoryFlags,
     #[bw(assert(flags.index_specified() || *file_index == 0))]
@@ -41,6 +45,14 @@ pub struct QueryDirectoryRequest {
     #[br(args { size: SizedStringSize::Bytes16(file_name_length) })]
     #[bw(write_with = PosMarker::write_aoff, args(&file_name_offset))]
     pub file_name: SizedWideString,
+}
+
+impl QueryDirectoryRequest {
+    /// The requested directory information class, or `None` if the
+    /// FileInformationClass byte is not a QUERY_DIRECTORY class.
+    pub fn info_class(&self) -> Option<QueryDirectoryInfoClass> {
+        QueryDirectoryInfoClass::try_from(self.file_information_class).ok()
+    }
 }
 
 /// Directory information class (FileInformationClass values valid for
@@ -77,6 +89,21 @@ impl QueryDirectoryInfoClass {
         Self::IdBothDirectoryInformation,
         Self::IdFullDirectoryInformation,
     ];
+}
+
+impl TryFrom<u8> for QueryDirectoryInfoClass {
+    /// The unrecognised FileInformationClass byte.
+    type Error = u8;
+
+    fn try_from(code: u8) -> Result<Self, u8> {
+        Self::ALL.into_iter().find(|c| *c as u8 == code).ok_or(code)
+    }
+}
+
+impl From<QueryDirectoryInfoClass> for u8 {
+    fn from(c: QueryDirectoryInfoClass) -> u8 {
+        c as u8
+    }
 }
 
 /// Flags for query directory.
@@ -162,8 +189,8 @@ mod tests {
 
     #[test]
     fn test_info_class_rejects_non_directory_codes() {
-        // 14 = FilePositionInformation, 0 / 4 are not directory classes.
-        for code in [0u8, 4, 14, 39] {
+        // 14 = FilePositionInformation, 0 / 4 / 200 are not directory classes.
+        for code in [0u8, 4, 14, 39, 200] {
             assert!(
                 QueryDirectoryInfoClass::read_le(&mut Cursor::new(&[code][..])).is_err(),
                 "code {code} must not decode as a directory class"
@@ -176,7 +203,7 @@ mod tests {
     #[test]
     fn test_query_directory_request_class_1_decodes() {
         let req = QueryDirectoryRequest {
-            file_information_class: QueryDirectoryInfoClass::DirectoryInformation,
+            file_information_class: QueryDirectoryInfoClass::DirectoryInformation.into(),
             flags: QueryDirectoryFlags::new().with_restart_scans(true),
             file_index: 0,
             file_id: FileId::default(),
@@ -189,9 +216,43 @@ mod tests {
         assert_eq!(bytes[2], 1, "FileInformationClass byte");
         let decoded = QueryDirectoryRequest::read_le(&mut Cursor::new(&bytes[..])).unwrap();
         assert_eq!(
-            decoded.file_information_class,
-            QueryDirectoryInfoClass::DirectoryInformation
+            decoded.info_class(),
+            Some(QueryDirectoryInfoClass::DirectoryInformation)
         );
         assert_eq!(decoded.file_name.to_string(), "*");
+    }
+
+    /// A request with a non-directory class (14 = FilePositionInformation,
+    /// 200 = undefined) must still decode, exposing the raw byte, so the
+    /// server can answer STATUS_INVALID_INFO_CLASS.
+    #[test]
+    fn test_query_directory_request_unknown_class_decodes_raw() {
+        for code in [14u8, 200] {
+            let req = QueryDirectoryRequest {
+                file_information_class: code,
+                flags: QueryDirectoryFlags::new(),
+                file_index: 0,
+                file_id: FileId::default(),
+                output_buffer_length: 65536,
+                file_name: "*".into(),
+            };
+            let mut buf = Cursor::new(Vec::new());
+            req.write_le(&mut buf).unwrap();
+            let decoded =
+                QueryDirectoryRequest::read_le(&mut Cursor::new(&buf.into_inner()[..])).unwrap();
+            assert_eq!(decoded.file_information_class, code);
+            assert_eq!(decoded.info_class(), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn test_info_class_try_from_u8() {
+        for class in QueryDirectoryInfoClass::ALL {
+            assert_eq!(QueryDirectoryInfoClass::try_from(class as u8), Ok(class));
+            assert_eq!(u8::from(class), class as u8);
+        }
+        for code in [0u8, 4, 14, 39, 200, 255] {
+            assert_eq!(QueryDirectoryInfoClass::try_from(code), Err(code));
+        }
     }
 }
