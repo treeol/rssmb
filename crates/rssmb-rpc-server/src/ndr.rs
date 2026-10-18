@@ -18,14 +18,23 @@ pub const STYPE_IPC: u32 = 0x80000000;
 pub const STYPE_SPECIAL: u32 = 0x80000000;
 pub const STYPE_IPC_SPECIAL: u32 = 0x80000003;
 
+/// First referent ID handed out for a non-NULL unique pointer. Matches
+/// Samba/Windows (0x00020000, then +4 per pointer), which keeps encoded
+/// stubs byte-stable and comparable with reference captures.
+pub const FIRST_REFERENT_ID: u32 = 0x0002_0000;
+
 /// NDR20 encoder. Writes little-endian primitives with alignment.
 pub struct NdrWriter {
     buf: Vec<u8>,
+    next_referent: u32,
 }
 
 impl NdrWriter {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            next_referent: FIRST_REFERENT_ID,
+        }
     }
 
     pub fn into_vec(self) -> Vec<u8> {
@@ -57,10 +66,17 @@ impl NdrWriter {
     }
 
     /// Write a unique pointer (NDR pointer_t). In NDR20, a unique pointer is
-    /// a u32 where 0 = NULL and nonzero = a pointer ID (we use 1 for non-null).
-    /// The actual referent data is written by the caller after the fixed part.
+    /// a u32 referent ID where 0 = NULL. Non-NULL pointers get distinct,
+    /// increasing IDs (0x00020000, 0x00020004, ...). The referent data is
+    /// written by the caller where NDR defers it.
     pub fn write_unique_ptr(&mut self, is_present: bool) -> u32 {
-        let ptr = if is_present { 1 } else { 0 };
+        let ptr = if is_present {
+            let id = self.next_referent;
+            self.next_referent = self.next_referent.wrapping_add(4);
+            id
+        } else {
+            0
+        };
         self.write_u32(ptr);
         ptr
     }
@@ -183,22 +199,29 @@ impl<'a> NdrReader<'a> {
     }
 }
 
+/// SHARE_INFO_1 fixed part: {netname ptr, type (u32), remark ptr}.
+///
+/// The remark pointer is always non-NULL; an empty comment is sent as the
+/// empty string (max_count = actual_count = 1, just the NUL), as Samba and
+/// Windows do. Some clients (go-smb2 before 2026-09, i.e. rclone <= 1.75)
+/// assume every entry carries both strings.
+fn encode_share_info_1_fixed(w: &mut NdrWriter, share: &ShareInfo) {
+    w.write_unique_ptr(true); // shi1_netname
+    w.write_u32(share.share_type); // shi1_type
+    w.write_unique_ptr(true); // shi1_remark
+}
+
+/// SHARE_INFO_1 deferred pointees, in the order their pointers appear in
+/// the fixed part: netname, then remark.
+fn encode_share_info_1_deferred(w: &mut NdrWriter, share: &ShareInfo) {
+    w.write_wstr_conformant(&share.name);
+    w.write_wstr_conformant(&share.comment);
+}
+
 /// SHARE_INFO_1 structure: {netname (wstr), type (u32), remark (wstr)}
 pub fn encode_share_info_1(w: &mut NdrWriter, share: &ShareInfo) {
-    // netname: unique pointer to conformant wstr
-    let netname_ptr = w.write_unique_ptr(true);
-    // type: u32
-    w.write_u32(share.share_type);
-    // remark: unique pointer to conformant wstr
-    let remark_ptr = w.write_unique_ptr(!share.comment.is_empty());
-
-    // Deferred pointees: netname, then remark (in order of appearance).
-    if netname_ptr != 0 {
-        w.write_wstr_conformant(&share.name);
-    }
-    if remark_ptr != 0 {
-        w.write_wstr_conformant(&share.comment);
-    }
+    encode_share_info_1_fixed(w, share);
+    encode_share_info_1_deferred(w, share);
 }
 
 /// Encode a NetrShareEnum response (opnum 15, level 1).
@@ -216,13 +239,16 @@ pub fn encode_share_info_1(w: &mut NdrWriter, share: &ShareInfo) {
 ///   N × SHARE_INFO_1 (inline):
 ///     NetnamePtr (u32) = nonzero (unique)
 ///     Type (u32) = share_type
-///     RemarkPtr (u32) = 0 or nonzero (unique)
-///   Deferred netname strings (in order)
-///   Deferred remark strings (in order)
+///     RemarkPtr (u32) = nonzero (unique; empty comment = "")
+///   Deferred strings, per element in array order (C706 §14.3.12.3):
+///     netname[0], remark[0], netname[1], remark[1], ...
 /// TotalEntries (u32) = N
 /// ResumeHandlePtr (u32) = 0 (null)
 /// WERROR (u32) = 0
 /// ```
+///
+/// Referent IDs come from [`NdrWriter`]'s counter (0x00020000, +4), so the
+/// output is byte-for-byte the Samba layout for the same shares.
 pub fn encode_netr_share_enum_response(shares: &[ShareInfo], level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
     let count = shares.len() as u32;
@@ -240,27 +266,13 @@ pub fn encode_netr_share_enum_response(shares: &[ShareInfo], level: u32) -> Vec<
         if buffer_present != 0 {
             // Conformant array: MaxCount (u32)
             w.write_u32(count);
-            // N × SHARE_INFO_1 (inline) — fixed parts first, pointers deferred
-            let mut netname_ptrs: Vec<u32> = Vec::with_capacity(shares.len());
-            let mut remark_ptrs: Vec<u32> = Vec::with_capacity(shares.len());
+            // N × SHARE_INFO_1 fixed parts, then each element's deferred
+            // strings in element order (netname[i], remark[i]).
             for share in shares.iter() {
-                let np = w.write_unique_ptr(true);
-                w.write_u32(share.share_type);
-                let rp = w.write_unique_ptr(!share.comment.is_empty());
-                netname_ptrs.push(np);
-                remark_ptrs.push(rp);
+                encode_share_info_1_fixed(&mut w, share);
             }
-            // Deferred netname strings (in order)
-            for (i, share) in shares.iter().enumerate() {
-                if netname_ptrs[i] != 0 {
-                    w.write_wstr_conformant(&share.name);
-                }
-            }
-            // Deferred remark strings (in order)
-            for (i, share) in shares.iter().enumerate() {
-                if remark_ptrs[i] != 0 {
-                    w.write_wstr_conformant(&share.comment);
-                }
+            for share in shares.iter() {
+                encode_share_info_1_deferred(&mut w, share);
             }
         }
     }
@@ -280,31 +292,23 @@ pub fn encode_netr_share_enum_response(shares: &[ShareInfo], level: u32) -> Vec<
 pub fn encode_netr_share_get_info_response(share: Option<&ShareInfo>, level: u32) -> Vec<u8> {
     let mut w = NdrWriter::new();
 
+    // MS-SRVS 3.1.4.10: [out, switch_is(Level)] LPSHARE_INFO InfoStruct.
+    // A non-encapsulated union parameter is marshalled as its discriminant
+    // followed by the arm — here a unique pointer to SHARE_INFO_1. There is
+    // no separate Level field in the reply (unlike SHARE_ENUM_STRUCT).
     if let Some(s) = share {
-        // SHARE_INFO_STRUCT: Level (u32) + SHARE_INFO_UNION {tag (u32), ptr (u32)}
-        w.write_u32(level); // Level (switch_is)
-        w.write_u32(level); // Union tag (discriminant)
-        let info_ptr = w.write_unique_ptr(true); // union ptr
+        w.write_u32(level); // union discriminant
+        let info_ptr = w.write_unique_ptr(true); // arm: LPSHARE_INFO_1
         if info_ptr != 0 {
-            // SHARE_INFO_1 fixed part
-            let np = w.write_unique_ptr(true);
-            w.write_u32(s.share_type);
-            let rp = w.write_unique_ptr(!s.comment.is_empty());
-            // Deferred: netname
-            if np != 0 {
-                w.write_wstr_conformant(&s.name);
-            }
-            // Deferred: remark
-            if rp != 0 {
-                w.write_wstr_conformant(&s.comment);
-            }
+            // SHARE_INFO_1: fixed part, then netname and remark (always
+            // present; empty comment = "").
+            encode_share_info_1(&mut w, s);
         }
         // WERROR
         w.write_u32(WERR_SUCCESS);
     } else {
-        // No share found — null union pointer.
+        // No share found — discriminant + NULL arm pointer.
         w.write_u32(level);
-        w.write_u32(level); // tag
         w.write_unique_ptr(false);
         w.write_u32(WERR_NERR_NETNAMENOTFOUND);
     }
@@ -385,9 +389,10 @@ pub fn parse_netr_share_get_info_request(stub: &[u8]) -> Option<(u32, String)> {
     if server_present {
         r.skip_wstr_conformant()?;
     }
-    // NetName: reference pointer (always present) to conformant wstr
-    let _netname_ptr = r.read_u32()?; // reference pointer (always non-null)
-                                      // Read the conformant wstr (max_count, offset, actual_count, chars...)
+    // NetName: `[in, string] WCHAR*` — a top-level [ref] pointer, which has
+    // no wire representation (C706 §14.3.11.1): the conformant varying
+    // string (max_count, offset, actual_count, chars) follows directly.
+    r.align(4);
     let max_count = r.read_u32()?;
     let _offset = r.read_u32()?;
     let actual_count = r.read_u32()?;
@@ -563,20 +568,40 @@ mod tests {
 
     #[test]
     fn parse_get_info_request() {
-        // Build a minimal NetrShareGetInfo request stub.
-        let mut w = NdrWriter::new();
-        // ServerName: unique ptr + conformant wstr
-        w.write_unique_ptr(true);
-        w.write_wstr_conformant("\\rssmb");
-        // NetName: reference ptr (always 1) + conformant wstr "public\0"
-        w.write_u32(1); // reference pointer
-        w.write_wstr_conformant("public");
-        // Level (u32)
-        w.write_u32(1);
+        // Exact stubs sent by impacket's NetrShareGetInfo (hNetrShareGetInfo)
+        // for NetName "public", Level 1. NetName is a top-level [ref]
+        // pointer, so it has no referent ID on the wire — the conformant
+        // string follows ServerName directly (C706 §14.3.11.1).
+        #[rustfmt::skip]
+        let null_server: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00,                         // ServerName: NULL
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max=7 off=0
+            0x07, 0x00, 0x00, 0x00,                         // actual=7
+            b'p', 0, b'u', 0, b'b', 0, b'l', 0, b'i', 0, b'c', 0, 0, 0,
+            0xbf, 0xbf,                                     // pad to 4
+            0x01, 0x00, 0x00, 0x00,                         // Level
+        ];
+        assert_eq!(
+            parse_netr_share_get_info_request(null_server),
+            Some((1, "public".to_string()))
+        );
 
-        let (level, name) = parse_netr_share_get_info_request(&w.into_vec()).unwrap();
-        assert_eq!(level, 1);
-        assert_eq!(name, "public");
+        #[rustfmt::skip]
+        let empty_server: &[u8] = &[
+            0xd8, 0x0d, 0x00, 0x00,                         // ServerName: referent
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max=1 off=0
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00,             // actual=1, "\0"
+            0xab, 0xab,                                     // pad to 4
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // NetName max=7 off=0
+            0x07, 0x00, 0x00, 0x00,                         // actual=7
+            b'p', 0, b'u', 0, b'b', 0, b'l', 0, b'i', 0, b'c', 0, 0, 0,
+            0xbf, 0xbf,
+            0x01, 0x00, 0x00, 0x00,                         // Level
+        ];
+        assert_eq!(
+            parse_netr_share_get_info_request(empty_server),
+            Some((1, "public".to_string()))
+        );
     }
 
     #[test]
@@ -606,12 +631,18 @@ mod tests {
         assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
         // Union tag (u32) = 1
         assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
-        // Container pointer (u32) = 1 (non-null)
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 1);
+        // Container pointer (u32) = first referent ID
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            FIRST_REFERENT_ID
+        );
         // EntriesRead (u32) = 1
         assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 1);
-        // BufferPtr (u32) = 1 (non-null)
-        assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 1);
+        // BufferPtr (u32) = next referent ID
+        assert_eq!(
+            u32::from_le_bytes(data[16..20].try_into().unwrap()),
+            FIRST_REFERENT_ID + 4
+        );
         // MaxCount (u32) = 1
         assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), 1);
 
@@ -664,33 +695,23 @@ mod tests {
         let max_count = r.read_u32().unwrap();
         assert_eq!(max_count, 3);
 
-        // Read 3 SHARE_INFO_1 fixed parts
-        // Share 0: "public" with comment "Public share" → remark non-null
-        // Share 1: "private" with empty comment → remark null
-        // Share 2: "IPC$" with empty comment → remark null, type 0x80000003
+        // Read 3 SHARE_INFO_1 fixed parts. Every share has a non-null
+        // remark pointer, including the ones with an empty comment.
         for i in 0..3 {
             let netname_ptr = r.read_unique_ptr().unwrap();
             assert!(netname_ptr);
             let share_type = r.read_u32().unwrap();
             let remark_ptr = r.read_unique_ptr().unwrap();
-            if i == 0 {
-                assert!(remark_ptr, "share 0 should have non-null remark");
-                assert_eq!(share_type, 0);
-            } else if i == 1 {
-                assert!(!remark_ptr, "share 1 should have null remark");
-                assert_eq!(share_type, 0);
-            } else {
-                assert!(!remark_ptr, "share 2 should have null remark");
-                assert_eq!(share_type, 0x80000003);
-            }
+            assert!(remark_ptr, "share {i} must have a non-null remark pointer");
+            let expected_type = if i == 2 { 0x80000003 } else { 0 };
+            assert_eq!(share_type, expected_type);
         }
 
-        // Skip deferred netname strings (3 shares)
+        // Deferred strings: netname[i], remark[i] per element.
         for _ in 0..3 {
-            r.skip_wstr_conformant().unwrap();
+            r.skip_wstr_conformant().unwrap(); // netname
+            r.skip_wstr_conformant().unwrap(); // remark ("" when empty)
         }
-        // Skip deferred remark strings (only share 0 has a remark)
-        r.skip_wstr_conformant().unwrap();
 
         // TotalEntries + ResumeHandle + WERROR
         let total_entries = r.read_u32().unwrap();
@@ -698,6 +719,196 @@ mod tests {
         let _resume = r.read_unique_ptr().unwrap();
         let werr = r.read_u32().unwrap();
         assert_eq!(werr, WERR_SUCCESS);
+    }
+
+    /// Decode a level-1 NetrShareEnum stub with a strict NDR walker:
+    /// referent IDs must be non-zero and unique, and every non-NULL
+    /// pointer's string must appear in element order. Returns
+    /// (name, type, remark) triples.
+    fn decode_share_enum_strict(data: &[u8]) -> Vec<(String, u32, Option<String>)> {
+        fn read_wstr(r: &mut NdrReader) -> String {
+            let max = r.read_u32().unwrap();
+            let off = r.read_u32().unwrap();
+            let actual = r.read_u32().unwrap();
+            assert_eq!(off, 0);
+            assert_eq!(max, actual, "max_count must equal actual_count");
+            let mut u = Vec::new();
+            for _ in 0..actual {
+                u.push(r.read_u16().unwrap());
+            }
+            assert_eq!(u.pop(), Some(0), "string must be NUL-terminated");
+            r.align(4);
+            String::from_utf16(&u).unwrap()
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut uniq = |id: u32| {
+            if id != 0 {
+                assert!(ids.insert(id), "referent ID 0x{id:08x} reused");
+            }
+            id != 0
+        };
+        let mut r = NdrReader::new(data);
+        assert_eq!(r.read_u32().unwrap(), 1); // Level
+        assert_eq!(r.read_u32().unwrap(), 1); // union switch
+        assert!(uniq(r.read_u32().unwrap())); // container
+        let n = r.read_u32().unwrap() as usize;
+        assert!(uniq(r.read_u32().unwrap())); // array
+        assert_eq!(r.read_u32().unwrap() as usize, n); // max_count
+        let mut fixed = Vec::new();
+        for _ in 0..n {
+            let np = uniq(r.read_u32().unwrap());
+            let ty = r.read_u32().unwrap();
+            let rp = uniq(r.read_u32().unwrap());
+            fixed.push((np, ty, rp));
+        }
+        let mut out = Vec::new();
+        for (np, ty, rp) in fixed {
+            assert!(np, "netname pointer must be non-null");
+            let name = read_wstr(&mut r);
+            let remark = rp.then(|| read_wstr(&mut r));
+            out.push((name, ty, remark));
+        }
+        assert_eq!(r.read_u32().unwrap() as usize, n); // TotalEntries
+        assert_eq!(r.read_u32().unwrap(), 0); // ResumeHandle (null)
+        assert_eq!(r.read_u32().unwrap(), WERR_SUCCESS);
+        assert_eq!(r.remaining(), 0, "trailing bytes");
+        out
+    }
+
+    /// The 3-share / 2-comment case, against Samba 4.17.12's NetrShareEnum
+    /// (level 1) reply for shares public "Pub", private "Priv", IPC$ "".
+    ///
+    /// Captured with impacket against `smbd` and normalized in two places
+    /// that are not encoding rules but server choices:
+    /// - Samba's referent counter for this call starts at 0x00020010
+    ///   (it numbers request-side pointers first); shifted by -0x10 to
+    ///   rssmb's 0x00020000 start. Step (+4) and order are Samba's.
+    /// - Samba's IPC$ remark is its `server string`; replaced by "" and
+    ///   the trailing ResumeHandle by NULL (impacket passed a non-NULL
+    ///   resume handle, which Samba echoes; rssmb always returns NULL).
+    #[test]
+    fn netr_share_enum_matches_samba_layout_3_shares_2_comments() {
+        #[rustfmt::skip]
+        let samba: &[&str] = &[
+            "01 00 00 00 01 00 00 00 00 00 02 00 03 00 00 00",
+            "04 00 02 00 03 00 00 00 08 00 02 00 00 00 00 00",
+            "0c 00 02 00 10 00 02 00 00 00 00 00 14 00 02 00",
+            "18 00 02 00 03 00 00 80 1c 00 02 00 07 00 00 00",
+            "00 00 00 00 07 00 00 00 70 00 75 00 62 00 6c 00",
+            "69 00 63 00 00 00 00 00 04 00 00 00 00 00 00 00",
+            "04 00 00 00 50 00 75 00 62 00 00 00 08 00 00 00",
+            "00 00 00 00 08 00 00 00 70 00 72 00 69 00 76 00",
+            "61 00 74 00 65 00 00 00 05 00 00 00 00 00 00 00",
+            "05 00 00 00 50 00 72 00 69 00 76 00 00 00 00 00",
+            "05 00 00 00 00 00 00 00 05 00 00 00 49 00 50 00",
+            "43 00 24 00 00 00 00 00 01 00 00 00 00 00 00 00",
+            "01 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00",
+            "00 00 00 00",
+        ];
+        let expected: Vec<u8> = samba
+            .iter()
+            .flat_map(|l| l.split_whitespace())
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect();
+        let shares = vec![
+            ShareInfo {
+                name: "public".into(),
+                comment: "Pub".into(),
+                share_type: STYPE_DISKTREE,
+                encrypt_data: false,
+            },
+            ShareInfo {
+                name: "private".into(),
+                comment: "Priv".into(),
+                share_type: STYPE_DISKTREE,
+                encrypt_data: false,
+            },
+            ShareInfo {
+                name: "IPC$".into(),
+                comment: String::new(),
+                share_type: STYPE_IPC_SPECIAL,
+                encrypt_data: false,
+            },
+        ];
+        let data = encode_netr_share_enum_response(&shares, 1);
+        assert_eq!(data, expected);
+
+        // And the pairing survives a strict decode.
+        assert_eq!(
+            decode_share_enum_strict(&data),
+            vec![
+                ("public".into(), 0, Some("Pub".into())),
+                ("private".into(), 0, Some("Priv".into())),
+                ("IPC$".into(), STYPE_IPC_SPECIAL, Some(String::new())),
+            ]
+        );
+    }
+
+    #[test]
+    fn netr_share_enum_empty_comment_is_empty_string_not_null() {
+        let data = encode_netr_share_enum_response(&test_shares(), 1);
+        let decoded = decode_share_enum_strict(&data);
+        assert_eq!(decoded[0].2.as_deref(), Some("Public share"));
+        assert_eq!(decoded[1].2.as_deref(), Some(""));
+        assert_eq!(decoded[2].2.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ndr_writer_referent_ids_are_distinct_and_increasing() {
+        let mut w = NdrWriter::new();
+        assert_eq!(w.write_unique_ptr(true), 0x0002_0000);
+        assert_eq!(w.write_unique_ptr(false), 0);
+        assert_eq!(w.write_unique_ptr(true), 0x0002_0004);
+        assert_eq!(w.write_unique_ptr(true), 0x0002_0008);
+    }
+
+    /// NetrShareGetInfo level 1 reply, against Samba 4.17.12 for public
+    /// "Pub": discriminant + LPSHARE_INFO_1 arm + WERROR (MS-SRVS 3.1.4.10),
+    /// no separate Level field. Samba's referent IDs (0x00020004, +4) are
+    /// shifted to rssmb's 0x00020000 start; nothing else is normalized.
+    #[test]
+    fn netr_share_get_info_matches_samba_layout() {
+        #[rustfmt::skip]
+        let expected: Vec<u8> = [
+            "01 00 00 00 00 00 02 00 04 00 02 00 00 00 00 00",
+            "08 00 02 00 07 00 00 00 00 00 00 00 07 00 00 00",
+            "70 00 75 00 62 00 6c 00 69 00 63 00 00 00 00 00",
+            "04 00 00 00 00 00 00 00 04 00 00 00 50 00 75 00",
+            "62 00 00 00 00 00 00 00",
+        ]
+        .iter()
+        .flat_map(|l| l.split_whitespace())
+        .map(|b| u8::from_str_radix(b, 16).unwrap())
+        .collect();
+        let share = ShareInfo {
+            name: "public".into(),
+            comment: "Pub".into(),
+            share_type: STYPE_DISKTREE,
+            encrypt_data: false,
+        };
+        let data = encode_netr_share_get_info_response(Some(&share), 1);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn netr_share_get_info_empty_comment_is_empty_string() {
+        let share = ShareInfo {
+            name: "IPC$".into(),
+            comment: String::new(),
+            share_type: STYPE_IPC_SPECIAL,
+            encrypt_data: false,
+        };
+        let data = encode_netr_share_get_info_response(Some(&share), 1);
+        let mut r = NdrReader::new(&data);
+        assert_eq!(r.read_u32().unwrap(), 1); // discriminant
+        assert!(r.read_unique_ptr().unwrap()); // info
+        assert!(r.read_unique_ptr().unwrap()); // netname
+        assert_eq!(r.read_u32().unwrap(), STYPE_IPC_SPECIAL);
+        assert!(r.read_unique_ptr().unwrap(), "remark must be non-null");
+        r.skip_wstr_conformant().unwrap(); // "IPC$"
+        assert_eq!(r.read_u32().unwrap(), 1); // remark max_count (just NUL)
+        assert_eq!(r.read_u32().unwrap(), 0); // offset
+        assert_eq!(r.read_u32().unwrap(), 1); // actual_count
     }
 
     // --- Golden-byte fixture: NetrShareGetInfo (opnum 16, level 1) ---
@@ -711,11 +922,17 @@ mod tests {
             encrypt_data: false,
         };
         let data = encode_netr_share_get_info_response(Some(&share), 1);
-        // Level + tag + union_ptr(non-null) + netname_ptr(non-null) + type + remark_ptr(non-null)
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // Level
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1); // Tag
-        assert_ne!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // UnionPtr
-                                                                            // WERROR at the end
+        // Discriminant + arm ptr(non-null) + netname_ptr + type + remark_ptr
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1); // discriminant
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            FIRST_REFERENT_ID
+        ); // arm ptr
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            FIRST_REFERENT_ID + 4
+        ); // shi1_netname ptr
+        assert_eq!(u32::from_le_bytes(data[12..16].try_into().unwrap()), 0); // shi1_type
         let werr = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         assert_eq!(werr, WERR_SUCCESS);
     }
@@ -723,12 +940,16 @@ mod tests {
     #[test]
     fn netr_share_get_info_golden_bytes_not_found() {
         let data = encode_netr_share_get_info_response(None, 1);
-        // Level + tag + null_ptr + WERROR
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 0); // null union ptr
-        let werr = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(werr, WERR_NERR_NETNAMENOTFOUND);
+        // Discriminant + NULL arm pointer + WERROR — exactly 12 bytes.
+        assert_eq!(
+            data,
+            [
+                1u32.to_le_bytes(),
+                0u32.to_le_bytes(),
+                WERR_NERR_NETNAMENOTFOUND.to_le_bytes()
+            ]
+            .concat()
+        );
     }
 
     // --- Golden-byte fixture: NetrServerGetInfo (opnum 21, level 100) ---
