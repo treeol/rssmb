@@ -702,4 +702,33 @@ mod tests {
         assert_eq!(err, DurableReconnectError::Expired);
         assert_eq!(table.len().await, 0);
     }
+
+    /// G7: the sweeper evicts expired entries so their VFS handles and any
+    /// state they hold are released without waiting for a lazy insert/take.
+    /// After expiry (whether swept or lazily evicted), a DH2C/DHnC lookup
+    /// fails — the dispatch layer maps both NotFound and Expired to the
+    /// golden status OBJECT_NAME_NOT_FOUND.
+    #[tokio::test]
+    async fn sweeper_evicts_expired_and_lookup_reports_expiry() {
+        let table = DurableTable::new();
+        // A live entry and an expired entry coexist.
+        table.insert(guid(2), test_entry()).await;
+        let mut expired = test_entry();
+        expired.smb_persistent_id = 0xBEEF;
+        expired.deadline = Instant::now() - Duration::from_millis(50);
+        table.insert(guid(1), expired).await;
+        assert_eq!(table.len().await, 2);
+
+        // Sweep: only the expired entry is evicted, the live one stays.
+        let swept = table.sweep().await;
+        assert_eq!(swept, 1);
+        assert_eq!(table.len().await, 1);
+        assert!(table.peek(&guid(2)).await.is_ok());
+
+        // After eviction the expired handle is gone: both lookup APIs
+        // report failure (dispatch maps this to OBJECT_NAME_NOT_FOUND —
+        // the golden status for a DH2C after the durable timeout).
+        let err = table.peek_by_persistent_id(0xBEEF, None).await.unwrap_err();
+        assert_eq!(err, DurableReconnectError::NotFound);
+    }
 }

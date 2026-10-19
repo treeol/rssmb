@@ -1552,6 +1552,38 @@ where
 
     let state = state_fn(config);
 
+    // Background durable sweeper (bounded): periodically evicts expired
+    // durable opens, closing their VFS handles and releasing any state
+    // they still hold. Without it, expired durables are only evicted
+    // lazily on the next insert/take — an idle server leaks fds until a
+    // reconnect or a new durable open happens to touch the table.
+    // Bounded by: the shutdown signal (exits promptly), the sweep interval
+    // (never tighter than 1s), and the process lifetime of the listener.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Sweep at a coarse cadence: the negotiated timeout is >= 1s
+            // (60000ms default, MIN(client,300000)), so a 5s interval bounds
+            // the fd overstay to ~5s past expiry without busy-waiting.
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.shutdown.notified() => {
+                        tracing::debug!("durable sweeper: shutdown — exiting");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let swept = state.durable_table.sweep().await;
+                        if swept > 0 {
+                            tracing::debug!(swept, "durable sweeper: evicted expired entries");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let mut connections = tokio::task::JoinSet::<()>::new();
 
     loop {
