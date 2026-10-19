@@ -3122,7 +3122,33 @@ async fn handle_create(
     // the table. If a sharing conflict is found, we close the VFS handle
     // (undoing the open) and return SHARING_VIOLATION.
     match vfs.create("", &file_path, &create_args).await {
-        Ok(open_id) => {
+        Ok(create_result) => {
+            let open_id = create_result.open;
+            // Map the VFS create outcome to the MS-SMB2 §2.2.14 CreateAction:
+            //   Superseded (0) / Created (2) / Opened (1) / Overwritten (3).
+            // Supersede → Superseded; new file → Created; existing file
+            // truncated by Overwrite/OverwriteIf → Overwritten; plain open
+            // → Opened. (Golden: a fresh FILE_OPEN_IF answers Created=0x2.)
+            let create_action = match create_req.create_disposition {
+                rssmb_proto::create::CreateDisposition::Superseded => {
+                    rssmb_proto::create::CreateAction::Superseded
+                }
+                rssmb_proto::create::CreateDisposition::Overwrite
+                | rssmb_proto::create::CreateDisposition::OverwriteIf => {
+                    if create_result.superseded {
+                        rssmb_proto::create::CreateAction::Overwritten
+                    } else {
+                        rssmb_proto::create::CreateAction::Created
+                    }
+                }
+                _ => {
+                    if create_result.created {
+                        rssmb_proto::create::CreateAction::Created
+                    } else {
+                        rssmb_proto::create::CreateAction::Opened
+                    }
+                }
+            };
             // Get the stable file identity for the open table.
             let vfs_file_id = vfs.file_id(open_id).await.ok();
 
@@ -3351,7 +3377,7 @@ async fn handle_create(
             let create_response = rssmb_proto::create::CreateResponse {
                 oplock_level: granted_oplock,
                 flags: Default::default(),
-                create_action: rssmb_proto::create::CreateAction::Opened,
+                create_action,
                 creation_time: FileTime::from(info.creation_time),
                 last_access_time: FileTime::from(info.last_access_time),
                 last_write_time: FileTime::from(info.last_write_time),

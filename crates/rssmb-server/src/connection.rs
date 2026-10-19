@@ -1828,7 +1828,7 @@ mod tests {
             desired_access: Default::default(),
             create_options: Default::default(),
         };
-        let open_id = vfs.create("", "f.txt", &args).await.expect("create");
+        let open_id = vfs.create("", "f.txt", &args).await.expect("create").open;
         conn_state.opens_ref().write().await.insert(
             1,
             crate::dispatch::OpenEntry {

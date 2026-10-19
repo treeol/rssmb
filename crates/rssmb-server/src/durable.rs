@@ -288,8 +288,8 @@ pub fn deadline_from_timeout(timeout_secs: u64) -> Instant {
 mod tests {
     use super::*;
     use rssmb_vfs::{
-        CreateArgs, DesiredAccess, DirEntry, DirInfoClass, FileId, FileInfo, FsCtlCode, FsStats,
-        InfoClass, LockRange, OpenId, SecurityInfo, ShareAccess, Vfs, VfsError,
+        CreateArgs, CreateResult, DesiredAccess, DirEntry, DirInfoClass, FileId, FileInfo,
+        FsCtlCode, FsStats, InfoClass, LockRange, OpenId, SecurityInfo, ShareAccess, Vfs, VfsError,
     };
 
     /// A no-op VFS stub for durable table tests.
@@ -297,7 +297,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Vfs for StubVfs {
-        async fn create(&self, _: &str, _: &str, _: &CreateArgs) -> Result<OpenId, VfsError> {
+        async fn create(&self, _: &str, _: &str, _: &CreateArgs) -> Result<CreateResult, VfsError> {
             Err(VfsError::NotSupported)
         }
         async fn read_at(&self, _: OpenId, _: u64, _: u32) -> Result<bytes::Bytes, VfsError> {

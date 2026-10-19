@@ -109,7 +109,7 @@ impl Vfs for MemoryFs {
         _share_root: &str,
         path: &str,
         args: &CreateArgs,
-    ) -> Result<OpenId, VfsError> {
+    ) -> Result<CreateResult, VfsError> {
         let normalized =
             NormalizedPath::from_smb_path(path).map_err(|_| VfsError::PathTraversal)?;
         let key = normalized.to_smb_string();
@@ -145,6 +145,13 @@ impl Vfs for MemoryFs {
             CreateDisposition::OverwriteIf => {}
         }
 
+        let created = !exists;
+        let superseded = exists
+            && matches!(
+                args.disposition,
+                CreateDisposition::Supersede | CreateDisposition::Overwrite
+            );
+
         if !exists {
             let now = Self::now_filetime();
             let new_id = FileId {
@@ -157,7 +164,7 @@ impl Vfs for MemoryFs {
                     data: vec![],
                     attributes: FileAttributes {
                         directory: is_dir,
-                        normal: !is_dir,
+                        normal: is_dir,
                         ..Default::default()
                     },
                     creation_time: now,
@@ -194,7 +201,11 @@ impl Vfs for MemoryFs {
             },
         );
 
-        Ok(open_id)
+        Ok(CreateResult {
+            open: open_id,
+            created,
+            superseded,
+        })
     }
 
     async fn read_at(&self, open: OpenId, offset: u64, len: u32) -> Result<Bytes, VfsError> {
@@ -527,7 +538,7 @@ mod tests {
         // Create a file
         let mut create_args = CreateArgs::open_readonly();
         create_args.disposition = CreateDisposition::Create;
-        let open = fs.create("", "test.txt", &create_args).await.unwrap();
+        let open = fs.create("", "test.txt", &create_args).await.unwrap().open;
 
         // Write
         let written = fs.write_at(open, 0, b"Hello, World!").await.unwrap();
@@ -577,7 +588,7 @@ mod tests {
         args.disposition = CreateDisposition::Create;
         args.create_options.delete_on_close = true;
 
-        let open = fs.create("", "temp.txt", &args).await.unwrap();
+        let open = fs.create("", "temp.txt", &args).await.unwrap().open;
         fs.close(open).await.unwrap();
 
         // File should be gone
@@ -608,7 +619,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let dir_open = fs.create("", "", &dir_args).await.unwrap();
+        let dir_open = fs.create("", "", &dir_args).await.unwrap().open;
 
         // List all
         let entries = fs
