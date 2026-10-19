@@ -2519,6 +2519,10 @@ async fn handle_tree_disconnect(
 
 // ── Durable handle & Lease create contexts (MS-SMB2 2.2.13.2.8–2.2.13.2.12) ──
 
+/// DHnQ create context name (durable handle v1 request, MS-SMB2 2.2.13.2.8).
+const DHNQ_NAME: &[u8; 4] = b"DHnQ";
+/// DHnC create context name (durable handle v1 reconnect, MS-SMB2 2.2.13.2.7).
+const DHNC_NAME: &[u8; 4] = b"DHnC";
 /// DH2Q create context name (durable handle v2 request).
 const DH2Q_NAME: &[u8; 4] = b"DH2Q";
 /// DH2C create context name (durable handle v2 reconnect).
@@ -2541,13 +2545,26 @@ struct Dh2qContext {
 #[derive(Debug)]
 struct Dh2cContext {
     /// The file ID for the open being re-established.
-    #[allow(dead_code)]
     file_id: rssmb_proto::create::FileId,
     /// The create GUID from the original DH2Q open.
     create_guid: [u8; 16],
     /// Flags (bit 1 = persistent handle).
     _flags: u32,
 }
+
+/// Parsed DHnC create context data (16 bytes: just the file id — v1
+/// reconnect carries no CreateGuid; it is valid to v1-reconnect a v2-opened
+/// handle, so the lookup matches on the persistent id alone, mirroring
+/// Samba's `smb2srv_open_recreate` with `create_guid == NULL`).
+#[derive(Debug)]
+struct DhncContext {
+    file_id: rssmb_proto::create::FileId,
+}
+
+/// Parsed DHnQ create context data (16 bytes, zeroed — the v1 request
+/// context body is all reserved).
+#[derive(Debug)]
+struct DhnqContext;
 
 /// Parsed RqLs create context data (32 bytes for v1, 52 bytes for v2).
 #[derive(Debug, Clone)]
@@ -2565,7 +2582,52 @@ struct RqLsContext {
 struct ParsedCreateContexts {
     dh2q: Option<Dh2qContext>,
     dh2c: Option<Dh2cContext>,
+    /// v1 durable request (DHnQ), present-flag.
+    dhnq: Option<DhnqContext>,
+    /// v1 durable reconnect (DHnC) — file id only.
+    dhnc: Option<DhncContext>,
     rqls: Option<RqLsContext>,
+}
+
+impl ParsedCreateContexts {
+    /// Samba's create-context combination validation
+    /// (source3/smbd/smb2_create.c, smbd_smb2_create_fetch_create_ctx):
+    /// a request must not carry more than one of the durable
+    /// request/reconnect contexts; mixed v1/v2 combinations are
+    /// `INVALID_PARAMETER` (MS-SMB2 3.3.5.9.12).
+    fn validate_combinations(&self) -> Result<(), NtStatus> {
+        if (self.dhnc.is_some() && self.dh2c.is_some())
+            || (self.dhnc.is_some() && self.dh2q.is_some())
+            || (self.dh2c.is_some() && self.dhnq.is_some())
+            || (self.dh2q.is_some() && self.dh2c.is_some())
+        {
+            return Err(NtStatus::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// Which reconnect context (if any) is present: DH2C or DHnC.
+    fn reconnect(&self) -> Option<ReconnectContext<'_>> {
+        if let Some(dh2c) = &self.dh2c {
+            return Some(ReconnectContext {
+                persistent_id: dh2c.file_id.persistent,
+                create_guid: Some(&dh2c.create_guid),
+            });
+        }
+        if let Some(dhnc) = &self.dhnc {
+            return Some(ReconnectContext {
+                persistent_id: dhnc.file_id.persistent,
+                create_guid: None,
+            });
+        }
+        None
+    }
+}
+
+/// A normalized durable-reconnect request (from DH2C or DHnC).
+struct ReconnectContext<'a> {
+    persistent_id: u64,
+    create_guid: Option<&'a [u8; 16]>,
 }
 
 /// Serialize a list of `(name, data)` create contexts into an 8-byte aligned
@@ -2696,6 +2758,19 @@ fn parse_create_contexts(
                         _flags: flags,
                         create_guid,
                     });
+                } else if name == DHNQ_NAME && data_length >= 16 {
+                    // v1 durable request: 16 reserved bytes (MS-SMB2 2.2.13.2.8).
+                    parsed.dhnq = Some(DhnqContext);
+                } else if name == DHNC_NAME && data_length >= 16 {
+                    // v1 durable reconnect: 16-byte file id (MS-SMB2 2.2.13.2.7).
+                    let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+                    let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+                    parsed.dhnc = Some(DhncContext {
+                        file_id: rssmb_proto::create::FileId {
+                            persistent,
+                            volatile,
+                        },
+                    });
                 } else if name == DH2C_NAME && data_length >= 36 {
                     let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
                     let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
@@ -2794,11 +2869,12 @@ async fn handle_create(
     }
     let vfs = tree_entry.vfs.clone();
 
-    // Parse create contexts for durable handle (DH2Q/DH2C) and lease (RqLs) support.
-    // The CreateContextsOffset (u32 at body+48) and CreateContextsLength
-    // (u32 at body+52) are relative to the start of the SMB2 header.
-    // The SMB2 header is 64 bytes, so body starts at offset 64.
-    let ParsedCreateContexts { dh2q, dh2c, rqls } = {
+    // Parse create contexts for durable handle (DHnQ/DHnC/DH2Q/DH2C) and
+    // lease (RqLs) support. The CreateContextsOffset (u32 at body+48) and
+    // CreateContextsLength (u32 at body+52) are relative to the start of
+    // the SMB2 header. The SMB2 header is 64 bytes, so body starts at
+    // offset 64.
+    let parsed_ctx = {
         let ctx_offset = if raw_frame.len() >= 64 + 52 + 4 {
             u32::from_le_bytes(raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]))
         } else {
@@ -2815,36 +2891,76 @@ async fn handle_create(
             ParsedCreateContexts::default()
         }
     };
+    let ParsedCreateContexts {
+        dh2q, dhnq, rqls, ..
+    } = &parsed_ctx;
 
-    // DH2C reconnect: look up the durable open and re-attach it.
-    if let Some(dh2c) = &dh2c {
+    // Combination validation (Samba smbd_smb2_create_fetch_create_ctx /
+    // MS-SMB2 3.3.5.9.12): only one durable request/reconnect context per
+    // create; mixed combos are INVALID_PARAMETER.
+    if let Err(status) = parsed_ctx.validate_combinations() {
+        debug!(
+            conn_id = conn_state.conn_id,
+            "create: invalid durable context combination"
+        );
+        return error_response_for(Command::Create, status, &req.header);
+    }
+
+    // Durable reconnect (DH2C v2 or DHnC v1): look up the durable open and
+    // re-attach it. All state transitions and status codes mirror Samba
+    // 4.19.5 (golden) — see tests/conformance/durable-v2-open-analysis.md G3.
+    if let Some(reconnect) = parsed_ctx.reconnect() {
         let durable_timeout = state.config.durable_timeout_secs;
         if durable_timeout == 0 {
             debug!(
                 conn_id = conn_state.conn_id,
-                "DH2C: durable handles disabled"
+                "durable reconnect: durable handles disabled"
             );
-            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
-            // STATUS_OBJECTID_NOT_FOUND = 0xC00000F4
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
-        // Peek first — validate identity and share without removing the
-        // entry. Only take (remove) if all checks pass, so a failed
-        // reconnect doesn't destroy the durable open.
-        let peeked = match state.durable_table.peek(&dh2c.create_guid).await {
+        // Peek first — validate everything without removing the entry.
+        // Only take (remove) if all checks pass, so a failed reconnect
+        // doesn't destroy the durable open. Lookup is by the persistent id
+        // carried in the reconnect context (Samba's primary key); the
+        // CreateGuid (DH2C only) is verified against the entry.
+        let peeked = match state
+            .durable_table
+            .peek_by_persistent_id(reconnect.persistent_id, reconnect.create_guid)
+            .await
+        {
             Ok(entry) => entry,
-            Err(err) => {
-                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle not found or expired");
+            Err(_err) => {
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: not found or expired"
+                );
+                // Every match failure is OBJECT_NAME_NOT_FOUND in the
+                // golden: unknown persistent id, wrong CreateGuid, expiry.
                 return error_response_for(
                     Command::Create,
-                    NtStatus::Other(0xC000_00F4),
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         };
 
+        // A durable open only becomes reconnectable once its owning
+        // connection has dropped (Samba: allow_reconnect flips in
+        // vfs_default_durable_disconnect; a DH2C against a still-live
+        // handle fails — subtest reopen1).
+        if !peeked.orphaned {
+            debug!(
+                conn_id = conn_state.conn_id,
+                "durable reconnect: original handle still attached"
+            );
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
+        }
+
         // Validate that the reconnecting session matches the original
-        // session's user (MS-SMB2 3.3.5.15.11).
+        // session's user (MS-SMB2 3.3.5.15.11; golden: owner mismatch is
+        // OBJECT_NAME_NOT_FOUND, same as Samba's
+        // security_token_is_sid check landing in the `not_found` branch).
         let identity = lookup_session_identity(conn_state, session_id).await;
         let reconnect_user = identity.as_ref().map(|i| i.username.as_str()).unwrap_or("");
         if reconnect_user != peeked.username {
@@ -2852,20 +2968,20 @@ async fn handle_create(
                 conn_id = conn_state.conn_id,
                 original_user = %peeked.username,
                 reconnect_user,
-                "DH2C: session user mismatch — rejecting reconnect"
+                "durable reconnect: session user mismatch"
             );
-            return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
-        // Validate tree matches the original share.
+        // Validate tree matches the original share (golden: NOT_FOUND).
         if tree_entry.share_name != peeked.share_name {
             debug!(
                 conn_id = conn_state.conn_id,
                 original_share = %peeked.share_name,
                 reconnect_share = %tree_entry.share_name,
-                "DH2C: share mismatch — rejecting reconnect"
+                "durable reconnect: share mismatch"
             );
-            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
         // Enforce write access: if the original open had write access,
@@ -2876,27 +2992,103 @@ async fn handle_create(
         if !tree_entry.write_access && durable_has_write {
             debug!(
                 conn_id = conn_state.conn_id,
-                "DH2C: reconnect denied — tree has no write access for writable handle"
+                "durable reconnect: tree has no write access for writable handle"
             );
             return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
 
-        // All validations passed — take the entry from the durable table.
-        let durable_entry = match state.durable_table.take(&dh2c.create_guid).await {
-            Ok(entry) => entry,
-            Err(err) => {
-                // Race: the entry was taken by another reconnect or expired
-                // between peek and take.
-                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle lost between peek and take");
+        // Lease validation (Samba smbd_smb2_create_durable_lease_check,
+        // golden): a lease-backed durable open requires the reconnect to
+        // carry a lease request with the SAME lease key — otherwise
+        // OBJECT_NAME_NOT_FOUND. The reconnect's oplock_level field is NOT
+        // consulted (the torture sends garbage there; Samba looks at the
+        // RqLs create context alone). An oplock-backed durable ignores any
+        // lease on the reconnect. A name mismatch WITH a matching lease
+        // is INVALID_PARAMETER (different from the oplock case, where the
+        // name is ignored entirely).
+        let requested_lease = rqls.as_ref();
+        match (&peeked.lease, requested_lease) {
+            (Some(durable_lease), Some(req_lease)) => {
+                if durable_lease.lease_key != req_lease.lease_key {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        "durable reconnect: lease key mismatch"
+                    );
+                    return error_response_for(
+                        Command::Create,
+                        NtStatus::ObjectNameNotFound,
+                        &req.header,
+                    );
+                }
+                // Name must match the original open for lease-backed
+                // durables (golden: reopen2-lease wrong-filename case).
+                let requested_name = create_req.name.to_string();
+                if requested_name != peeked.path {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        durable_path = %peeked.path,
+                        requested_name = %requested_name,
+                        "durable reconnect: name mismatch with matched lease"
+                    );
+                    return error_response_for(
+                        Command::Create,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
+                }
+            }
+            (Some(_durable_lease), None) => {
+                // Reopened file has a lease, but no lease was requested.
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: lease-backed durable without lease request"
+                );
                 return error_response_for(
                     Command::Create,
-                    NtStatus::Other(0xC000_00F4),
+                    NtStatus::ObjectNameNotFound,
+                    &req.header,
+                );
+            }
+            (None, Some(_req_lease)) => {
+                // Lease requested, but the reopened file has no lease.
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: lease requested for non-leased durable"
+                );
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::ObjectNameNotFound,
+                    &req.header,
+                );
+            }
+            (None, None) => {}
+        }
+
+        // All validations passed — take the entry from the durable table.
+        let (durable_entry, durable_guid) = match state
+            .durable_table
+            .take_by_persistent_id(reconnect.persistent_id, reconnect.create_guid)
+            .await
+        {
+            Ok((entry, guid)) => (entry, guid),
+            Err(_err) => {
+                // Race: the entry was taken by another reconnect or expired
+                // between peek and take.
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: entry lost between peek and take"
+                );
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         };
 
-        // Re-attach: insert into the per-connection open table.
+        // Re-attach: insert into the per-connection open table. The
+        // re-attached open keeps its durable identity so a second
+        // disconnect (reopen2 reconnects twice) re-orphans it correctly.
         let file_id = next_file_id(conn_state);
         conn_state.opens_ref().write().await.insert(
             file_id.volatile,
@@ -2910,13 +3102,16 @@ async fn handle_create(
                 path: durable_entry.path.clone(),
                 is_pipe: false,
                 pipe_state: None,
-                durable_guid: None,
+                durable_guid: Some(durable_guid),
             },
         );
 
         // The durable entry was already removed from the OpenTable
         // when it was made durable (on disconnect). Re-add it so
-        // share-mode tracking continues.
+        // share-mode tracking continues. A share conflict here is
+        // OBJECT_NAME_NOT_FOUND in the golden (Samba maps every
+        // durable_reconnect backend failure to NOT_FOUND, smb2_create.c
+        // ~line 1002).
         if let Some(fid) = durable_entry.file_id {
             let ot_entry = opens::OpenEntry {
                 open_id: durable_entry.open_id,
@@ -2929,22 +3124,84 @@ async fn handle_create(
             if let Err(_conflict) = state.open_table.check_and_add(fid, ot_entry).await {
                 debug!(
                     conn_id = conn_state.conn_id,
-                    "DH2C: share conflict on reconnect"
+                    "durable reconnect: share conflict"
                 );
-                // Close the VFS handle we just re-attached.
-                let _ = durable_entry.vfs.close(durable_entry.open_id).await;
+                // Undo the re-attach and close the VFS handle.
                 conn_state
                     .opens_ref()
                     .write()
                     .await
                     .remove(&file_id.volatile);
+                let _ = durable_entry.vfs.close(durable_entry.open_id).await;
                 return error_response_for(
                     Command::Create,
-                    NtStatus::SharingViolation,
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         }
+
+        // Re-register the lease/oplock with the re-attached open so breaks
+        // keep flowing and a CLOSE removes the right records. The lease
+        // record itself survived the disconnect (connection cleanup skips
+        // remove_open_from_leases for durable opens); we only need the
+        // oplock record restored for oplock-backed durables (Samba restores
+        // oplock_type from the smbXsrv_open record).
+        if durable_entry.oplock_level.is_some() {
+            if let Some(fid) = durable_entry.file_id {
+                let level = match durable_entry.oplock_level {
+                    Some(rssmb_proto::oplock::OplockLevel::Batch) => 0x09,
+                    Some(rssmb_proto::oplock::OplockLevel::Exclusive) => 0x08,
+                    Some(rssmb_proto::oplock::OplockLevel::II) => 0x01,
+                    _ => 0x00,
+                };
+                if level != 0x00 {
+                    let (granted, _breaks) = state
+                        .open_table
+                        .request_oplock(
+                            fid,
+                            durable_entry.open_id,
+                            file_id,
+                            level,
+                            conn_state.write_tx.clone(),
+                        )
+                        .await;
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        granted, "durable reconnect: oplock restored"
+                    );
+                }
+            }
+        }
+
+        // The handle stays durable across reconnects (Samba keeps the
+        // smbXsrv_open record; reopen2 reconnects the same handle twice).
+        // Re-insert the entry keyed by the same CreateGuid, updated with
+        // the NEW file id assigned on this connection (the next reconnect
+        // presents that id), the new session/tree, and orphaned=false —
+        // it must be orphaned again by a disconnect before another
+        // reconnect is allowed.
+        let reinserted_entry = crate::durable::DurableEntry {
+            vfs: durable_entry.vfs.clone(),
+            open_id: durable_entry.open_id,
+            file_id: durable_entry.file_id,
+            smb_persistent_id: file_id.persistent,
+            session_id,
+            tree_id,
+            share_name: durable_entry.share_name.clone(),
+            username: durable_entry.username.clone(),
+            share_access: durable_entry.share_access,
+            desired_access: durable_entry.desired_access,
+            path: durable_entry.path.clone(),
+            deadline: durable_entry.deadline,
+            oplock_level: durable_entry.oplock_level,
+            lease: durable_entry.lease.clone(),
+            orphaned: false,
+        };
+        state
+            .durable_table
+            .insert(durable_guid, reinserted_entry)
+            .await;
 
         // Query file info for the response.
         let info = durable_entry
@@ -2966,8 +3223,44 @@ async fn handle_create(
                 file_name: durable_entry.path.clone(),
             });
 
+        // Response fields per golden: create_action = Opened (EXISTED),
+        // oplock_level = the ORIGINAL grant (batch oplock or Lease),
+        // NO DH2Q response blob (durable flag not re-negotiated),
+        // and for lease-backed durables an RqLs echo with the original
+        // lease key/state (Samba smb2_create.c:1622 — echoed from the
+        // open's stored lease, independent of the reconnect request).
+        let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
+        if let Some(lease) = &durable_entry.lease {
+            let grant = opens::LeaseGrant {
+                lease_key: lease.lease_key,
+                state: lease.state,
+                flags: 0,
+                epoch: lease.epoch,
+                parent_lease_key: lease.parent_lease_key,
+                is_v2: lease.is_v2,
+            };
+            resp_ctx_items.push((RQLS_NAME, build_rqls_response_data(&grant)));
+        }
+        let create_contexts = if resp_ctx_items.is_empty() {
+            Vec::new()
+        } else {
+            let refs: Vec<(&[u8], &[u8])> = resp_ctx_items
+                .iter()
+                .map(|(n, d)| (*n, d.as_slice()))
+                .collect();
+            encode_create_contexts(&refs)
+        };
+
+        let oplock_level = if durable_entry.lease.is_some() {
+            rssmb_proto::oplock::OplockLevel::Lease
+        } else {
+            durable_entry
+                .oplock_level
+                .unwrap_or(rssmb_proto::oplock::OplockLevel::None)
+        };
+
         let create_response = rssmb_proto::create::CreateResponse {
-            oplock_level: rssmb_proto::oplock::OplockLevel::None,
+            oplock_level,
             flags: Default::default(),
             create_action: rssmb_proto::create::CreateAction::Opened,
             creation_time: FileTime::from(info.creation_time),
@@ -2978,12 +3271,12 @@ async fn handle_create(
             endof_file: info.size,
             file_attributes: crate::fsinfo::file_attributes_to_fscc(&info.attributes),
             file_id,
-            create_contexts: Vec::new(),
+            create_contexts,
         };
         let response = build_response(&req.header, ResponseContent::Create(create_response));
         debug!(
             conn_id = conn_state.conn_id,
-            "DH2C: durable handle re-attached"
+            "durable reconnect: handle re-attached"
         );
         return FramedResponse::Plain(response);
     }
@@ -3181,15 +3474,16 @@ async fn handle_create(
 
             let file_id = next_file_id(conn_state);
 
-            // DH2Q: if a durable handle request was present and durable
-            // handles are enabled, record the open in the durable table
-            // so it can survive a disconnect.
+            // Durable handles are enabled via config; a DH2Q request is only
+            // honored when the durability precondition holds (see the grant
+            // section below — batch oplock, or a lease with Handle caching,
+            // per MS-SMB2 3.3.5.9.10 and the golden tables).
             let durable_enabled = state.config.durable_timeout_secs > 0;
-            let durable_guid = if dh2q.is_some() && durable_enabled {
-                dh2q.as_ref().map(|q| q.create_guid)
-            } else {
-                None
-            };
+            // A v1 (DHnQ) durable request is honored under the same
+            // precondition; its response context is the 8-byte DHnQ blob
+            // (timeout=0 — v1 has no timeout negotiation; Samba returns
+            // all-zero bytes, smb2_create.c:1567).
+            let durable_requested = (dh2q.is_some() || dhnq.is_some()) && durable_enabled;
 
             // Server-chosen durable timeout in milliseconds, mirroring Samba
             // (source3/smbd/smb2_create.c:1305-1313): MIN(client, 300000),
@@ -3207,56 +3501,11 @@ async fn handle_create(
                 None => (state.config.durable_timeout_secs * 1000) as u32,
             };
 
-            // Store the open in the per-connection open table
-            conn_state.opens_ref().write().await.insert(
-                file_id.volatile,
-                OpenEntry {
-                    session_id,
-                    tree_id,
-                    open_id,
-                    vfs: vfs.clone(),
-                    file_id: vfs_file_id,
-                    dir_cursor: Default::default(),
-                    path: file_path.clone(),
-                    is_pipe: false,
-                    pipe_state: None,
-                    durable_guid,
-                },
-            );
-
             let mut durable_granted = false;
-            if let Some(dh2q) = &dh2q {
-                if durable_enabled {
-                    let identity = lookup_session_identity(conn_state, session_id).await;
-                    let username = identity
-                        .as_ref()
-                        .map(|i| i.username.clone())
-                        .unwrap_or_default();
-                    let durable_entry = crate::durable::DurableEntry {
-                        vfs: vfs.clone(),
-                        open_id,
-                        file_id: vfs_file_id,
-                        session_id,
-                        tree_id,
-                        share_name: tree_entry.share_name.clone(),
-                        username,
-                        share_access,
-                        desired_access,
-                        path: file_path.clone(),
-                        deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
-                    };
-                    state
-                        .durable_table
-                        .insert(dh2q.create_guid, durable_entry)
-                        .await;
-                    durable_granted = true;
-                    debug!(
-                        conn_id = conn_state.conn_id,
-                        timeout_msecs = durable_timeout_msecs,
-                        "DH2Q: durable handle recorded"
-                    );
-                }
-            }
+            let mut durable_guid: Option<[u8; 16]> = None;
+
+            // (OpenEntry insert happens after the lease/oplock grant, when
+            // the durable decision is known.)
 
             // Query file info for the response
             let info = vfs
@@ -3278,6 +3527,9 @@ async fn handle_create(
             let mut granted_oplock = rssmb_proto::oplock::OplockLevel::None;
             let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
             let mut pending_breaks: Vec<opens::BreakNotification> = Vec::new();
+            // Lease grant to echo on a future durable reconnect (None if
+            // the open is not lease-backed).
+            let mut granted_lease: Option<crate::durable::LeaseEcho> = None;
 
             if state.config.leases && !info.attributes.directory {
                 if let Some(fid) = vfs_file_id {
@@ -3318,6 +3570,13 @@ async fn handle_create(
                             {
                                 Ok((grant, breaks)) => {
                                     granted_oplock = rssmb_proto::oplock::OplockLevel::Lease;
+                                    granted_lease = Some(crate::durable::LeaseEcho {
+                                        lease_key: grant.lease_key,
+                                        state: grant.state,
+                                        is_v2: grant.is_v2,
+                                        parent_lease_key: grant.parent_lease_key,
+                                        epoch: grant.epoch,
+                                    });
                                     resp_ctx_items
                                         .push((RQLS_NAME, build_rqls_response_data(&grant)));
                                     pending_breaks = breaks;
@@ -3382,16 +3641,107 @@ async fn handle_create(
             // Deliver any triggered break notifications to other lease/oplock holders.
             send_break_notifications(&pending_breaks).await;
 
-            // DH2Q response context (MS-SMB2 §2.2.13.2.11 response): 8 bytes
-            // = negotiated timeout (ms) + flags. Mirrors Samba
-            // (source3/smbd/smb2_create.c:1580-1604): emitted only when the
-            // durable handle was actually granted; flags stay 0 — persistent
-            // handles are not implemented (see analysis G6).
+            // Durability precondition (MS-SMB2 3.3.5.9.10, golden tables in
+            // tests/conformance/durable-v2-open-analysis.md): a durable
+            // request (DH2Q or DHnQ) is only granted when the open holds a
+            // batch oplock or a lease with Handle caching (RH/RWH/RHWE).
+            // Any other open gets no durable response context — the
+            // durable flag stays 0 in the CREATE response, matching the
+            // golden open-oplock/open-lease tables (durable column).
+            let durability_precondition = granted_oplock == rssmb_proto::oplock::OplockLevel::Batch
+                || granted_lease.as_ref().is_some_and(|l| l.state.handle);
+            if durable_requested && durability_precondition {
+                durable_guid = match (&dh2q, &dhnq) {
+                    (Some(q), _) => Some(q.create_guid),
+                    (None, Some(_)) => Some([0u8; 16]),
+                    _ => None,
+                };
+                durable_granted = true;
+            }
+
+            // Store the open in the per-connection open table.
+            conn_state.opens_ref().write().await.insert(
+                file_id.volatile,
+                OpenEntry {
+                    session_id,
+                    tree_id,
+                    open_id,
+                    vfs: vfs.clone(),
+                    file_id: vfs_file_id,
+                    dir_cursor: Default::default(),
+                    path: file_path.clone(),
+                    is_pipe: false,
+                    pipe_state: None,
+                    durable_guid,
+                },
+            );
+
+            // Record the granted durable open in the durable table, storing
+            // the original oplock/lease grant for the reconnect echo. The
+            // entry is NOT orphaned yet — it only becomes reconnectable
+            // after its owning connection drops (Samba: allow_reconnect).
+            // For v1 (DHnQ) opens there is no client GUID, so the entry
+            // is keyed by a zero GUID — v1 reconnects (DHnC) match by the
+            // persistent id alone, which is all they carry.
             if durable_granted {
-                let mut blob = Vec::with_capacity(8);
-                blob.extend_from_slice(&durable_timeout_msecs.to_le_bytes());
-                blob.extend_from_slice(&0u32.to_le_bytes());
-                resp_ctx_items.push((DH2Q_NAME, blob));
+                let identity = lookup_session_identity(conn_state, session_id).await;
+                let username = identity
+                    .as_ref()
+                    .map(|i| i.username.clone())
+                    .unwrap_or_default();
+                let create_guid = match (&dh2q, &dhnq) {
+                    (Some(q), _) => q.create_guid,
+                    (None, Some(_)) => [0u8; 16], // v1 durable: no CreateGuid
+                    _ => unreachable!("durable_granted implies a durable request context"),
+                };
+                let durable_entry = crate::durable::DurableEntry {
+                    vfs: vfs.clone(),
+                    open_id,
+                    file_id: vfs_file_id,
+                    smb_persistent_id: file_id.persistent,
+                    session_id,
+                    tree_id,
+                    share_name: tree_entry.share_name.clone(),
+                    username,
+                    share_access,
+                    desired_access,
+                    path: file_path.clone(),
+                    deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
+                    oplock_level: if granted_lease.is_none() {
+                        Some(granted_oplock)
+                    } else {
+                        None
+                    },
+                    lease: granted_lease.clone(),
+                    orphaned: false,
+                };
+                state.durable_table.insert(create_guid, durable_entry).await;
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    timeout_msecs = durable_timeout_msecs,
+                    v1 = dhnq.is_some(),
+                    "durable handle recorded"
+                );
+            }
+
+            // Durable response contexts (Samba source3/smbd/smb2_create.c
+            // :1567-1604): emitted only when the durable handle was
+            // actually granted.
+            //  - DHnQ (v1): 8 zero bytes — no timeout negotiation; the
+            //    client parses `durable_open = true` from the presence of
+            //    the blob alone (libcli create.c:406-411).
+            //  - DH2Q (v2): negotiated timeout (ms) + flags; flags stay 0
+            //    — persistent handles are not implemented (analysis G6).
+            if durable_granted {
+                if dhnq.is_some() {
+                    let blob = vec![0u8; 8];
+                    resp_ctx_items.push((DHNQ_NAME, blob));
+                } else {
+                    let mut blob = Vec::with_capacity(8);
+                    blob.extend_from_slice(&durable_timeout_msecs.to_le_bytes());
+                    blob.extend_from_slice(&0u32.to_le_bytes());
+                    resp_ctx_items.push((DH2Q_NAME, blob));
+                }
             }
 
             let create_contexts = if resp_ctx_items.is_empty() {

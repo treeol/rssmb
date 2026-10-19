@@ -1262,6 +1262,24 @@ impl Connection {
                 should_delete_on_close =
                     remove_result.was_last && remove_result.any_delete_on_close;
             }
+            // Durable opens: leave the VFS handle alive in the durable
+            // table for reconnect. The OpenTable entry was removed above so
+            // new opens during the durable window don't conflict with the
+            // disconnected client. The lease record is kept (the reconnect
+            // echoes it), and the entry is marked orphaned so a DH2C/DHnC
+            // may now re-attach it (Samba: allow_reconnect flips in
+            // vfs_default_durable_disconnect at this exact point).
+            if entry.durable_guid.is_some() {
+                if let Some(guid) = entry.durable_guid {
+                    state.durable_table.mark_orphaned(&guid).await;
+                }
+                debug!(
+                    conn_id,
+                    open_id = ?entry.open_id,
+                    "cleanup: skipping VFS close for durable open (left in durable table)"
+                );
+                continue;
+            }
             state
                 .open_table
                 .remove_open_from_leases(entry.open_id)
@@ -1272,18 +1290,6 @@ impl Connection {
                 .await;
             if released > 0 {
                 debug!(conn_id, open_id = ?entry.open_id, released, "cleanup: released stale locks");
-            }
-            // Durable opens: leave the VFS handle alive in the durable
-            // table for reconnect. The OpenTable entry was removed above so
-            // new opens during the durable window don't conflict with the
-            // disconnected client.
-            if entry.durable_guid.is_some() {
-                debug!(
-                    conn_id,
-                    open_id = ?entry.open_id,
-                    "cleanup: skipping VFS close for durable open (left in durable table)"
-                );
-                continue;
             }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;

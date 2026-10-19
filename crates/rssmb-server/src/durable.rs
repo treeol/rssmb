@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
+use rssmb_proto::oplock::OplockLevel;
 use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
 
 /// A durable open entry — kept alive after disconnect for reconnect.
@@ -33,6 +34,12 @@ pub struct DurableEntry {
     /// Stable file identity (dev,ino) for the open file — used to key
     /// into the global OpenTable for share-mode conflict tracking.
     pub file_id: Option<FileId>,
+    /// The SMB2 persistent id that was returned to the client in the CREATE
+    /// response. DH2C/DHnC reconnect requests carry this id and Samba's
+    /// primary lookup is BY PERSISTENT ID (smbXsrv_open.c:
+    /// smb2srv_open_recreate — `persistent_id & 0xFFFFFFFF` keys the global
+    /// table); the CreateGuid is only verified afterwards.
+    pub smb_persistent_id: u64,
     /// Session id that created the durable open.
     pub session_id: u64,
     /// Tree id on which the durable open was created.
@@ -46,10 +53,37 @@ pub struct DurableEntry {
     pub share_access: ShareAccess,
     /// Desired access from the original open.
     pub desired_access: DesiredAccess,
-    /// File path (for diagnostics/logging).
+    /// File path (for name-vs-lease validation and diagnostics).
     pub path: String,
     /// Deadline after which the durable open is closed and removed.
     pub deadline: Instant,
+    /// Oplock granted on the original open, echoed on reconnect
+    /// (Samba maps from the stored oplock_type; `None` = no oplock).
+    pub oplock_level: Option<OplockLevel>,
+    /// Lease granted on the original open, echoed on reconnect via an RqLs
+    /// response context (Samba: `smb2_create.c:1622` — emitted when the
+    /// original open holds a lease, regardless of what the reconnect
+    /// requests). `None` = the open was not leased.
+    pub lease: Option<LeaseEcho>,
+    /// Whether the owning connection has dropped and the handle is orphaned.
+    ///
+    /// Samba's `vfs_default_durable_cookie.allow_reconnect` is `false` while
+    /// the handle is still attached to a live connection and only flips to
+    /// `true` in `vfs_default_durable_disconnect` (source3/smbd/durable.c)
+    /// when the connection tears down. A DH2C against a still-live handle
+    /// therefore fails with `OBJECT_NAME_NOT_FOUND` (verified against the
+    /// 4.19.5 golden server, subtest reopen1).
+    pub orphaned: bool,
+}
+
+/// Lease state to echo in the reconnect CREATE response.
+#[derive(Debug, Clone)]
+pub struct LeaseEcho {
+    pub lease_key: [u8; 16],
+    pub state: crate::opens::LeaseCaching,
+    pub is_v2: bool,
+    pub parent_lease_key: Option<[u8; 16]>,
+    pub epoch: u16,
 }
 
 impl std::fmt::Debug for DurableEntry {
@@ -61,6 +95,7 @@ impl std::fmt::Debug for DurableEntry {
             .field("share_name", &self.share_name)
             .field("username", &self.username)
             .field("path", &self.path)
+            .field("orphaned", &self.orphaned)
             .finish()
     }
 }
@@ -69,7 +104,10 @@ impl std::fmt::Debug for DurableEntry {
 ///
 /// The table is a `RwLock<HashMap<[u8; 16], DurableEntry>>`. The key is the
 /// raw 16-byte representation of the `CreateGuid` (the client-supplied GUID
-/// from the DH2Q create context).
+/// from the DH2Q create context). A secondary index by SMB persistent id
+/// serves the DH2C/DHnC lookup path (Samba keys its global table by the
+/// persistent id and verifies the CreateGuid afterwards — a v1 `DHnC`
+/// reconnect carries no GUID and must match by id alone).
 ///
 /// Expired entries are cleaned up lazily: every `insert`, `take`, and
 /// `sweep` call evicts entries past their deadline. A background sweeper
@@ -126,23 +164,126 @@ impl DurableTable {
                     Err(DurableReconnectError::Expired)
                 } else {
                     // Clone the entry — it contains Arcs so this is cheap.
-                    Ok(DurableEntry {
-                        vfs: entry.vfs.clone(),
-                        open_id: entry.open_id,
-                        file_id: entry.file_id,
-                        session_id: entry.session_id,
-                        tree_id: entry.tree_id,
-                        share_name: entry.share_name.clone(),
-                        username: entry.username.clone(),
-                        share_access: entry.share_access,
-                        desired_access: entry.desired_access,
-                        path: entry.path.clone(),
-                        deadline: entry.deadline,
-                    })
+                    Ok(clone_entry(entry))
                 }
             }
             None => Err(DurableReconnectError::NotFound),
         }
+    }
+
+    /// Look up a durable open by the SMB persistent file id carried in a
+    /// DH2C/DHnC reconnect context. Mirrors Samba's primary lookup
+    /// (`smb2srv_open_recreate`); when `create_guid` is provided (DH2C) it
+    /// is verified against the stored entry, when `None` (DHnC v1 reconnect)
+    /// the GUID check is skipped — it is valid to v1-reconnect a v2-opened
+    /// handle (source3/smbd/smbXsrv_open.c, smb2srv_open_recreate_fn).
+    pub async fn peek_by_persistent_id(
+        &self,
+        smb_persistent_id: u64,
+        create_guid: Option<&[u8; 16]>,
+    ) -> Result<DurableEntry, DurableReconnectError> {
+        let entries = self.entries.read().await;
+        let found = entries
+            .iter()
+            .find(|(_, e)| e.smb_persistent_id == smb_persistent_id);
+        match found {
+            Some((guid, entry)) => {
+                if Instant::now() > entry.deadline {
+                    return Err(DurableReconnectError::Expired);
+                }
+                if let Some(req_guid) = create_guid {
+                    if guid != req_guid {
+                        return Err(DurableReconnectError::NotFound);
+                    }
+                }
+                Ok(clone_entry(entry))
+            }
+            None => Err(DurableReconnectError::NotFound),
+        }
+    }
+
+    /// Mark the entry keyed by `create_guid` as orphaned (its owning
+    /// connection has dropped). Guid-keyed variant used from connection
+    /// cleanup, which has the guid at hand.
+    pub async fn mark_orphaned(&self, create_guid: &[u8; 16]) {
+        let mut entries = self.entries.write().await;
+        if let Some(entry) = entries.get_mut(create_guid) {
+            entry.orphaned = true;
+        }
+    }
+
+    /// Mark every entry created by `session_id` on `conn_id`'s opens as
+    /// orphaned: the owning connection has dropped, so a future DH2C/DHnC
+    /// may re-attach the handle. Called from the connection cleanup path.
+    /// Samba flips the equivalent `allow_reconnect` cookie in
+    /// `vfs_default_durable_disconnect` at the same point.
+    pub async fn orphan_by_session(&self, session_id: u64) -> usize {
+        let mut entries = self.entries.write().await;
+        let mut count = 0;
+        for entry in entries.values_mut() {
+            if entry.session_id == session_id && !entry.orphaned {
+                entry.orphaned = true;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            tracing::debug!(
+                session_id,
+                orphaned = count,
+                "durable: entries orphaned by disconnect"
+            );
+        }
+        count
+    }
+
+    /// Take (remove) a durable open by the SMB persistent file id carried in
+    /// a DH2C/DHnC reconnect context, verifying the CreateGuid when present.
+    /// Returns `Ok(entry)` if found and not expired, `Err(DurableReconnectError)`
+    /// otherwise.
+    ///
+    /// The caller is responsible for re-attaching the returned entry to the
+    /// new connection's open table. Call `peek_by_persistent_id` first to
+    /// validate identity before committing to the take.
+    pub async fn take_by_persistent_id(
+        &self,
+        smb_persistent_id: u64,
+        create_guid: Option<&[u8; 16]>,
+    ) -> Result<(DurableEntry, [u8; 16]), DurableReconnectError> {
+        let mut entries = self.entries.write().await;
+        // Note: we do NOT call evict_expired here — the requested entry
+        // must be checked for expiry specifically so the caller gets
+        // `Expired` (not `NotFound`) when the deadline has passed.
+        // Other expired entries are cleaned up by the sweeper.
+        let found = entries
+            .iter()
+            .find(|(_, e)| e.smb_persistent_id == smb_persistent_id)
+            .map(|(guid, _)| *guid);
+        let guid = match found {
+            Some(guid) => guid,
+            None => return Err(DurableReconnectError::NotFound),
+        };
+        let entry = entries.remove(&guid).expect("just found");
+        if Instant::now() > entry.deadline {
+            tracing::debug!(guid = ?guid, "durable reconnect: entry expired");
+            // Close the expired VFS handle.
+            let vfs = entry.vfs.clone();
+            let open_id = entry.open_id;
+            tokio::spawn(async move {
+                if let Err(e) = vfs.close(open_id).await {
+                    tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
+                }
+            });
+            return Err(DurableReconnectError::Expired);
+        }
+        if let Some(req_guid) = create_guid {
+            if guid != *req_guid {
+                // Put it back — a failed GUID verification must not destroy
+                // the durable open (mirrors peek/take split semantics).
+                entries.insert(guid, entry);
+                return Err(DurableReconnectError::NotFound);
+            }
+        }
+        Ok((entry, guid))
     }
 
     /// Take (remove) a durable open by `CreateGuid`. Returns `Ok(entry)` if
@@ -279,6 +420,33 @@ pub enum DurableReconnectError {
     Expired,
 }
 
+impl DurableEntry {
+    // The CreateGuid is the table key, not a field; GUID verification happens
+    // in the keyed lookup APIs (peek_by_persistent_id / take_by_persistent_id)
+    // which see both the key and the entry.
+}
+
+/// Clone a durable entry (Arcs make this cheap).
+fn clone_entry(entry: &DurableEntry) -> DurableEntry {
+    DurableEntry {
+        vfs: entry.vfs.clone(),
+        open_id: entry.open_id,
+        file_id: entry.file_id,
+        smb_persistent_id: entry.smb_persistent_id,
+        session_id: entry.session_id,
+        tree_id: entry.tree_id,
+        share_name: entry.share_name.clone(),
+        username: entry.username.clone(),
+        share_access: entry.share_access,
+        desired_access: entry.desired_access,
+        path: entry.path.clone(),
+        deadline: entry.deadline,
+        oplock_level: entry.oplock_level,
+        lease: entry.lease.clone(),
+        orphaned: entry.orphaned,
+    }
+}
+
 /// Compute the deadline for a durable open given the timeout in seconds.
 #[cfg(test)]
 pub fn deadline_from_timeout(timeout_secs: u64) -> Instant {
@@ -366,6 +534,7 @@ mod tests {
             vfs: Arc::new(StubVfs) as Arc<dyn Vfs>,
             open_id: OpenId(1),
             file_id: Some(FileId { dev: 0, ino: 42 }),
+            smb_persistent_id: 0x1234_5678,
             session_id: 100,
             tree_id: 1,
             share_name: "test".to_string(),
@@ -374,6 +543,9 @@ mod tests {
             desired_access: DesiredAccess::default(),
             path: "/test".to_string(),
             deadline: Instant::now() + Duration::from_secs(3600),
+            oplock_level: None,
+            lease: None,
+            orphaned: false,
         }
     }
 
@@ -450,5 +622,74 @@ mod tests {
     async fn sweep_with_no_entries_is_noop() {
         let table = DurableTable::new();
         assert_eq!(table.sweep().await, 0);
+    }
+
+    #[tokio::test]
+    async fn orphan_by_session_flips_only_matching_entries() {
+        let table = DurableTable::new();
+        table.insert(guid(1), test_entry()).await;
+        let mut other = test_entry();
+        other.session_id = 200;
+        table.insert(guid(2), other).await;
+        assert_eq!(table.orphan_by_session(100).await, 1);
+        let e = table.peek(&guid(1)).await.unwrap();
+        assert!(e.orphaned);
+        let e2 = table.peek(&guid(2)).await.unwrap();
+        assert!(!e2.orphaned);
+        // Idempotent: second call finds nothing new.
+        assert_eq!(table.orphan_by_session(100).await, 0);
+    }
+
+    #[tokio::test]
+    async fn take_by_persistent_id_matches_and_verifies_guid() {
+        let table = DurableTable::new();
+        table.insert(guid(1), test_entry()).await;
+
+        // Match by persistent id with the right GUID.
+        let (entry, key) = table
+            .take_by_persistent_id(0x1234_5678, Some(&guid(1)))
+            .await
+            .expect("should find by persistent id");
+        assert_eq!(key, guid(1));
+        assert_eq!(entry.session_id, 100);
+
+        // Re-insert; wrong GUID must fail with NotFound and NOT consume
+        // the entry.
+        table.insert(guid(1), test_entry()).await;
+        let err = table
+            .take_by_persistent_id(0x1234_5678, Some(&guid(9)))
+            .await
+            .unwrap_err();
+        assert_eq!(err, DurableReconnectError::NotFound);
+        assert_eq!(
+            table.len().await,
+            1,
+            "wrong-guid take must not consume the entry"
+        );
+
+        // v1 DHnC reconnect: no GUID — valid to v1-reconnect a v2 open.
+        let (entry, _) = table
+            .take_by_persistent_id(0x1234_5678, None)
+            .await
+            .expect("v1 reconnect must match by id alone");
+        assert_eq!(entry.session_id, 100);
+        assert_eq!(table.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn take_by_persistent_id_miss_and_expiry() {
+        let table = DurableTable::new();
+        let err = table.take_by_persistent_id(0xDEAD, None).await.unwrap_err();
+        assert_eq!(err, DurableReconnectError::NotFound);
+
+        let mut expired = test_entry();
+        expired.deadline = Instant::now() - Duration::from_secs(1);
+        table.insert(guid(1), expired).await;
+        let err = table
+            .take_by_persistent_id(0x1234_5678, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, DurableReconnectError::Expired);
+        assert_eq!(table.len().await, 0);
     }
 }
