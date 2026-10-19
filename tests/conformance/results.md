@@ -17,7 +17,7 @@
 | smb2.credits | ❌ FAIL | 0/3 | session_setup_credits_granted,single_req_credits_granted skipped_mid |
 | smb2.ioctl | ❌ FAIL | 44/29 | (unchanged — copy-chunk & friends) |
 | smb2.lock | ❌ FAIL | 3/22 | (Campaign C scope) |
-| smb2.lease | ❌ FAIL | 8/31 | (Campaign B scope; was 3/36) |
+| smb2.lease | ❌ FAIL | 5/36 | (Campaign B scope; the 8/31 recorded after Campaign A was a mid-suite truncation artifact of the harness's flat 120 s cap — the uncapped re-measure is 5/36, see tests/conformance/lease-analysis.md; 3 subtests skip at golden parity) |
 | smb2.durable-v2-open | ❌ FAIL | 14/1 | app-instance (not implemented: no Samba 4.19.5 golden — Samba itself fails this subtest; documented in tests/conformance/durable-v2-open-analysis.md) |
 | smb2.notify | ❌ FAIL | 1/0 |   |
 | smb2.rename | ❌ FAIL | 3/9 | close-full-information,msword no_share_delete_but_delete_access,no_share_delete_no_delete_access no_sharing,rename_dir_openfile share_delete_and_delete_access,share_delete_no_delete_access simple_nodelete |
@@ -37,10 +37,12 @@
   effect, reported not chased.
 - smb2.session: 44/22 → 46/20 — +2 (bind_negative_smb202/smb210s) from the
   PreviousSessionId/session-semantics work.
-- smb2.lease: 3/36 → 8/31 — +5 (break,oplock related rows in the earlier
-  count were create_action/file_attr failures; G2 fixed those asserts) and
-  corrected lease-create echo behavior. Campaign B targets the remaining
-  31.
+- smb2.lease: 3/36 → 5/36 — the post-Campaign-A run recorded 8/31, but
+  that count came from a log truncated mid-suite by the harness's flat
+  120 s cap; the uncapped re-measure (tests/conformance/lease-analysis.md)
+  is 5/36 (31 failing; 3 subtests skip at golden parity). The real +2 over
+  the pre-A 3/36 is from the G2 create_action/file-attribute fixes.
+  Campaign B targets the remaining 31.
 
 No suite regressed.
 
