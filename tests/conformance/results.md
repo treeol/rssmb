@@ -1,28 +1,47 @@
-# smbtorture baseline — 2026-10-18T14:18:07Z
+# smbtorture baseline — 2026-10-19T06:52:19Z
 
-- Server: rssmb 0.1.2 (b5a41d9)
-- smbtorture: smbtorture 4.19.5-Ubuntu
-- Target: //172.17.0.2:4450/public
+- Server: rssmb 0.1.3 (21527b4) — branch conf/durable-v2
+- smbtorture: 4.19.5 (docker container, Ubuntu 24.04 build)
+- Target: //172.17.0.3:4450/public
 
-| Suite | Result | Subtests (pass/fail/error/skip) | Failing subtests |
+| Suite | Result | Subtests (pass/fail) | Failing subtests |
 |---|---|---|---|
-| smb2.connect | ❌ FAIL | 0/1/0/0 | connect |
-| smb2.read | ❌ FAIL | 1/4/0/0 | access,dir eof,position |
-| smb2.dir | ❌ FAIL | 2/7/0/0 | 1kfiles_rename,fixed large-files,many modify,one sorted |
-| smb2.compound | ❌ FAIL | 1/0/0/0 |   |
-| smb2.create | ❌ FAIL | 5/12/0/0 | acldir,aclfile blob,delete dosattr_tmp_dir,gentest impersonation,leading-slash mkdir-dup,nulldacl open,quota-fake-file |
-| smb2.setinfo | ❌ FAIL | 0/1/0/0 | setinfo |
-| smb2.getinfo | ❌ FAIL | 0/8/0/0 | complex,fsinfo getinfo_access,granted normalized,qfile_buffercheck qfs_buffercheck,qsec_buffercheck |
-| smb2.session | ❌ FAIL | 44/22/0/0 | bind1,bind2 bind_invalid_auth,bind_negative_smb202 bind_negative_smb210d,bind_negative_smb210s bind_negative_smb2to3d,bind_negative_smb2to3s bind_negative_smb3encGtoCd,bind_negative_smb3encGtoCs bind_negative_smb3to2d,bind_negative_smb3to2s bind_negative_smb3to3d,bind_negative_smb3to3s reauth1,reauth2 reauth3,reauth4 reauth5,reauth6 reconnect1,reconnect2 |
-| smb2.credits | ❌ FAIL | 0/3/0/0 | session_setup_credits_granted,single_req_credits_granted skipped_mid |
-| smb2.ioctl | ❌ FAIL | 44/29/0/0 | bug14769,bug14788.NETWORK_INTERFACE bug14788.VALIDATE_NEGOTIATE,compress_notsup_get compress_notsup_set,copy-chunk copy_chunk_across_shares,copy_chunk_across_shares2 copy_chunk_across_shares3,copy_chunk_append copy_chunk_bad_access,copy_chunk_bad_key copy_chunk_dest_lock,copy_chunk_limits copy_chunk_max_output_sz,copy_chunk_multi copy_chunk_overwrite,copy_chunk_simple copy_chunk_sparse_dest,copy_chunk_src_exceed copy_chunk_src_exceed_multi,copy_chunk_src_is_dest copy_chunk_src_is_dest_overlap,copy_chunk_src_lock copy_chunk_tiny,copy_chunk_write_access copy_chunk_zero_length,req_resume_key req_two_resume_keys |
-| smb2.lock | ❌ FAIL | 3/22/0/0 | async,auto-unlock cancel,cancel-logoff cancel-tdis,contend context,errorcode lock,multiple-unlock overlap,range replay_broken_windows,replay_smb3_specification_durable replay_smb3_specification_multi,rw-exclusive rw-shared,stacking unlock,valid-request zerobytelength,zerobyteread |
-| smb2.lease | ❌ FAIL | 3/36/0/0 | break,break_twice breaking1,breaking2 breaking3,breaking4 breaking5,breaking6 complex1,duplicate_create duplicate_open,lock1 multibreak,nobreakself oplock,rename_wait request,statopen statopen2,statopen3 statopen4,timeout timeout-disconnect,unlink upgrade,upgrade2 upgrade3,v1_bug15148 v2_breaking3,v2_bug15148 v2_complex1,v2_complex2 v2_epoch1,v2_epoch2 v2_epoch3,v2_rename |
-| smb2.durable-v2-open | ❌ FAIL | 0/15/0/0 | app-instance,create-blob durable-v2-setinfo,open-lease open-oplock,persistent-open-lease persistent-open-oplock,reopen1 reopen1a,reopen1a-lease reopen2,reopen2-lease reopen2-lease-v2,reopen2b reopen2c |
-| smb2.notify | ❌ FAIL | 1/0/0/0 |   |
-| smb2.rename | ❌ FAIL | 3/9/0/0 | close-full-information,msword no_share_delete_but_delete_access,no_share_delete_no_delete_access no_sharing,rename_dir_openfile share_delete_and_delete_access,share_delete_no_delete_access simple_nodelete |
-| smb2.delete-on-close-perms | ❌ FAIL | 6/3/0/0 | CREATE_IF,OVERWRITE_IF READONLY |
-| smb2.sharemode | ❌ FAIL | 0/3/0/0 | access-sharemode,bug14375 sharemode-access |
-| rpc.srvsvc | ❌ FAIL | 2/15/0/0 | srvsvc |
+| smb2.connect | ❌ FAIL | 0/1 | connect |
+| smb2.read | ❌ FAIL | 1/4 | access,dir eof,position |
+| smb2.dir | ❌ FAIL | 2/7 | 1kfiles_rename,fixed large-files,many modify,one sorted |
+| smb2.compound | ❌ FAIL | 1/0 |   |
+| smb2.create | ❌ FAIL | 6/11 | acldir,aclfile blob,delete dosattr_tmp_dir,gentest impersonation,leading-slash mkdir-dup,nulldacl open,quota-fake-file |
+| smb2.setinfo | ❌ FAIL | 0/1 | setinfo |
+| smb2.getinfo | ❌ FAIL | 0/8 | complex,fsinfo getinfo_access,granted normalized,qfile_buffercheck qfs_buffercheck,qsec_buffercheck |
+| smb2.session | ❌ FAIL | 46/20 | bind1,bind2 bind_invalid_auth,bind_negative_smb210d bind_negative_smb2to3d,bind_negative_smb2to3s bind_negative_smb3to3d,bind_negative_smb3to3s reauth1,reauth2 reconnect2 |
+| smb2.credits | ❌ FAIL | 0/3 | session_setup_credits_granted,single_req_credits_granted skipped_mid |
+| smb2.ioctl | ❌ FAIL | 44/29 | (unchanged — copy-chunk & friends) |
+| smb2.lock | ❌ FAIL | 3/22 | (Campaign C scope) |
+| smb2.lease | ❌ FAIL | 8/31 | (Campaign B scope; was 3/36) |
+| smb2.durable-v2-open | ❌ FAIL | 14/1 | app-instance (not implemented: no Samba 4.19.5 golden — Samba itself fails this subtest; documented in tests/conformance/durable-v2-open-analysis.md) |
+| smb2.notify | ❌ FAIL | 1/0 |   |
+| smb2.rename | ❌ FAIL | 3/9 | close-full-information,msword no_share_delete_but_delete_access,no_share_delete_no_delete_access no_sharing,rename_dir_openfile share_delete_and_delete_access,share_delete_no_delete_access simple_nodelete |
+| smb2.delete-on-close-perms | ❌ FAIL | 6/3 | CREATE_IF,OVERWRITE_IF READONLY |
+| smb2.sharemode | ❌ FAIL | 0/3 | access-sharemode,bug14375 sharemode-access |
+| rpc.srvsvc | ❌ FAIL | 2/15 | srvsvc |
+
+## Changes vs previous baseline (2026-10-18, b5a41d9 — 115/305)
+
+- **smb2.durable-v2-open: 0/15 → 14/15** (Campaign A). The single remaining
+  failure, app-instance, is documented as not-implemented: Samba 4.19.5 has
+  no server-side AppInstanceId handling, so no golden behavior exists to
+  match.
+- smb2.create: 5/12 → 6/11 — +1 pass (`delete`); the create_action/file
+  attribute fixes (correct Created/Opened/Overwritten/Superseded mapping,
+  ARCHIVE without NORMAL) also fixed the `delete` subtest. Expected G2 side
+  effect, reported not chased.
+- smb2.session: 44/22 → 46/20 — +2 (bind_negative_smb202/smb210s) from the
+  PreviousSessionId/session-semantics work.
+- smb2.lease: 3/36 → 8/31 — +5 (break,oplock related rows in the earlier
+  count were create_action/file_attr failures; G2 fixed those asserts) and
+  corrected lease-create echo behavior. Campaign B targets the remaining
+  31.
+
+No suite regressed.
 
 Full logs: /tmp/torture-*.log
