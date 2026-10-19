@@ -3292,6 +3292,7 @@ async fn handle_create(
             path: durable_entry.path.clone(),
             client_guid: durable_entry.client_guid,
             deadline: durable_entry.deadline,
+            timeout_msecs: durable_entry.timeout_msecs,
             oplock_level: durable_entry.oplock_level,
             lease: durable_entry.lease.clone(),
             orphaned: false,
@@ -3842,6 +3843,7 @@ async fn handle_create(
                         None
                     },
                     deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
+                    timeout_msecs: durable_timeout_msecs,
                     oplock_level: if granted_lease.is_none() {
                         Some(granted_oplock)
                     } else {
