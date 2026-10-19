@@ -280,8 +280,15 @@ pub enum DurableReconnectError {
 }
 
 /// Compute the deadline for a durable open given the timeout in seconds.
+#[cfg(test)]
 pub fn deadline_from_timeout(timeout_secs: u64) -> Instant {
     Instant::now() + Duration::from_secs(timeout_secs)
+}
+
+/// Compute the deadline for a durable open given the negotiated timeout in
+/// milliseconds (MS-SMB2 §2.2.13.2.11 — the server echoes this to the client).
+pub fn deadline_from_millis(timeout_msecs: u32) -> Instant {
+    Instant::now() + Duration::from_millis(timeout_msecs as u64)
 }
 
 #[cfg(test)]

@@ -2530,7 +2530,6 @@ const RQLS_NAME: &[u8; 4] = b"RqLs";
 #[derive(Debug)]
 struct Dh2qContext {
     /// Timeout in milliseconds the server should keep the handle alive.
-    #[allow(dead_code)]
     timeout: u32,
     /// Flags (bit 1 = persistent handle).
     _flags: u32,
@@ -3185,11 +3184,27 @@ async fn handle_create(
             // DH2Q: if a durable handle request was present and durable
             // handles are enabled, record the open in the durable table
             // so it can survive a disconnect.
-            let durable_timeout = state.config.durable_timeout_secs;
-            let durable_guid = if dh2q.is_some() && durable_timeout > 0 {
+            let durable_enabled = state.config.durable_timeout_secs > 0;
+            let durable_guid = if dh2q.is_some() && durable_enabled {
                 dh2q.as_ref().map(|q| q.create_guid)
             } else {
                 None
+            };
+
+            // Server-chosen durable timeout in milliseconds, mirroring Samba
+            // (source3/smbd/smb2_create.c:1305-1313): MIN(client, 300000),
+            // or 60000 when the client requested 0. Config's
+            // durable_timeout_secs acts as the enable/disable switch; the
+            // per-open deadline uses this negotiated value.
+            let durable_timeout_msecs: u32 = match &dh2q {
+                Some(q) => {
+                    if q.timeout == 0 {
+                        60_000
+                    } else {
+                        q.timeout.min(300_000)
+                    }
+                }
+                None => (state.config.durable_timeout_secs * 1000) as u32,
             };
 
             // Store the open in the per-connection open table
@@ -3209,8 +3224,9 @@ async fn handle_create(
                 },
             );
 
+            let mut durable_granted = false;
             if let Some(dh2q) = &dh2q {
-                if durable_timeout > 0 {
+                if durable_enabled {
                     let identity = lookup_session_identity(conn_state, session_id).await;
                     let username = identity
                         .as_ref()
@@ -3227,14 +3243,16 @@ async fn handle_create(
                         share_access,
                         desired_access,
                         path: file_path.clone(),
-                        deadline: crate::durable::deadline_from_timeout(durable_timeout),
+                        deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
                     };
                     state
                         .durable_table
                         .insert(dh2q.create_guid, durable_entry)
                         .await;
+                    durable_granted = true;
                     debug!(
                         conn_id = conn_state.conn_id,
+                        timeout_msecs = durable_timeout_msecs,
                         "DH2Q: durable handle recorded"
                     );
                 }
@@ -3363,6 +3381,18 @@ async fn handle_create(
 
             // Deliver any triggered break notifications to other lease/oplock holders.
             send_break_notifications(&pending_breaks).await;
+
+            // DH2Q response context (MS-SMB2 §2.2.13.2.11 response): 8 bytes
+            // = negotiated timeout (ms) + flags. Mirrors Samba
+            // (source3/smbd/smb2_create.c:1580-1604): emitted only when the
+            // durable handle was actually granted; flags stay 0 — persistent
+            // handles are not implemented (see analysis G6).
+            if durable_granted {
+                let mut blob = Vec::with_capacity(8);
+                blob.extend_from_slice(&durable_timeout_msecs.to_le_bytes());
+                blob.extend_from_slice(&0u32.to_le_bytes());
+                resp_ctx_items.push((DH2Q_NAME, blob));
+            }
 
             let create_contexts = if resp_ctx_items.is_empty() {
                 Vec::new()
