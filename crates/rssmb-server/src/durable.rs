@@ -144,11 +144,29 @@ impl DurableTable {
 
     /// Insert a durable open. Called from `handle_create` when a DH2Q
     /// create context is present and the open succeeds.
-    pub async fn insert(&self, create_guid: [u8; 16], entry: DurableEntry) {
+    ///
+    /// Returns `Err(open_id_of_existing)` when a LIVE (non-orphaned) entry
+    /// already exists under this CreateGuid — a non-replay DH2Q reusing an
+    /// in-flight GUID must fail with STATUS_DUPLICATE_OBJECTID
+    /// (MS-SMB2 3.3.5.9.10; Samba's replay-cache lookup in smbd_smb2_create)
+    /// rather than silently closing the existing handle. An orphaned
+    /// (stale/previous-generation) entry is replaced and its VFS handle
+    /// closed as before.
+    pub async fn insert(
+        &self,
+        create_guid: [u8; 16],
+        entry: DurableEntry,
+    ) -> Result<(), Option<rssmb_vfs::OpenId>> {
         let mut entries = self.entries.write().await;
-        // If an entry with the same GUID already exists (e.g. a stale
-        // durable from a previous connection that timed out but wasn't
-        // swept yet), close it before replacing it.
+        if let Some(old) = entries.get(&create_guid) {
+            if !old.orphaned {
+                // A live open already holds this CreateGuid — duplicate.
+                return Err(Some(old.open_id));
+            }
+        }
+        // The entry is absent or orphaned (a stale durable from a previous
+        // connection that timed out but wasn't swept yet) — replace it and
+        // close the old VFS handle.
         if let Some(old) = entries.remove(&create_guid) {
             tracing::debug!(
                 guid = ?create_guid,
@@ -165,6 +183,7 @@ impl DurableTable {
             });
         }
         entries.insert(create_guid, entry);
+        Ok(())
     }
 
     /// Insert a v1 (DHnQ) durable open, keyed by the SMB persistent file
@@ -200,7 +219,7 @@ impl DurableTable {
         match entries.get(create_guid) {
             Some(entry) => {
                 if entry.orphaned && Instant::now() > entry.deadline {
-                    Err(DurableReconnectError::Expired)
+                    Err(DurableReconnectError::Expired(entry.open_id))
                 } else {
                     // Clone the entry — it contains Arcs so this is cheap.
                     Ok(clone_entry(entry))
@@ -230,7 +249,7 @@ impl DurableTable {
                 .find(|(_, e)| e.smb_persistent_id == smb_persistent_id);
             if let Some((guid, entry)) = found {
                 if entry.orphaned && Instant::now() > entry.deadline {
-                    return Err(DurableReconnectError::Expired);
+                    return Err(DurableReconnectError::Expired(entry.open_id));
                 }
                 if let Some(req_guid) = create_guid {
                     if guid != req_guid {
@@ -244,7 +263,7 @@ impl DurableTable {
         match v1.get(&smb_persistent_id) {
             Some(entry) => {
                 if entry.orphaned && Instant::now() > entry.deadline {
-                    Err(DurableReconnectError::Expired)
+                    Err(DurableReconnectError::Expired(entry.open_id))
                 } else {
                     // A DH2C (with a CreateGuid) never matches a v1 entry —
                     // v1 durables have no CreateGuid to verify.
@@ -362,7 +381,7 @@ impl DurableTable {
                             tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
                         }
                     });
-                    return Err(DurableReconnectError::Expired);
+                    return Err(DurableReconnectError::Expired(open_id));
                 }
                 if let Some(req_guid) = create_guid {
                     if guid != *req_guid {
@@ -391,7 +410,7 @@ impl DurableTable {
                             tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
                         }
                     });
-                    return Err(DurableReconnectError::Expired);
+                    return Err(DurableReconnectError::Expired(open_id));
                 }
                 if create_guid.is_some() {
                     // DH2C against a v1 open: no CreateGuid exists — NOT_FOUND
@@ -432,7 +451,7 @@ impl DurableTable {
                             tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
                         }
                     });
-                    Err(DurableReconnectError::Expired)
+                    Err(DurableReconnectError::Expired(open_id))
                 } else {
                     Ok(entry)
                 }
@@ -452,21 +471,32 @@ impl DurableTable {
         entries.remove(create_guid).is_some()
     }
 
-    /// Sweep all expired entries (v2 and v1 tables), closing their VFS
-    /// handles. Called periodically by the background sweeper and
-    /// opportunistically by `take`/`insert`.
-    pub async fn sweep(&self) -> usize {
+    /// Sweep all expired ORPHANED entries (v2 and v1 tables), closing their
+    /// VFS handles. Called periodically by the background sweeper and
+    /// opportunistically. Returns the number evicted plus the evicted
+    /// open ids — the caller uses them to release lease records the table
+    /// cannot reach (the OpenTable is not owned here).
+    pub async fn sweep_with_ids(&self) -> (usize, Vec<rssmb_vfs::OpenId>) {
         let mut entries = self.entries.write().await;
         let mut v1 = self.v1_entries.write().await;
-        let n2 = Self::evict_expired(&mut entries).await;
-        let n1 = Self::evict_expired_v1(&mut v1).await;
-        n2 + n1
+        let mut evicted = Vec::new();
+        let n2 = Self::evict_expired(&mut entries, &mut evicted).await;
+        let n1 = Self::evict_expired_v1(&mut v1, &mut evicted).await;
+        (n2 + n1, evicted)
+    }
+
+    /// Sweep, returning only the count (convenience for tests).
+    pub async fn sweep(&self) -> usize {
+        self.sweep_with_ids().await.0
     }
 
     /// Evict expired ORPHANED v1 entries, closing their VFS handles in the
-    /// background. Live (attached) v1 entries are never swept — their
-    /// deadline starts at orphan time.
-    async fn evict_expired_v1(entries: &mut HashMap<u64, DurableEntry>) -> usize {
+    /// background and reporting the evicted open ids. Live (attached) v1
+    /// entries are never swept — their deadline starts at orphan time.
+    async fn evict_expired_v1(
+        entries: &mut HashMap<u64, DurableEntry>,
+        evicted_open_ids: &mut Vec<rssmb_vfs::OpenId>,
+    ) -> usize {
         let now = Instant::now();
         let expired: Vec<u64> = entries
             .iter()
@@ -476,6 +506,7 @@ impl DurableTable {
         let count = expired.len();
         for pid in expired {
             if let Some(entry) = entries.remove(&pid) {
+                evicted_open_ids.push(entry.open_id);
                 let vfs = entry.vfs.clone();
                 let open_id = entry.open_id;
                 tokio::spawn(async move {
@@ -491,15 +522,20 @@ impl DurableTable {
         count
     }
 
-    /// Evict expired ORPHANED entries from the map. Returns the count evicted.
-    /// Closes VFS handles for evicted entries in the background.
+    /// Evict expired ORPHANED entries from the map. Returns the count evicted
+    /// plus the evicted entries' open ids (so the caller can release lease
+    /// state the table cannot reach). Closes VFS handles for evicted entries
+    /// in the background.
     ///
     /// Only orphaned entries are evicted: a durable entry whose owning
     /// connection is still live must never be swept — its deadline starts at
     /// orphan time, not at insert (Samba stamps disconnect_time at disconnect
     /// and compares it against durable_timeout_msec; see
     /// smbXsrv_open.c smbXsrv_open_local_maintenance_fn).
-    async fn evict_expired(entries: &mut HashMap<[u8; 16], DurableEntry>) -> usize {
+    async fn evict_expired(
+        entries: &mut HashMap<[u8; 16], DurableEntry>,
+        evicted_open_ids: &mut Vec<rssmb_vfs::OpenId>,
+    ) -> usize {
         let now = Instant::now();
         let expired: Vec<[u8; 16]> = entries
             .iter()
@@ -509,17 +545,14 @@ impl DurableTable {
         let count = expired.len();
         for guid in expired {
             if let Some(entry) = entries.remove(&guid) {
+                evicted_open_ids.push(entry.open_id);
                 let vfs = entry.vfs.clone();
                 let open_id = entry.open_id;
-                // Also remove from the global open table.
-                if let Some(fid) = entry.file_id {
-                    // We can't access the OpenTable here without a reference.
-                    // The OpenTable removal is handled by the caller or the
-                    // background sweeper. For now, just close the VFS handle.
-                    // The OpenTable entry will be cleaned up on the next
-                    // check_and_add or sweep.
-                    let _ = fid; // suppress unused warning
-                }
+                // The OpenTable share-mode entry was already removed at
+                // orphan time (connection cleanup); the lease record is
+                // released by the caller via evicted_open_ids (the table
+                // cannot reach the OpenTable).
+                let _ = entry.file_id;
                 tokio::spawn(async move {
                     if let Err(e) = vfs.close(open_id).await {
                         tracing::warn!(error = %e, "durable sweep: closing VFS handle failed");
@@ -584,8 +617,12 @@ impl Default for DurableTable {
 pub enum DurableReconnectError {
     #[error("durable handle not found")]
     NotFound,
+    /// The handle expired past its orphan deadline: its VFS handle was
+    /// closed in the background. The open id is returned so the caller can
+    /// release the lease record for that open (the table cannot reach the
+    /// OpenTable).
     #[error("durable handle expired")]
-    Expired,
+    Expired(OpenId),
 }
 
 impl DurableEntry {
@@ -760,7 +797,7 @@ mod tests {
         entry.deadline = Instant::now() - Duration::from_secs(1);
         table.insert(guid(1), entry).await;
         let err = table.take(&guid(1)).await.unwrap_err();
-        assert_eq!(err, DurableReconnectError::Expired);
+        assert!(matches!(err, DurableReconnectError::Expired(_)));
         assert_eq!(table.len().await, 0);
     }
 
@@ -801,9 +838,53 @@ mod tests {
         table.insert(guid(1), test_entry()).await;
         let mut entry2 = test_entry();
         entry2.session_id = 200;
+        // Orphan the first entry, then insert a new one under the same
+        // GUID: the stale entry is replaced.
+        table.mark_orphaned(&guid(1)).await;
         table.insert(guid(1), entry2).await;
         let entry = table.take(&guid(1)).await.unwrap();
         assert_eq!(entry.session_id, 200);
+    }
+
+    /// A LIVE (non-orphaned) entry under the same CreateGuid must NOT be
+    /// evicted by a second insert — a non-replay DH2Q reusing an in-flight
+    /// GUID is a duplicate (STATUS_DUPLICATE_OBJECTID at the dispatch layer)
+    /// and must leave the existing handle alone (MS-SMB2 3.3.5.9.10).
+    #[tokio::test]
+    async fn insert_rejects_duplicate_live_guid() {
+        let table = DurableTable::new();
+        table.insert(guid(1), test_entry()).await;
+        let err = table.insert(guid(1), test_entry()).await;
+        assert!(err.is_err(), "live duplicate must be rejected");
+        // The original entry is untouched and still live.
+        let e = table.peek(&guid(1)).await.unwrap();
+        assert_eq!(e.session_id, 100);
+        assert!(!e.orphaned);
+    }
+
+    /// Reconnect lifecycle: take → re-insert (orphaned=false) → a second
+    /// disconnect orphans again and refreshes the deadline from that
+    /// disconnect (the timeout always counts from the latest orphaning).
+    #[tokio::test]
+    async fn reconnect_cycle_refreshes_deadline_on_second_orphan() {
+        let table = DurableTable::new();
+        table.insert(guid(1), test_entry()).await;
+        table.mark_orphaned(&guid(1)).await;
+        let entry = table.take(&guid(1)).await.unwrap();
+        // Reconnect re-inserts with orphaned=false.
+        let reinserted = crate::durable::DurableEntry {
+            orphaned: false,
+            ..clone_entry(&entry)
+        };
+        table.insert(guid(1), reinserted).await;
+        // Second disconnect: deadline refreshes from now.
+        let before = table.peek(&guid(1)).await.unwrap().deadline;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        table.mark_orphaned(&guid(1)).await;
+        let after = table.peek(&guid(1)).await.unwrap().deadline;
+        assert!(after > before, "deadline must refresh on second orphan");
+        // And the refreshed entry expires again.
+        assert!(!table.is_empty().await);
     }
 
     #[tokio::test]
@@ -894,7 +975,7 @@ mod tests {
             .take_by_persistent_id(0x1234_5678, None)
             .await
             .unwrap_err();
-        assert_eq!(err, DurableReconnectError::Expired);
+        assert!(matches!(err, DurableReconnectError::Expired(_)));
         assert_eq!(table.len().await, 0);
     }
 

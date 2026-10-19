@@ -1858,6 +1858,11 @@ async fn handle_session_setup(
                     .auth_success_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 conn_state.sessions.write().await.push(Arc::new(session));
+                // A fresh session establishment on this id retires any
+                // tombstone left by a previous-session teardown (ids are
+                // server-assigned and effectively never reused, but prune
+                // anyway so the retired set stays tight).
+                state.retired_sessions.write().unwrap().remove(&session_id);
                 // Register the SessionShared in the global registry so that
                 // a binding channel can find and share this session's state.
                 if let Some(ss) = conn_state.session_shared.read().unwrap().clone() {
@@ -2984,11 +2989,18 @@ async fn handle_create(
             .await
         {
             Ok(entry) => entry,
-            Err(_err) => {
+            Err(err) => {
                 debug!(
                     conn_id = conn_state.conn_id,
+                    error = ?err,
                     "durable reconnect: not found or expired"
                 );
+                // An expired entry's VFS handle was just closed in the
+                // background; its lease record must be released here (the
+                // table cannot reach the OpenTable).
+                if let crate::durable::DurableReconnectError::Expired(open_id) = err {
+                    state.open_table.remove_open_from_leases(open_id).await;
+                }
                 // Every match failure is OBJECT_NAME_NOT_FOUND in the
                 // golden: unknown persistent id, wrong CreateGuid, expiry.
                 return error_response_for(
@@ -3157,9 +3169,13 @@ async fn handle_create(
             .await
         {
             Ok((entry, guid)) => (entry, guid),
-            Err(_err) => {
+            Err(err) => {
                 // Race: the entry was taken by another reconnect or expired
-                // between peek and take.
+                // between peek and take. On expiry the VFS handle was just
+                // closed — release its lease record too.
+                if let crate::durable::DurableReconnectError::Expired(open_id) = err {
+                    state.open_table.remove_open_from_leases(open_id).await;
+                }
                 debug!(
                     conn_id = conn_state.conn_id,
                     "durable reconnect: entry lost between peek and take"
@@ -3858,10 +3874,36 @@ async fn handle_create(
                 // global table). Never share a key between distinct v1
                 // opens.
                 if let Some(q) = &dh2q {
-                    state
+                    if let Err(_existing) = state
                         .durable_table
                         .insert(q.create_guid, durable_entry)
-                        .await;
+                        .await
+                    {
+                        // A LIVE open already holds this CreateGuid — a
+                        // non-replay DH2Q reusing an in-flight GUID fails
+                        // with STATUS_DUPLICATE_OBJECTID (MS-SMB2
+                        // 3.3.5.9.10; Samba's replay-cache lookup). Undo
+                        // the open so no state is orphaned.
+                        debug!(
+                            conn_id = conn_state.conn_id,
+                            "DH2Q: duplicate CreateGuid on live durable open"
+                        );
+                        if let Some(fid) = vfs_file_id {
+                            let _ = state.open_table.remove(fid, open_id).await;
+                        }
+                        state.open_table.remove_open_from_leases(open_id).await;
+                        conn_state
+                            .opens_ref()
+                            .write()
+                            .await
+                            .remove(&file_id.volatile);
+                        let _ = vfs.close(open_id).await;
+                        return error_response_for(
+                            Command::Create,
+                            NtStatus::DuplicateObjectId,
+                            &req.header,
+                        );
+                    }
                 } else if dhnq.is_some() {
                     state
                         .durable_table

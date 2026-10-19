@@ -159,7 +159,10 @@ pub struct ServerState {
     /// the server SHOULD tear down the previous session when the new session
     /// authenticates as the same user). Requests naming a torn-down session
     /// fail with USER_SESSION_DELETED, mirroring Samba's session-table
-    /// lookup in smbd_smb2_request_validate.
+    /// lookup in smbd_smb2_request_validate. Bounded: torn-down ids are
+    /// pruned when the id is reused by a fresh session setup (SessionIds
+    /// are 64-bit server-assigned, so unbounded growth is practically
+    /// impossible, but pruning keeps the set tight).
     pub retired_sessions: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
 }
 

@@ -1577,9 +1577,17 @@ where
                         break;
                     }
                     _ = ticker.tick() => {
-                        let swept = state.durable_table.sweep().await;
+                        let (swept, evicted) = state.durable_table.sweep_with_ids().await;
                         if swept > 0 {
                             tracing::debug!(swept, "durable sweeper: evicted expired entries");
+                        }
+                        // Release the lease record for each evicted open —
+                        // the table cannot reach the OpenTable itself.
+                        for open_id in evicted {
+                            state
+                                .open_table
+                                .remove_open_from_leases(open_id)
+                                .await;
                         }
                     }
                 }
