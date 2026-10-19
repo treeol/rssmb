@@ -3269,7 +3269,7 @@ async fn handle_create(
                     _ => 0x00,
                 };
                 if level != 0x00 {
-                    let (granted, _breaks) = state
+                    let (granted, _breaks, _waiters) = state
                         .open_table
                         .request_oplock(
                             fid,
@@ -3277,6 +3277,7 @@ async fn handle_create(
                             file_id,
                             level,
                             conn_state.write_tx.clone(),
+                            false,
                         )
                         .await;
                     debug!(
@@ -3579,6 +3580,37 @@ async fn handle_create(
                         );
                         // Undo the VFS open.
                         let _ = vfs.close(open_id).await;
+                        // Samba delay_for_oplock (open.c) with
+                        // have_sharing_violation: break Handle caching on the
+                        // conflicting leases (delay mask H) and pend the
+                        // create until the break completes (timeout-disconnect).
+                        // Deviation: after the wait we answer
+                        // SHARING_VIOLATION without re-trying the open — a
+                        // holder that closes its handle on the H break still
+                        // gets the opener a violation (Samba would retry).
+                        let will_overwrite = matches!(
+                            create_req.create_disposition,
+                            rssmb_proto::create::CreateDisposition::Superseded
+                                | rssmb_proto::create::CreateDisposition::Overwrite
+                                | rssmb_proto::create::CreateDisposition::OverwriteIf
+                        );
+                        let (breaks, mut waiters) = state
+                            .open_table
+                            .break_for_open(fid, open_id, will_overwrite, true)
+                            .await;
+                        send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
+                        waiters.retain(|w| w.delay);
+                        if !waiters.is_empty() {
+                            return pend_until_breaks(
+                                conn_state,
+                                &req.header,
+                                waiters,
+                                Command::Create,
+                                Err(NtStatus::SharingViolation),
+                            )
+                            .await;
+                        }
                         return error_response_for(
                             Command::Create,
                             NtStatus::SharingViolation,
@@ -3646,6 +3678,11 @@ async fn handle_create(
             let mut granted_oplock = rssmb_proto::oplock::OplockLevel::None;
             let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
             let mut pending_breaks: Vec<opens::BreakNotification> = Vec::new();
+            // Break waiters from the lease/oplock grant — the oneshot
+            // receivers that resolve when each holder acks (or the 35 s
+            // server break-timeout fires). Non-empty when the create must
+            // pend for a break acknowledgment (L1: breaking1/timeout/etc.).
+            let mut pending_break_waiters: Vec<opens::BreakWaiter> = Vec::new();
             // Lease grant to echo on a future durable reconnect (None if
             // the open is not lease-backed).
             let mut granted_lease: Option<crate::durable::LeaseEcho> = None;
@@ -3670,6 +3707,14 @@ async fn handle_create(
                 }
             };
 
+            // Samba delay_for_oplock (open.c): SUPERSEDE/OVERWRITE/OVERWRITE_IF
+            // set `will_overwrite`, which drops H and R from the break target.
+            let will_overwrite = matches!(
+                create_req.create_disposition,
+                rssmb_proto::create::CreateDisposition::Superseded
+                    | rssmb_proto::create::CreateDisposition::Overwrite
+                    | rssmb_proto::create::CreateDisposition::OverwriteIf
+            );
             if state.config.leases && !info.attributes.directory {
                 if let Some(fid) = vfs_file_id {
                     let (dialect, client_guid) = {
@@ -3703,11 +3748,12 @@ async fn handle_create(
                                     is_v2,
                                     rqls.parent_lease_key,
                                     rqls.epoch,
+                                    will_overwrite,
                                     conn_state.write_tx.clone(),
                                 )
                                 .await
                             {
-                                Ok((grant, breaks)) => {
+                                Ok((grant, breaks, lease_waiters)) => {
                                     granted_oplock = rssmb_proto::oplock::OplockLevel::Lease;
                                     granted_lease = Some(crate::durable::LeaseEcho {
                                         lease_key: grant.lease_key,
@@ -3719,6 +3765,7 @@ async fn handle_create(
                                     resp_ctx_items
                                         .push((RQLS_NAME, build_rqls_response_data(&grant)));
                                     pending_breaks = breaks;
+                                    pending_break_waiters = lease_waiters;
                                 }
                                 Err(()) => {
                                     // Lease key collision with a different underlying file.
@@ -3751,7 +3798,7 @@ async fn handle_create(
                             _ => 0x00,
                         };
                         if req_level != 0x00 {
-                            let (granted, breaks) = state
+                            let (granted, breaks, oplock_waiters) = state
                                 .open_table
                                 .request_oplock(
                                     fid,
@@ -3759,6 +3806,7 @@ async fn handle_create(
                                     file_id,
                                     req_level,
                                     conn_state.write_tx.clone(),
+                                    will_overwrite,
                                 )
                                 .await;
                             granted_oplock = match granted {
@@ -3768,13 +3816,15 @@ async fn handle_create(
                                 _ => rssmb_proto::oplock::OplockLevel::None,
                             };
                             pending_breaks = breaks;
+                            pending_break_waiters = oplock_waiters;
                         } else {
                             // Non-leased open still breaks any existing Write lease/oplock on this file.
-                            let (breaks, _waiters) = state
+                            let (breaks, waiters) = state
                                 .open_table
-                                .break_for_op(fid, Some(open_id), opens::ConflictOp::Read)
+                                .break_for_open(fid, open_id, will_overwrite, false)
                                 .await;
                             pending_breaks = breaks;
+                            pending_break_waiters = waiters;
                         }
                     }
                 }
@@ -3782,6 +3832,15 @@ async fn handle_create(
 
             // Deliver any triggered break notifications to other lease/oplock holders.
             send_break_notifications(&pending_breaks).await;
+
+            // Arm the 35 s server break-timeout for each pending break
+            // (MS-SMB2 3.3.4.7; Samba OPLOCK_BREAK_TIMEOUT=35). The timer
+            // downgrades the lease to NONE and resolves the waiter if the
+            // holder never acks (L1: timeout, timeout-disconnect).
+            state.open_table.arm_break_timers(&pending_break_waiters);
+            // Only breaks that remove a delay-mask bit (or hit a lease that
+            // is already mid-break) make the create pend (breaking4).
+            pending_break_waiters.retain(|w| w.delay);
 
             // Durability precondition (MS-SMB2 3.3.5.9.10, golden tables in
             // tests/conformance/durable-v2-open-analysis.md): a durable
@@ -3964,6 +4023,21 @@ async fn handle_create(
                 file_id,
                 create_contexts,
             };
+
+            // A break that removes a delay-mask bit pends the CREATE
+            // (MS-SMB2 3.3.4.7; Samba delay_for_oplock_fn): interim
+            // STATUS_PENDING now, the CreateResponse once every holder acks
+            // or its 35 s break timer expires.
+            if !pending_break_waiters.is_empty() {
+                return pend_until_breaks(
+                    conn_state,
+                    &req.header,
+                    std::mem::take(&mut pending_break_waiters),
+                    Command::Create,
+                    Ok(ResponseContent::Create(create_response)),
+                )
+                .await;
+            }
 
             let response = build_response(&req.header, ResponseContent::Create(create_response));
             FramedResponse::Plain(response)
@@ -4150,7 +4224,10 @@ async fn handle_close(
                 let mut pending = conn_state.pending_async.lock().await;
                 let to_remove: Vec<u64> = pending
                     .iter()
-                    .filter(|(_, op)| op.tree_id == tree_id)
+                    // Only CHANGE_NOTIFY is tied to a handle being closed;
+                    // other async ops (deferred CREATE / rename awaiting a
+                    // lease-break ack) must survive unrelated CLOSEs.
+                    .filter(|(_, op)| op.tree_id == tree_id && op.command == Command::ChangeNotify)
                     .map(|(k, _)| *k)
                     .collect();
                 for key in to_remove {
@@ -4266,11 +4343,12 @@ async fn handle_read(
             );
         }
         // Break any Write lease/oplock held by another client on this file.
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Read)
             .await;
         send_break_notifications(&breaks).await;
+        state.open_table.arm_break_timers(&waiters);
     }
 
     // Read from VFS
@@ -4461,11 +4539,15 @@ async fn handle_write(
             );
         }
         // Break any Read or Write lease/oplock held by another client on this file.
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
             .await;
         send_break_notifications(&breaks).await;
+        // Arm the 35 s break-timeout for any ack-required breaks (the
+        // write itself is fire-and-forget, but the lease must not stay
+        // stuck in breaking if the holder never acks).
+        state.open_table.arm_break_timers(&waiters);
     }
 
     match entry
@@ -5044,11 +5126,12 @@ async fn handle_set_info(
             match rssmb_proto::fscc::FileEndOfFileInformation::read_le(&mut cursor) {
                 Ok(eof) => {
                     if let Some(fid) = entry.file_id {
-                        let (breaks, _waiters) = state
+                        let (breaks, waiters) = state
                             .open_table
                             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
                             .await;
                         send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
                     }
                     let mut info = match entry
                         .vfs
@@ -5120,7 +5203,7 @@ async fn handle_set_info(
                     }
                     if delete_pending {
                         if let Some(fid) = entry.file_id {
-                            let (breaks, _waiters) = state
+                            let (breaks, waiters) = state
                                 .open_table
                                 .break_for_op(
                                     fid,
@@ -5129,6 +5212,7 @@ async fn handle_set_info(
                                 )
                                 .await;
                             send_break_notifications(&breaks).await;
+                            state.open_table.arm_break_timers(&waiters);
                         }
                     }
                     match entry
@@ -5184,18 +5268,130 @@ async fn handle_set_info(
             let mut cursor = std::io::Cursor::new(&raw_data[..]);
             match rssmb_proto::fscc::FileRenameInformation::read_le(&mut cursor) {
                 Ok(rename) => {
+                    let new_name = rename.file_name.to_string();
+                    let replace = rename.replace_if_exists.into();
                     if let Some(fid) = entry.file_id {
-                        let (breaks, _waiters) = state
+                        // Samba delay_rename_for_lease_break (smb2_setinfo.c):
+                        // a rename defers iff another lease on this file holds
+                        // Handle caching — the break target is state minus H
+                        // (keep R+W), and the rename pends until the holder
+                        // acks or the 70 s timeout fires (rename_wait golden).
+                        let (breaks, waiters) = state
                             .open_table
-                            .break_for_op(
-                                fid,
-                                Some(entry.open_id),
-                                opens::ConflictOp::HandleOrDelete,
-                            )
+                            .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Rename)
                             .await;
                         send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
+                        if !waiters.is_empty() {
+                            // Rename must pend for the H-removing break.
+                            // Return an interim PENDING and spawn a completion
+                            // task that awaits the break waiters (with 70 s
+                            // cap) then performs the rename.
+                            let message_id = req.header.message_id;
+                            let session_id = req.header.session_id;
+                            let tree_id = req.header.tree_id.unwrap_or(0);
+                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                            conn_state.pending_async.lock().await.insert(
+                                message_id,
+                                AsyncOp {
+                                    command: Command::SetInfo,
+                                    session_id,
+                                    tree_id,
+                                    cancel: cancel_tx,
+                                    notify_handle: None,
+                                },
+                            );
+                            // Send interim STATUS_PENDING. Construct manually
+                            // (build_response overwrites flags/status).
+                            let mut pending_hdr = req.header.clone();
+                            pending_hdr.status = NtStatus::Pending.to_u32();
+                            pending_hdr.to_async(message_id);
+                            pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+                            let pending_resp = PlainResponse {
+                                header: pending_hdr,
+                                content: ResponseContent::Error(
+                                    rssmb_proto::error::ErrorResponse { error_data: vec![] },
+                                ),
+                            };
+                            // Spawn completion task.
+                            let state_clone = state.clone();
+                            let conn_clone = conn_state.clone();
+                            let vfs_clone = entry.vfs.clone();
+                            let open_id = entry.open_id;
+                            let req_header = req.header.clone();
+                            let client_signed = req.header.flags.signed();
+                            tokio::spawn(async move {
+                                let timeout =
+                                    tokio::time::sleep(std::time::Duration::from_secs(70));
+                                let wait_all = futures::future::join_all(
+                                    waiters.into_iter().map(|w| w.receiver),
+                                );
+                                tokio::pin!(wait_all);
+                                tokio::pin!(timeout);
+                                tokio::select! {
+                                    _ = wait_all => {}
+                                    _ = timeout => {}
+                                    _ = cancel_rx => {
+                                        conn_clone.pending_async.lock().await.remove(&message_id);
+                                        return;
+                                    }
+                                }
+                                conn_clone.pending_async.lock().await.remove(&message_id);
+                                match vfs_clone.rename(open_id, &new_name, replace).await {
+                                    Ok(()) => {
+                                        let mut resp = build_response(
+                                            &req_header,
+                                            ResponseContent::SetInfo(
+                                                rssmb_proto::info::SetInfoResponse::default(),
+                                            ),
+                                        );
+                                        resp.header.to_async(message_id);
+                                        let framed = FramedResponse::Plain(resp);
+                                        send_unsolicited(&conn_clone, &framed, client_signed).await;
+                                    }
+                                    Err(e) => {
+                                        let status = match e {
+                                            rssmb_vfs::VfsError::InvalidHandle => {
+                                                NtStatus::InvalidHandle
+                                            }
+                                            rssmb_vfs::VfsError::AlreadyExists => {
+                                                NtStatus::ObjectNameCollision
+                                            }
+                                            rssmb_vfs::VfsError::AccessDenied => {
+                                                NtStatus::AccessDenied
+                                            }
+                                            rssmb_vfs::VfsError::NotFound => {
+                                                NtStatus::ObjectNameNotFound
+                                            }
+                                            rssmb_vfs::VfsError::DirectoryNotEmpty => {
+                                                NtStatus::DirectoryNotEmpty
+                                            }
+                                            rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
+                                            _ => NtStatus::InvalidParameter,
+                                        };
+                                        let err_resp = error_response_for(
+                                            Command::SetInfo,
+                                            status,
+                                            &req_header,
+                                        );
+                                        // Convert to async for the pended response.
+                                        let framed = match err_resp {
+                                            FramedResponse::Plain(mut p) => {
+                                                p.header.to_async(message_id);
+                                                FramedResponse::Plain(p)
+                                            }
+                                            other => other,
+                                        };
+                                        send_unsolicited(&conn_clone, &framed, client_signed).await;
+                                    }
+                                }
+                                let _ = state_clone; // keep alive
+                            });
+                            // Return the interim PENDING response; the
+                            // completion is sent out-of-band.
+                            return FramedResponse::Plain(pending_resp);
+                        }
                     }
-                    let new_name = rename.file_name.to_string();
                     debug!(conn_id = conn_state.conn_id, new_name = %new_name, "set_info rename");
                     match entry
                         .vfs
@@ -5810,11 +6006,12 @@ async fn handle_lock(
         ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
     );
     if !acquired.is_empty() {
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(file_id, Some(entry.open_id), opens::ConflictOp::Lock)
             .await;
         send_break_notifications(&breaks).await;
+        state.open_table.arm_break_timers(&waiters);
     }
     FramedResponse::Plain(response)
 }
@@ -6042,6 +6239,70 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
 /// plaintext once encryption is selected — if the encryption state is
 /// missing after the decision, the response is dropped (not sent
 /// unencrypted).
+/// Pend a request until every break waiter resolves (ack or 35 s expiry),
+/// then send `outcome` as the async final response. Returns the interim
+/// STATUS_PENDING to send now. Registered in `pending_async` so CANCEL and
+/// disconnect drop it. Same wire shape as the deferred-CREATE path.
+async fn pend_until_breaks(
+    conn_state: &ConnState,
+    req_header: &Header,
+    waiters: Vec<opens::BreakWaiter>,
+    command: Command,
+    outcome: Result<ResponseContent, NtStatus>,
+) -> FramedResponse {
+    let message_id = req_header.message_id;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    conn_state.pending_async.lock().await.insert(
+        message_id,
+        AsyncOp {
+            command,
+            session_id: req_header.session_id,
+            tree_id: req_header.tree_id.unwrap_or(0),
+            cancel: cancel_tx,
+            notify_handle: None,
+        },
+    );
+    let mut pending_hdr = req_header.clone();
+    pending_hdr.status = NtStatus::Pending.to_u32();
+    pending_hdr.to_async(message_id);
+    pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+    let pending_resp = PlainResponse {
+        header: pending_hdr,
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+    };
+    let conn_clone = conn_state.clone();
+    let req_header = req_header.clone();
+    tokio::spawn(async move {
+        let wait_all = futures::future::join_all(waiters.into_iter().map(|w| w.receiver));
+        let safety_timeout = tokio::time::sleep(std::time::Duration::from_secs(36));
+        tokio::pin!(wait_all);
+        tokio::pin!(safety_timeout);
+        tokio::select! {
+            _ = wait_all => {}
+            _ = safety_timeout => {}
+            _ = cancel_rx => {
+                conn_clone.pending_async.lock().await.remove(&message_id);
+                return;
+            }
+        }
+        conn_clone.pending_async.lock().await.remove(&message_id);
+        let (content, status) = match outcome {
+            Ok(c) => (c, NtStatus::Success),
+            Err(s) => (
+                ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+                s,
+            ),
+        };
+        let mut resp = build_response(&req_header, content);
+        resp.header.to_async(message_id);
+        resp.header.status = status.to_u32();
+        resp.header.credit_charge = 0;
+        resp.header.credit_request = 0;
+        send_unsolicited(&conn_clone, &FramedResponse::Plain(resp), true).await;
+    });
+    FramedResponse::Plain(pending_resp)
+}
+
 pub(crate) async fn send_unsolicited(
     conn_state: &ConnState,
     resp: &FramedResponse,
@@ -6433,7 +6694,13 @@ fn error_response_for(command: Command, status: NtStatus, req_header: &Header) -
 
 /// Construct a PlainResponse mirroring the request header.
 pub(crate) fn build_response(req_header: &Header, content: ResponseContent) -> PlainResponse {
-    let command = content.associated_cmd();
+    // Error responses don't carry their own command — use the request's
+    // command (the command that errored). All other content variants map
+    // to their associated command.
+    let command = match &content {
+        ResponseContent::Error(_) => req_header.command,
+        _ => content.associated_cmd(),
+    };
     PlainResponse {
         header: Header {
             credit_charge: req_header.credit_charge,

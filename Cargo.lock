@@ -2234,6 +2234,7 @@ dependencies = [
  "binrw",
  "bytes",
  "cmac",
+ "futures",
  "hmac 0.12.1",
  "libc",
  "notify",

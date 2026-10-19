@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use rssmb_vfs::{DesiredAccess, FileId, OpenId, ShareAccess};
@@ -91,6 +92,34 @@ impl LeaseCaching {
     pub fn is_subset_of(self, other: Self) -> bool {
         (self.to_bits() & !other.to_bits()) == 0
     }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self::from_bits(self.to_bits() & other.to_bits())
+    }
+
+    pub fn minus(self, other: Self) -> Self {
+        Self::from_bits(self.to_bits() & !other.to_bits())
+    }
+
+    pub fn is_none(self) -> bool {
+        self.to_bits() == 0
+    }
+
+    pub const R: Self = Self {
+        read: true,
+        handle: false,
+        write: false,
+    };
+    pub const H: Self = Self {
+        read: false,
+        handle: true,
+        write: false,
+    };
+    pub const W: Self = Self {
+        read: false,
+        handle: false,
+        write: true,
+    };
 }
 
 /// Unique identifier for a Lease in the global lease table: `(ClientGuid, LeaseKey)`.
@@ -120,6 +149,9 @@ pub enum ConflictOp {
     Write,
     /// Another handle is renaming or setting delete-on-close (breaks H and W, or R/H/W).
     HandleOrDelete,
+    /// Another handle is renaming the file. Samba `delay_rename_lease_break_fn`
+    /// (smb2_setinfo.c): only leases holding H are broken, to `state & !H`.
+    Rename,
     /// Byte-range lock acquired on the file (breaks R/H/W).
     Lock,
 }
@@ -142,6 +174,33 @@ pub enum BreakNotification {
     },
 }
 
+/// A pending break acknowledgment — the oneshot resolves when the holder
+/// acks (or the 35 s server break-timeout fires). Carries the identity and
+/// `break_generation` so the caller can arm the per-break expiry timer
+/// after releasing the write lock.
+#[derive(Debug)]
+pub struct BreakWaiter {
+    pub receiver: tokio::sync::oneshot::Receiver<()>,
+    /// Which lease or oplock this waiter belongs to.
+    pub target: BreakTarget,
+    /// The `break_generation` captured at break-initiation time. The
+    /// timer no-ops if the generation no longer matches (the lease was
+    /// acked or re-broken in the meantime).
+    pub generation: u64,
+    /// Whether the triggering operation must pend on this waiter. Samba
+    /// `delay_for_oplock_fn`: a create only pends when the holder's state
+    /// intersects the delay mask (W, or H under a sharing violation) — an
+    /// ack-required RH→NONE break on overwrite does NOT block the opener
+    /// (breaking4). The 35 s expiry timer is armed for every waiter.
+    pub delay: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BreakTarget {
+    Lease(LeaseId),
+    Oplock(OpenId),
+}
+
 #[derive(Debug)]
 struct LeaseRecord {
     file_id: FileId,
@@ -155,6 +214,15 @@ struct LeaseRecord {
     handles: HashSet<OpenId>,
     notify_tx: LeaseNotifySender,
     break_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// Internal generation — bumped every time a break is initiated (both
+    /// v1 and v2). Carried by the per-break 35 s expiry timer; the timer
+    /// no-ops if the generation no longer matches (the lease was acked or
+    /// re-broken in the meantime). Samba calls this `lease_epoch` and
+    /// guards on epoch + BREAK_IN_PROGRESS (smb2_oplock.c
+    /// `lease_timeout_handler`); we use an independent counter because v1
+    /// leases keep `epoch` at 0 and we don't want a race on an epoch the
+    /// wire protocol doesn't carry.
+    break_generation: u64,
 }
 
 #[derive(Debug)]
@@ -167,6 +235,9 @@ struct OplockRecord {
     pending_breaking_to: Option<u8>,
     notify_tx: LeaseNotifySender,
     break_waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// Same-generation guard as `LeaseRecord::break_generation` for the
+    /// oplock expiry timer.
+    break_generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -177,56 +248,186 @@ struct LeaseManager {
 
 impl LeaseManager {
     /// Break other lease/oplock holders when a new open arrives on `file_id`.
+    ///
+    /// Returns break notifications to send immediately and oneshot receivers
+    /// that resolve when each holder acks its break (or the 35 s server
+    /// break-timeout fires). The caller (CREATE dispatch) awaits these to
+    /// pend the conflicting create until the break completes — MS-SMB2
+    /// 3.3.4.7 / Samba `delay_for_oplock_fn` (open.c).
+    ///
+    /// `will_overwrite` is true for SUPERSede/OVERWRITE/OVERWRITE_IF
+    /// dispositions: the break target additionally drops H and R (the file
+    /// is being replaced/truncated). `sharing_violation` flips the delay
+    /// mask from WRITE to HANDLE — under a share conflict the create must
+    /// pend on an H-removing break (timeout-disconnect golden), not just W.
     fn break_other_holders_on_open(
         &mut self,
         file_id: FileId,
         actor_lease: Option<LeaseId>,
         actor_open: OpenId,
-        _requested: LeaseCaching,
-    ) -> Vec<BreakNotification> {
+        will_overwrite: bool,
+        sharing_violation: bool,
+    ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
+        // Samba delay_for_oplock (open.c): the delay mask is H under a
+        // sharing violation, W otherwise; overwrite dispositions also drop
+        // H and R from the break target.
+        let delay_mask = if sharing_violation {
+            LeaseCaching::H
+        } else {
+            LeaseCaching::W
+        };
         let mut out = Vec::new();
+        let mut waiters = Vec::new();
         for (id, rec) in self.leases.iter_mut() {
             if rec.file_id != file_id || Some(*id) == actor_lease || rec.handles.is_empty() {
                 continue;
             }
-            if rec.state.write {
-                let current = rec.state;
-                let target = LeaseCaching {
-                    read: rec.state.read,
-                    handle: rec.state.handle,
-                    write: false,
-                };
-                if !rec.breaking {
-                    rec.breaking = true;
-                    rec.break_to = target;
-                    if rec.is_v2 {
-                        rec.epoch = rec.epoch.wrapping_add(1);
-                    }
-                    out.push(BreakNotification::Lease {
-                        notify_tx: rec.notify_tx.clone(),
-                        lease_key: id.lease_key,
-                        current_state: current,
-                        new_state: target,
-                        new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
-                        ack_required: true,
+            let e = rec.state;
+            let mut break_to = e.minus(delay_mask);
+            if will_overwrite {
+                break_to = break_to.minus(LeaseCaching::H.union(LeaseCaching::R));
+            }
+            if e.minus(break_to).is_none() {
+                // Nothing to break — but a lease already mid-break still
+                // delays the opener until the break completes.
+                if rec.breaking {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rec.break_waiters.push(tx);
+                    waiters.push(BreakWaiter {
+                        receiver: rx,
+                        target: BreakTarget::Lease(*id),
+                        generation: rec.break_generation,
+                        delay: true,
                     });
                 }
-            }
-        }
-        for (oid, rec) in self.oplocks.iter_mut() {
-            if rec.file_id != file_id || *oid == actor_open {
                 continue;
             }
-            if (rec.level == 0x08 || rec.level == 0x09) && rec.breaking_to.is_none() {
-                rec.breaking_to = Some(0x01);
-                out.push(BreakNotification::Oplock {
-                    notify_tx: rec.notify_tx.clone(),
-                    smb_file_id: rec.smb_file_id,
-                    new_oplock_level: 0x01,
+            let delay = !e.intersect(delay_mask).is_none();
+            // Samba process_oplock_break (smb2_oplock.c).
+            if rec.breaking {
+                // Already breaking: narrow the required target; no new
+                // break message goes out until the current one is acked.
+                let required = rec
+                    .pending_break_to
+                    .unwrap_or(rec.break_to)
+                    .intersect(break_to);
+                if required != rec.break_to {
+                    rec.pending_break_to = Some(required);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rec.break_waiters.push(tx);
+                waiters.push(BreakWaiter {
+                    receiver: rx,
+                    target: BreakTarget::Lease(*id),
+                    generation: rec.break_generation,
+                    delay,
                 });
+                continue;
             }
+            let current = rec.state;
+            if rec.is_v2 {
+                rec.epoch = rec.epoch.wrapping_add(1);
+            }
+            // MS-SMB2 3.3.4.7: an ack is required iff the lease holds H or W.
+            let ack_required = e.handle || e.write;
+            if ack_required {
+                rec.breaking = true;
+                rec.break_to = break_to;
+                rec.pending_break_to = None;
+                rec.break_generation = rec.break_generation.wrapping_add(1);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rec.break_waiters.push(tx);
+                waiters.push(BreakWaiter {
+                    receiver: rx,
+                    target: BreakTarget::Lease(*id),
+                    generation: rec.break_generation,
+                    delay,
+                });
+            } else {
+                // R-only → NONE: async break, no ack (breaking5).
+                rec.state = LeaseCaching::NONE;
+            }
+            out.push(BreakNotification::Lease {
+                notify_tx: rec.notify_tx.clone(),
+                lease_key: id.lease_key,
+                current_state: current,
+                new_state: break_to,
+                new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
+                ack_required,
+            });
         }
-        out
+        let mut oplocks_to_remove = Vec::new();
+        for (oid, rec) in self.oplocks.iter_mut() {
+            if rec.file_id != file_id || *oid == actor_open || rec.level == 0 {
+                continue;
+            }
+            // Oplock level as lease bits: batch=RWH, exclusive=RW, II=R.
+            let e = match rec.level {
+                0x09 => LeaseCaching::from_bits(0x07),
+                0x08 => LeaseCaching::from_bits(0x05),
+                _ => LeaseCaching::R,
+            };
+            let mut break_to = e.minus(delay_mask);
+            if will_overwrite {
+                break_to = break_to.minus(LeaseCaching::H.union(LeaseCaching::R));
+            }
+            let breaking = rec.breaking_to.is_some();
+            if e.minus(break_to).is_none() {
+                if breaking {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rec.break_waiters.push(tx);
+                    waiters.push(BreakWaiter {
+                        receiver: rx,
+                        target: BreakTarget::Oplock(*oid),
+                        generation: rec.break_generation,
+                        delay: true,
+                    });
+                }
+                continue;
+            }
+            // Oplock break targets never keep H or W.
+            let new_level: u8 = if break_to.read { 0x01 } else { 0x00 };
+            let delay = !e.intersect(delay_mask).is_none();
+            let ack_req = rec.level == 0x08 || rec.level == 0x09;
+            if breaking {
+                if new_level == 0x00 && rec.breaking_to == Some(0x01) {
+                    rec.pending_breaking_to = Some(0x00);
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rec.break_waiters.push(tx);
+                waiters.push(BreakWaiter {
+                    receiver: rx,
+                    target: BreakTarget::Oplock(*oid),
+                    generation: rec.break_generation,
+                    delay,
+                });
+                continue;
+            }
+            if ack_req {
+                rec.breaking_to = Some(new_level);
+                rec.break_generation = rec.break_generation.wrapping_add(1);
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rec.break_waiters.push(tx);
+                waiters.push(BreakWaiter {
+                    receiver: rx,
+                    target: BreakTarget::Oplock(*oid),
+                    generation: rec.break_generation,
+                    delay,
+                });
+            } else {
+                rec.level = 0x00;
+                oplocks_to_remove.push(*oid);
+            }
+            out.push(BreakNotification::Oplock {
+                notify_tx: rec.notify_tx.clone(),
+                smb_file_id: rec.smb_file_id,
+                new_oplock_level: new_level,
+            });
+        }
+        for oid in oplocks_to_remove {
+            self.oplocks.remove(&oid);
+        }
+        (out, waiters)
     }
 
     fn trigger_breaks(
@@ -235,12 +436,9 @@ impl LeaseManager {
         actor_lease: Option<LeaseId>,
         actor_open: Option<OpenId>,
         op: ConflictOp,
-    ) -> (
-        Vec<BreakNotification>,
-        Vec<tokio::sync::oneshot::Receiver<()>>,
-    ) {
+    ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
         let mut notifications = Vec::new();
-        let mut receivers = Vec::new();
+        let mut waiters = Vec::new();
 
         for (id, rec) in self.leases.iter_mut() {
             if rec.file_id != file_id || Some(*id) == actor_lease || rec.handles.is_empty() {
@@ -270,6 +468,12 @@ impl LeaseManager {
                     }
                     LeaseCaching::NONE
                 }
+                ConflictOp::Rename => {
+                    if !rec.state.handle {
+                        continue;
+                    }
+                    rec.state.minus(LeaseCaching::H)
+                }
             };
 
             if rec.state == target {
@@ -288,9 +492,15 @@ impl LeaseManager {
                 if ack_required {
                     rec.breaking = true;
                     rec.break_to = target;
+                    rec.break_generation = rec.break_generation.wrapping_add(1);
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     rec.break_waiters.push(tx);
-                    receivers.push(rx);
+                    waiters.push(BreakWaiter {
+                        receiver: rx,
+                        target: BreakTarget::Lease(*id),
+                        generation: rec.break_generation,
+                        delay: true,
+                    });
                 } else {
                     rec.state = target;
                 }
@@ -323,7 +533,12 @@ impl LeaseManager {
                 if ack_required {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     rec.break_waiters.push(tx);
-                    receivers.push(rx);
+                    waiters.push(BreakWaiter {
+                        receiver: rx,
+                        target: BreakTarget::Lease(*id),
+                        generation: rec.break_generation,
+                        delay: true,
+                    });
                 }
             }
         }
@@ -335,7 +550,10 @@ impl LeaseManager {
             }
             let (need_break, new_level, ack_req) = match op {
                 ConflictOp::Read => (rec.level == 0x08 || rec.level == 0x09, 0x01, true),
-                ConflictOp::Write | ConflictOp::HandleOrDelete | ConflictOp::Lock => {
+                ConflictOp::Write
+                | ConflictOp::HandleOrDelete
+                | ConflictOp::Rename
+                | ConflictOp::Lock => {
                     (rec.level != 0, 0x00, rec.level == 0x08 || rec.level == 0x09)
                 }
             };
@@ -345,9 +563,15 @@ impl LeaseManager {
             if rec.breaking_to.is_none() {
                 if ack_req {
                     rec.breaking_to = Some(new_level);
+                    rec.break_generation = rec.break_generation.wrapping_add(1);
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     rec.break_waiters.push(tx);
-                    receivers.push(rx);
+                    waiters.push(BreakWaiter {
+                        receiver: rx,
+                        target: BreakTarget::Oplock(*oid),
+                        generation: rec.break_generation,
+                        delay: true,
+                    });
                 } else {
                     rec.level = 0x00;
                     oplocks_to_remove.push(*oid);
@@ -363,14 +587,19 @@ impl LeaseManager {
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 rec.break_waiters.push(tx);
-                receivers.push(rx);
+                waiters.push(BreakWaiter {
+                    receiver: rx,
+                    target: BreakTarget::Oplock(*oid),
+                    generation: rec.break_generation,
+                    delay: true,
+                });
             }
         }
         for oid in oplocks_to_remove {
             self.oplocks.remove(&oid);
         }
 
-        (notifications, receivers)
+        (notifications, waiters)
     }
 }
 
@@ -1036,8 +1265,9 @@ impl OpenTable {
         is_v2: bool,
         parent_lease_key: Option<[u8; 16]>,
         client_epoch: u16,
+        will_overwrite: bool,
         notify_tx: LeaseNotifySender,
-    ) -> Result<(LeaseGrant, Vec<BreakNotification>), ()> {
+    ) -> Result<(LeaseGrant, Vec<BreakNotification>, Vec<BreakWaiter>), ()> {
         let total_opens = self.count(file_id).await;
         let mut mgr = self.leases.write().await;
         let id = LeaseId {
@@ -1056,7 +1286,6 @@ impl OpenTable {
         // 2. Break any conflicting leases/oplocks held by OTHER owners on `file_id`
         //    if our requested state requires exclusivity or if existing holders
         //    hold Write caching.
-        let mut breaks = Vec::new();
         let other_leases_exist = mgr
             .leases
             .iter()
@@ -1081,7 +1310,8 @@ impl OpenTable {
         let non_leased_other_opens = total_opens > this_lease_opens && !other_leases_exist;
 
         // Opening a file from another lease key breaks Write caching on existing leases/oplocks.
-        breaks.extend(mgr.break_other_holders_on_open(file_id, Some(id), open_id, requested));
+        let (breaks, break_waiters) =
+            mgr.break_other_holders_on_open(file_id, Some(id), open_id, will_overwrite, false);
 
         // 3. Compute the maximum caching we can grant for `requested`.
         //    - Write caching (W) requires R (or RH) and NO other opens outside this lease.
@@ -1117,6 +1347,7 @@ impl OpenTable {
             handles: HashSet::new(),
             notify_tx: notify_tx.clone(),
             break_waiters: Vec::new(),
+            break_generation: 0,
         });
 
         entry.handles.insert(open_id);
@@ -1156,11 +1387,8 @@ impl OpenTable {
             is_v2: entry.is_v2,
         };
 
-        Ok((grant, breaks))
+        Ok((grant, breaks, break_waiters))
     }
-
-    /// Request a traditional Oplock (`0x01` Level II, `0x08` Exclusive, `0x09` Batch)
-    /// for `open_id` on `file_id`.
     pub async fn request_oplock(
         &self,
         file_id: FileId,
@@ -1168,20 +1396,13 @@ impl OpenTable {
         smb_file_id: rssmb_proto::create::FileId,
         requested_level: u8,
         notify_tx: LeaseNotifySender,
-    ) -> (u8, Vec<BreakNotification>) {
+        will_overwrite: bool,
+    ) -> (u8, Vec<BreakNotification>, Vec<BreakWaiter>) {
         let total_opens = self.count(file_id).await;
         let mut mgr = self.leases.write().await;
 
-        let breaks = mgr.break_other_holders_on_open(
-            file_id,
-            None,
-            open_id,
-            LeaseCaching {
-                read: true,
-                handle: requested_level == 0x09,
-                write: requested_level == 0x08 || requested_level == 0x09,
-            },
-        );
+        let (breaks, break_waiters) =
+            mgr.break_other_holders_on_open(file_id, None, open_id, will_overwrite, false);
 
         let granted = if total_opens <= 1
             && !mgr
@@ -1212,27 +1433,46 @@ impl OpenTable {
                     pending_breaking_to: None,
                     notify_tx,
                     break_waiters: Vec::new(),
+                    break_generation: 0,
                 },
             );
         }
 
-        (granted, breaks)
+        (granted, breaks, break_waiters)
     }
 
     /// Trigger breaks on `file_id` before an operation (`op`) performed by `actor_open_id`.
     ///
-    /// Returns any `BreakNotification`s to send immediately and `oneshot::Receiver`s
-    /// to await (with the 35s lease break timeout) when an ACK is required before
-    /// the conflicting operation proceeds.
+    /// Returns any `BreakNotification`s to send immediately and `BreakWaiter`s
+    /// to await (with the 35 s lease break timeout) when an ACK is required
+    /// before the conflicting operation proceeds.
+    /// Break other holders for a new open that requests no lease/oplock
+    /// (Samba `delay_for_oplock`, open.c). `sharing_violation` selects the H
+    /// delay mask: the opener pends on an H-removing break and re-checks the
+    /// share modes afterwards (timeout-disconnect).
+    pub async fn break_for_open(
+        &self,
+        file_id: FileId,
+        actor_open: OpenId,
+        will_overwrite: bool,
+        sharing_violation: bool,
+    ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
+        let mut mgr = self.leases.write().await;
+        mgr.break_other_holders_on_open(
+            file_id,
+            None,
+            actor_open,
+            will_overwrite,
+            sharing_violation,
+        )
+    }
+
     pub async fn break_for_op(
         &self,
         file_id: FileId,
         actor_open_id: Option<OpenId>,
         op: ConflictOp,
-    ) -> (
-        Vec<BreakNotification>,
-        Vec<tokio::sync::oneshot::Receiver<()>>,
-    ) {
+    ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
         let mut mgr = self.leases.write().await;
         let actor_lease = actor_open_id.and_then(|oid| {
             mgr.leases
@@ -1265,43 +1505,46 @@ impl OpenTable {
         if !rec.breaking {
             return Err(rssmb_wire_adapter::NtStatus::Other(0xC000_0001)); // STATUS_UNSUCCESSFUL
         }
-        // MS-SMB2 3.3.5.19.2: Client must acknowledge a state <= BreakToLeaseState.
+        // Samba smbd_smb2_lease_break_ack (smb2_oplock.c): the acked state
+        // must be a subset of the advertised break_to, else
+        // STATUS_REQUEST_NOT_ACCEPTED (breaking2).
         if !acked_state.is_subset_of(rec.break_to) {
-            return Err(rssmb_wire_adapter::NtStatus::InvalidParameter);
+            return Err(rssmb_wire_adapter::NtStatus::Other(0xC000_00D0));
         }
         rec.state = acked_state;
-        // Check if a stricter break was queued while the first break was in flight.
-        if let Some(next_target) = rec.pending_break_to.take() {
-            if !rec.state.is_subset_of(next_target) {
-                let target = LeaseCaching {
-                    read: rec.state.read && next_target.read,
-                    handle: rec.state.handle && next_target.handle,
-                    write: rec.state.write && next_target.write,
-                };
-                let ack_req = rec.state.handle || rec.state.write;
-                if rec.is_v2 {
-                    rec.epoch = rec.epoch.wrapping_add(1);
-                }
-                let notif = BreakNotification::Lease {
-                    notify_tx: rec.notify_tx.clone(),
-                    lease_key: id.lease_key,
-                    current_state: rec.state,
-                    new_state: target,
-                    new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
-                    ack_required: ack_req,
-                };
-                if ack_req {
-                    rec.breaking = true;
-                    rec.break_to = target;
-                    return Ok((acked_state, Some(notif)));
-                }
-                rec.state = target;
-                rec.breaking = false;
-                for tx in std::mem::take(&mut rec.break_waiters) {
-                    let _ = tx.send(());
+        // If a stricter break was required while this one was in flight,
+        // break further. Samba breaks in steps: while the state still holds
+        // W or H, the next advertised target keeps R (breaking3).
+        let required = rec.pending_break_to.take().unwrap_or(rec.break_to);
+        if !acked_state.is_subset_of(required) {
+            let mut next = required;
+            let ack_req = acked_state.handle || acked_state.write;
+            if ack_req {
+                next = next.union(LeaseCaching::R).intersect(acked_state);
+            }
+            let notif = BreakNotification::Lease {
+                notify_tx: rec.notify_tx.clone(),
+                lease_key: id.lease_key,
+                current_state: acked_state,
+                new_state: next,
+                // Samba does not bump the epoch for the additional break.
+                new_epoch: if rec.is_v2 { rec.epoch } else { 0 },
+                ack_required: ack_req,
+            };
+            if ack_req {
+                rec.breaking = true;
+                rec.break_to = next;
+                if next != required {
+                    rec.pending_break_to = Some(required);
                 }
                 return Ok((acked_state, Some(notif)));
             }
+            rec.state = LeaseCaching::NONE;
+            rec.breaking = false;
+            for tx in std::mem::take(&mut rec.break_waiters) {
+                let _ = tx.send(());
+            }
+            return Ok((acked_state, Some(notif)));
         }
         rec.breaking = false;
         let waiters = std::mem::take(&mut rec.break_waiters);
@@ -1381,6 +1624,90 @@ impl OpenTable {
         }
         for oid in to_remove {
             mgr.oplocks.remove(&oid);
+        }
+    }
+
+    /// Expire a specific lease's break — the 35 s server break-timeout fired.
+    ///
+    /// Golden (Samba `lease_timeout_handler`, smb2_oplock.c:285): on expiry
+    /// the lease is downgraded to `NONE` (NOT to `break_to`), `breaking` is
+    /// cleared, and all break waiters are resolved so the pending operation
+    /// proceeds. The `expected_generation` guard prevents a stale timer
+    /// from firing after the lease was acked or re-broken (Samba's
+    /// epoch + BREAK_IN_PROGRESS race checks).
+    pub async fn expire_lease_break(&self, lease_id: LeaseId, expected_generation: u64) {
+        let mut mgr = self.leases.write().await;
+        if let Some(rec) = mgr.leases.get_mut(&lease_id) {
+            if rec.break_generation == expected_generation && rec.breaking {
+                rec.state = LeaseCaching::NONE;
+                rec.breaking = false;
+                rec.break_to = LeaseCaching::NONE;
+                rec.pending_break_to = None;
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    }
+
+    /// Expire a specific oplock's break — the 35 s server break-timeout fired.
+    ///
+    /// Same generation-guarded expiry as `expire_lease_break` for the
+    /// oplock path.
+    pub async fn expire_oplock_break(&self, open_id: OpenId, expected_generation: u64) {
+        let mut mgr = self.leases.write().await;
+        let mut to_remove = false;
+        if let Some(rec) = mgr.oplocks.get_mut(&open_id) {
+            if rec.break_generation == expected_generation && rec.breaking_to.is_some() {
+                rec.level = 0;
+                rec.breaking_to = None;
+                rec.pending_breaking_to = None;
+                for tx in std::mem::take(&mut rec.break_waiters) {
+                    let _ = tx.send(());
+                }
+                to_remove = true;
+            }
+        }
+        if to_remove {
+            mgr.oplocks.remove(&open_id);
+        }
+    }
+
+    /// Arm the 35 s server break-timeout for a lease break (MS-SMB2
+    /// 3.3.4.7; Samba `OPLOCK_BREAK_TIMEOUT` = 35, local.h:131).
+    ///
+    /// Spawns a tokio task that sleeps 35 s then calls
+    /// `expire_lease_break` with the current `break_generation`. The
+    /// generation guard inside `expire_lease_break` makes a stale timer
+    /// (the lease was acked or re-broken since) a no-op.
+    fn arm_lease_break_timer(self: &Arc<Self>, lease_id: LeaseId, generation: u64) {
+        let open_table = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            open_table.expire_lease_break(lease_id, generation).await;
+        });
+    }
+
+    /// Arm the 35 s server break-timeout for an oplock break.
+    fn arm_oplock_break_timer(self: &Arc<Self>, open_id: OpenId, generation: u64) {
+        let open_table = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            open_table.expire_oplock_break(open_id, generation).await;
+        });
+    }
+
+    /// Arm the 35 s server break-timeout for each waiter in `waiters`.
+    /// Called by the dispatch layer after receiving break waiters from
+    /// `request_lease` / `request_oplock` / `break_for_op` — the
+    /// generation captured in each `BreakWaiter` makes a stale timer
+    /// (the lease was acked or re-broken since arming) a no-op.
+    pub fn arm_break_timers(self: &Arc<Self>, waiters: &[BreakWaiter]) {
+        for w in waiters {
+            match w.target {
+                BreakTarget::Lease(id) => self.arm_lease_break_timer(id, w.generation),
+                BreakTarget::Oplock(oid) => self.arm_oplock_break_timer(oid, w.generation),
+            }
         }
     }
 
@@ -2382,7 +2709,7 @@ mod tests {
             .unwrap();
 
         // First open requests R -> granted R
-        let (grant1, breaks1) = table
+        let (grant1, breaks1, _waiters1) = table
             .request_lease(
                 fid(10),
                 oid(1),
@@ -2392,6 +2719,7 @@ mod tests {
                 false,
                 None,
                 0,
+                false,
                 tx.clone(),
             )
             .await
@@ -2404,7 +2732,7 @@ mod tests {
             .check_and_add(fid(10), entry(2, 100, ShareAccess::all()))
             .await
             .unwrap();
-        let (grant2, breaks2) = table
+        let (grant2, breaks2, _waiters2) = table
             .request_lease(
                 fid(10),
                 oid(2),
@@ -2414,6 +2742,7 @@ mod tests {
                 true,
                 None,
                 1,
+                false,
                 tx.clone(),
             )
             .await
@@ -2443,6 +2772,7 @@ mod tests {
                 false,
                 None,
                 0,
+                false,
                 tx.clone(),
             )
             .await
@@ -2463,6 +2793,7 @@ mod tests {
                 false,
                 None,
                 0,
+                false,
                 tx,
             )
             .await;
@@ -2480,7 +2811,7 @@ mod tests {
             .check_and_add(fid(5), entry(1, 100, ShareAccess::all()))
             .await
             .unwrap();
-        let (grant, _) = table
+        let (grant, _, _) = table
             .request_lease(
                 fid(5),
                 oid(1),
@@ -2490,6 +2821,7 @@ mod tests {
                 true,
                 None,
                 1,
+                false,
                 tx.clone(),
             )
             .await
@@ -2497,7 +2829,7 @@ mod tests {
         assert_eq!(grant.state, LeaseCaching::from_bits(0x07));
 
         // Conflicting write from another handle triggers break to NONE with ack_required = true
-        let (breaks, mut waiters) = table
+        let (breaks, waiters) = table
             .break_for_op(fid(5), Some(oid(99)), ConflictOp::Write)
             .await;
         assert_eq!(breaks.len(), 1);
@@ -2531,7 +2863,13 @@ mod tests {
             .unwrap();
         assert_eq!(acked, LeaseCaching::NONE);
         assert!(followup.is_none());
-        assert!(waiters.pop().unwrap().try_recv().is_ok());
+        assert!(waiters
+            .into_iter()
+            .next()
+            .unwrap()
+            .receiver
+            .try_recv()
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2555,6 +2893,7 @@ mod tests {
                 true,
                 None,
                 1,
+                false,
                 tx,
             )
             .await
@@ -2567,7 +2906,7 @@ mod tests {
         assert_eq!(breaks1.len(), 1);
 
         // 2. While RW -> R break is in flight, a Write arrives -> escalates pending target to NONE
-        let (breaks2, mut waiters2) = table
+        let (breaks2, waiters2) = table
             .break_for_op(fid(6), Some(oid(2)), ConflictOp::Write)
             .await;
         assert!(breaks2.is_empty());
@@ -2580,7 +2919,182 @@ mod tests {
             .unwrap();
         assert_eq!(acked, LeaseCaching::from_bits(0x01));
         assert!(followup.is_some());
-        assert!(waiters2.pop().unwrap().try_recv().is_ok());
+        assert!(waiters2
+            .into_iter()
+            .next()
+            .unwrap()
+            .receiver
+            .try_recv()
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn lease_break_waiter_carries_generation_for_timer_guard() {
+        // L1: a break waiter carries the break_generation captured at
+        // break-initiation time, so the 35 s expiry timer can no-op if the
+        // lease was acked or re-broken in the meantime (Samba
+        // lease_timeout_handler epoch/flags race checks).
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client1 = [1u8; 16];
+        let key1 = [0xCCu8; 16];
+
+        table
+            .check_and_add(fid(7), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let (_grant, _breaks, _) = table
+            .request_lease(
+                fid(7),
+                oid(1),
+                client1,
+                key1,
+                LeaseCaching::from_bits(0x07), // RWH
+                true,
+                None,
+                1,
+                false,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        // A conflicting write triggers break RWH -> NONE with an ack-required
+        // waiter carrying generation 1 (first break).
+        let (breaks, waiters) = table
+            .break_for_op(fid(7), Some(oid(2)), ConflictOp::Write)
+            .await;
+        assert_eq!(breaks.len(), 1);
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(waiters[0].generation, 1);
+        match waiters[0].target {
+            BreakTarget::Lease(id) => {
+                assert_eq!(id.client_guid, client1);
+                assert_eq!(id.lease_key, key1);
+            }
+            BreakTarget::Oplock(_) => panic!("expected lease target"),
+        }
+
+        // Ack the break — this resolves the waiter.
+        let (acked, followup) = table
+            .ack_lease_break(client1, key1, LeaseCaching::NONE)
+            .await
+            .unwrap();
+        assert_eq!(acked, LeaseCaching::NONE);
+        assert!(followup.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_break_expiry_downgrades_to_none_and_resolves_waiter() {
+        // L1: the 35 s server break-timeout fires → lease downgraded to NONE
+        // (NOT to break_to), breaking cleared, waiter resolved (Samba
+        // lease_timeout_handler: downgrade_lease(..., SMB2_LEASE_NONE)).
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client1 = [1u8; 16];
+        let key1 = [0xDDu8; 16];
+
+        table
+            .check_and_add(fid(8), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let (_grant, _breaks, _) = table
+            .request_lease(
+                fid(8),
+                oid(1),
+                client1,
+                key1,
+                LeaseCaching::from_bits(0x07), // RWH
+                true,
+                None,
+                1,
+                false,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        // Trigger a break RWH -> RH (ack required).
+        let (_breaks, waiters) = table
+            .break_for_op(fid(8), Some(oid(2)), ConflictOp::Read)
+            .await;
+        assert_eq!(waiters.len(), 1);
+        let generation = waiters[0].generation;
+        let mut waiter_rx = waiters.into_iter().next().unwrap().receiver;
+
+        // Simulate the 35 s timer firing — expire the break.
+        let lease_id = LeaseId {
+            client_guid: client1,
+            lease_key: key1,
+        };
+        table.expire_lease_break(lease_id, generation).await;
+
+        // The waiter should be resolved.
+        assert!(waiter_rx.try_recv().is_ok());
+
+        // The lease state should be NONE (not break_to RH).
+        let (stored_key, stored_state) = table.lease_for_open(oid(1)).await.unwrap();
+        assert_eq!(stored_key, key1);
+        assert_eq!(stored_state, LeaseCaching::NONE);
+
+        // A late ack should now return UNSUCCESSFUL (not breaking).
+        let late_ack = table
+            .ack_lease_break(client1, key1, LeaseCaching::NONE)
+            .await;
+        assert!(late_ack.is_err());
+    }
+
+    #[tokio::test]
+    async fn lease_break_expiry_stale_generation_is_noop() {
+        // L1: if the lease was acked (or re-broken) between arming the timer
+        // and its fire, the generation guard makes the expiry a no-op.
+        let table = OpenTable::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client1 = [1u8; 16];
+        let key1 = [0xEEu8; 16];
+
+        table
+            .check_and_add(fid(9), entry(1, 100, ShareAccess::all()))
+            .await
+            .unwrap();
+        let (_grant, _breaks, _) = table
+            .request_lease(
+                fid(9),
+                oid(1),
+                client1,
+                key1,
+                LeaseCaching::from_bits(0x07), // RWH
+                true,
+                None,
+                1,
+                false,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        // Break RWH -> RH (generation 1).
+        let (_breaks, waiters) = table
+            .break_for_op(fid(9), Some(oid(2)), ConflictOp::Read)
+            .await;
+        let stale_generation = waiters[0].generation;
+
+        // Ack the break (generation moves past 1).
+        let _ = table
+            .ack_lease_break(client1, key1, LeaseCaching::from_bits(0x02))
+            .await
+            .unwrap();
+
+        // Stale timer fires with generation 1 — should be a no-op.
+        // The lease is now RH (acked), not NONE.
+        let lease_id = LeaseId {
+            client_guid: client1,
+            lease_key: key1,
+        };
+        table.expire_lease_break(lease_id, stale_generation).await;
+
+        let (_, stored_state) = table.lease_for_open(oid(1)).await.unwrap();
+        assert_eq!(stored_state, LeaseCaching::from_bits(0x02)); // still RH, not NONE
     }
 
     // ---- Property tests (Phase 6.4) ----
