@@ -108,14 +108,14 @@ impl std::fmt::Debug for DurableEntry {
     }
 }
 
-/// Global table of durable opens, keyed by `CreateGuid`.
+/// Global table of durable opens.
 ///
-/// The table is a `RwLock<HashMap<[u8; 16], DurableEntry>>`. The key is the
-/// raw 16-byte representation of the `CreateGuid` (the client-supplied GUID
-/// from the DH2Q create context). A secondary index by SMB persistent id
-/// serves the DH2C/DHnC lookup path (Samba keys its global table by the
-/// persistent id and verifies the CreateGuid afterwards — a v1 `DHnC`
-/// reconnect carries no GUID and must match by id alone).
+/// v2 durable opens (DH2Q) are keyed by their client-supplied CreateGuid.
+/// v1 durable opens (DHnQ) carry no GUID — Samba keys them by the SMB
+/// persistent file id in its global table (`smb2srv_open_recreate`), so a
+/// v1 entry lives in a side table keyed by persistent id. Keeping the two
+/// apart matters: multiple concurrent v1 durables share no identity and
+/// must never evict each other.
 ///
 /// Expired entries are cleaned up lazily: every `insert`, `take`, and
 /// `sweep` call evicts entries past their deadline. A background sweeper
@@ -123,12 +123,15 @@ impl std::fmt::Debug for DurableEntry {
 /// VFS handles promptly even when no client activity triggers a lookup.
 pub struct DurableTable {
     entries: RwLock<HashMap<[u8; 16], DurableEntry>>,
+    /// v1 (DHnQ) durable opens keyed by the SMB persistent file id.
+    v1_entries: RwLock<HashMap<u64, DurableEntry>>,
 }
 
 impl DurableTable {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            v1_entries: RwLock::new(HashMap::new()),
         }
     }
 
@@ -155,6 +158,27 @@ impl DurableTable {
             });
         }
         entries.insert(create_guid, entry);
+    }
+
+    /// Insert a v1 (DHnQ) durable open, keyed by the SMB persistent file
+    /// id (Samba's key for v1 durables). Multiple concurrent v1 durables
+    /// coexist — each has its own persistent id.
+    pub async fn insert_v1(&self, smb_persistent_id: u64, entry: DurableEntry) {
+        let mut entries = self.v1_entries.write().await;
+        if let Some(old) = entries.remove(&smb_persistent_id) {
+            tracing::debug!(
+                persistent_id = smb_persistent_id,
+                "durable insert_v1: replacing stale entry, closing old VFS handle"
+            );
+            let vfs = old.vfs.clone();
+            let open_id = old.open_id;
+            tokio::spawn(async move {
+                if let Err(e) = vfs.close(open_id).await {
+                    tracing::warn!(error = %e, "durable: closing stale VFS handle failed");
+                }
+            });
+        }
+        entries.insert(smb_persistent_id, entry);
     }
 
     /// Peek at a durable open by `CreateGuid` without removing it.
@@ -185,17 +209,19 @@ impl DurableTable {
     /// is verified against the stored entry, when `None` (DHnC v1 reconnect)
     /// the GUID check is skipped — it is valid to v1-reconnect a v2-opened
     /// handle (source3/smbd/smbXsrv_open.c, smb2srv_open_recreate_fn).
+    /// v2 entries live in the guid table, v1 entries in the persistent-id
+    /// table; both are searched.
     pub async fn peek_by_persistent_id(
         &self,
         smb_persistent_id: u64,
         create_guid: Option<&[u8; 16]>,
     ) -> Result<DurableEntry, DurableReconnectError> {
-        let entries = self.entries.read().await;
-        let found = entries
-            .iter()
-            .find(|(_, e)| e.smb_persistent_id == smb_persistent_id);
-        match found {
-            Some((guid, entry)) => {
+        {
+            let entries = self.entries.read().await;
+            let found = entries
+                .iter()
+                .find(|(_, e)| e.smb_persistent_id == smb_persistent_id);
+            if let Some((guid, entry)) = found {
                 if Instant::now() > entry.deadline {
                     return Err(DurableReconnectError::Expired);
                 }
@@ -204,7 +230,22 @@ impl DurableTable {
                         return Err(DurableReconnectError::NotFound);
                     }
                 }
-                Ok(clone_entry(entry))
+                return Ok(clone_entry(entry));
+            }
+        }
+        let v1 = self.v1_entries.read().await;
+        match v1.get(&smb_persistent_id) {
+            Some(entry) => {
+                if Instant::now() > entry.deadline {
+                    Err(DurableReconnectError::Expired)
+                } else {
+                    // A DH2C (with a CreateGuid) never matches a v1 entry —
+                    // v1 durables have no CreateGuid to verify.
+                    if create_guid.is_some() {
+                        return Err(DurableReconnectError::NotFound);
+                    }
+                    Ok(clone_entry(entry))
+                }
             }
             None => Err(DurableReconnectError::NotFound),
         }
@@ -212,12 +253,31 @@ impl DurableTable {
 
     /// Mark the entry keyed by `create_guid` as orphaned (its owning
     /// connection has dropped). Guid-keyed variant used from connection
-    /// cleanup, which has the guid at hand.
+    /// cleanup, which has the guid at hand. V1 durables are keyed by
+    /// persistent id — use `mark_orphaned_v1`.
     pub async fn mark_orphaned(&self, create_guid: &[u8; 16]) {
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.get_mut(create_guid) {
             entry.orphaned = true;
         }
+    }
+
+    /// Mark the v1 durable open keyed by `smb_persistent_id` as orphaned.
+    pub async fn mark_orphaned_v1(&self, smb_persistent_id: u64) {
+        let mut entries = self.v1_entries.write().await;
+        if let Some(entry) = entries.get_mut(&smb_persistent_id) {
+            entry.orphaned = true;
+        }
+    }
+
+    /// Forget a v1 durable open by its SMB persistent id (e.g. on CLOSE).
+    /// Does NOT close the VFS handle — the caller does that.
+    pub async fn forget_v1(&self, smb_persistent_id: u64) -> bool {
+        self.v1_entries
+            .write()
+            .await
+            .remove(&smb_persistent_id)
+            .is_some()
     }
 
     /// Mark every entry created by `session_id` on `conn_id`'s opens as
@@ -246,8 +306,10 @@ impl DurableTable {
 
     /// Take (remove) a durable open by the SMB persistent file id carried in
     /// a DH2C/DHnC reconnect context, verifying the CreateGuid when present.
-    /// Returns `Ok(entry)` if found and not expired, `Err(DurableReconnectError)`
-    /// otherwise.
+    /// Returns `Ok((entry, durable_guid))` if found and not expired — the
+    /// returned guid is the CreateGuid the entry was keyed under for v2
+    /// durables, or all-zeros for v1 (the caller re-inserts on the
+    /// appropriate key using `is_v1`).
     ///
     /// The caller is responsible for re-attaching the returned entry to the
     /// new connection's open table. Call `peek_by_persistent_id` first to
@@ -257,41 +319,70 @@ impl DurableTable {
         smb_persistent_id: u64,
         create_guid: Option<&[u8; 16]>,
     ) -> Result<(DurableEntry, [u8; 16]), DurableReconnectError> {
-        let mut entries = self.entries.write().await;
-        // Note: we do NOT call evict_expired here — the requested entry
-        // must be checked for expiry specifically so the caller gets
-        // `Expired` (not `NotFound`) when the deadline has passed.
-        // Other expired entries are cleaned up by the sweeper.
-        let found = entries
-            .iter()
-            .find(|(_, e)| e.smb_persistent_id == smb_persistent_id)
-            .map(|(guid, _)| *guid);
-        let guid = match found {
-            Some(guid) => guid,
-            None => return Err(DurableReconnectError::NotFound),
-        };
-        let entry = entries.remove(&guid).expect("just found");
-        if Instant::now() > entry.deadline {
-            tracing::debug!(guid = ?guid, "durable reconnect: entry expired");
-            // Close the expired VFS handle.
-            let vfs = entry.vfs.clone();
-            let open_id = entry.open_id;
-            tokio::spawn(async move {
-                if let Err(e) = vfs.close(open_id).await {
-                    tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
+        // v2 table first.
+        {
+            let mut entries = self.entries.write().await;
+            // Note: we do NOT call evict_expired here — the requested entry
+            // must be checked for expiry specifically so the caller gets
+            // `Expired` (not `NotFound`) when the deadline has passed.
+            // Other expired entries are cleaned up by the sweeper.
+            let found = entries
+                .iter()
+                .find(|(_, e)| e.smb_persistent_id == smb_persistent_id)
+                .map(|(guid, _)| *guid);
+            if let Some(guid) = found {
+                let entry = entries.remove(&guid).expect("just found");
+                if Instant::now() > entry.deadline {
+                    tracing::debug!(guid = ?guid, "durable reconnect: entry expired");
+                    // Close the expired VFS handle.
+                    let vfs = entry.vfs.clone();
+                    let open_id = entry.open_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = vfs.close(open_id).await {
+                            tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
+                        }
+                    });
+                    return Err(DurableReconnectError::Expired);
                 }
-            });
-            return Err(DurableReconnectError::Expired);
-        }
-        if let Some(req_guid) = create_guid {
-            if guid != *req_guid {
-                // Put it back — a failed GUID verification must not destroy
-                // the durable open (mirrors peek/take split semantics).
-                entries.insert(guid, entry);
-                return Err(DurableReconnectError::NotFound);
+                if let Some(req_guid) = create_guid {
+                    if guid != *req_guid {
+                        // Put it back — a failed GUID verification must not
+                        // destroy the durable open (peek/take split).
+                        entries.insert(guid, entry);
+                        return Err(DurableReconnectError::NotFound);
+                    }
+                }
+                return Ok((entry, guid));
             }
         }
-        Ok((entry, guid))
+        // v1 table (DHnC only — a DH2C's CreateGuid never matches a v1 open).
+        let mut v1 = self.v1_entries.write().await;
+        match v1.remove(&smb_persistent_id) {
+            Some(entry) => {
+                if Instant::now() > entry.deadline {
+                    tracing::debug!(
+                        persistent_id = smb_persistent_id,
+                        "durable reconnect: v1 entry expired"
+                    );
+                    let vfs = entry.vfs.clone();
+                    let open_id = entry.open_id;
+                    tokio::spawn(async move {
+                        if let Err(e) = vfs.close(open_id).await {
+                            tracing::warn!(error = %e, "durable: closing expired VFS handle failed");
+                        }
+                    });
+                    return Err(DurableReconnectError::Expired);
+                }
+                if create_guid.is_some() {
+                    // DH2C against a v1 open: no CreateGuid exists — NOT_FOUND
+                    // (golden reopen2c).
+                    v1.insert(smb_persistent_id, entry);
+                    return Err(DurableReconnectError::NotFound);
+                }
+                Ok((entry, [0u8; 16]))
+            }
+            None => Err(DurableReconnectError::NotFound),
+        }
     }
 
     /// Take (remove) a durable open by `CreateGuid`. Returns `Ok(entry)` if
@@ -335,17 +426,47 @@ impl DurableTable {
     /// is responsible for closing the VFS handle after calling this.
     ///
     /// Returns `true` if the entry was found and removed.
+    /// Returns `true` if the entry was found and removed.
     pub async fn forget(&self, create_guid: &[u8; 16]) -> bool {
         let mut entries = self.entries.write().await;
         entries.remove(create_guid).is_some()
     }
 
-    /// Sweep all expired entries, closing their VFS handles. Called
-    /// periodically by the background sweeper and opportunistically by
-    /// `take`/`insert`.
+    /// Sweep all expired entries (v2 and v1 tables), closing their VFS
+    /// handles. Called periodically by the background sweeper and
+    /// opportunistically by `take`/`insert`.
     pub async fn sweep(&self) -> usize {
         let mut entries = self.entries.write().await;
-        Self::evict_expired(&mut entries).await
+        let mut v1 = self.v1_entries.write().await;
+        let n2 = Self::evict_expired(&mut entries).await;
+        let n1 = Self::evict_expired_v1(&mut v1).await;
+        n2 + n1
+    }
+
+    /// Evict expired v1 entries, closing their VFS handles in the background.
+    async fn evict_expired_v1(entries: &mut HashMap<u64, DurableEntry>) -> usize {
+        let now = Instant::now();
+        let expired: Vec<u64> = entries
+            .iter()
+            .filter(|(_, e)| now > e.deadline)
+            .map(|(k, _)| *k)
+            .collect();
+        let count = expired.len();
+        for pid in expired {
+            if let Some(entry) = entries.remove(&pid) {
+                let vfs = entry.vfs.clone();
+                let open_id = entry.open_id;
+                tokio::spawn(async move {
+                    if let Err(e) = vfs.close(open_id).await {
+                        tracing::warn!(error = %e, "durable sweep: closing VFS handle failed");
+                    }
+                });
+            }
+        }
+        if count > 0 {
+            tracing::debug!(expired = count, "durable: swept expired v1 entries");
+        }
+        count
     }
 
     /// Evict expired entries from the map. Returns the count evicted.
@@ -384,23 +505,34 @@ impl DurableTable {
         count
     }
 
-    /// Number of entries in the table (for diagnostics).
+    /// Number of entries in both tables (for diagnostics).
     pub async fn len(&self) -> usize {
-        self.entries.read().await.len()
+        self.entries.read().await.len() + self.v1_entries.read().await.len()
     }
 
-    /// Returns `true` if the table contains no entries.
+    /// Returns `true` if both tables contain no entries.
     pub async fn is_empty(&self) -> bool {
-        self.entries.read().await.is_empty()
+        self.entries.read().await.is_empty() && self.v1_entries.read().await.is_empty()
     }
 
-    /// Close all durable VFS handles and clear the table. Called during
+    /// Close all durable VFS handles and clear both tables. Called during
     /// graceful shutdown to ensure durable handles are properly cleaned up.
     pub async fn close_all(&self) -> usize {
         let mut entries = self.entries.write().await;
+        let mut v1 = self.v1_entries.write().await;
         let drained: Vec<([u8; 16], DurableEntry)> = entries.drain().collect();
-        let count = drained.len();
-        for (_guid, entry) in drained {
+        let drained_v1: Vec<(u64, DurableEntry)> = v1.drain().collect();
+        let count = drained.len() + drained_v1.len();
+        for (_key, entry) in drained {
+            let vfs = entry.vfs.clone();
+            let open_id = entry.open_id;
+            tokio::spawn(async move {
+                if let Err(e) = vfs.close(open_id).await {
+                    tracing::warn!(error = %e, "durable close_all: VFS close failed");
+                }
+            });
+        }
+        for (_pid, entry) in drained_v1 {
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {

@@ -1269,9 +1269,12 @@ impl Connection {
             // echoes it), and the entry is marked orphaned so a DH2C/DHnC
             // may now re-attach it (Samba: allow_reconnect flips in
             // vfs_default_durable_disconnect at this exact point).
-            if entry.durable_guid.is_some() {
+            if entry.durable_guid.is_some() || entry.durable_persistent_id.is_some() {
                 if let Some(guid) = entry.durable_guid {
                     state.durable_table.mark_orphaned(&guid).await;
+                }
+                if let Some(pid) = entry.durable_persistent_id {
+                    state.durable_table.mark_orphaned_v1(pid).await;
                 }
                 debug!(
                     conn_id,
@@ -1880,6 +1883,7 @@ mod tests {
                 is_pipe: false,
                 pipe_state: None,
                 durable_guid: None,
+                durable_persistent_id: None,
             },
         );
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();

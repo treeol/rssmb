@@ -61,6 +61,10 @@ pub struct OpenEntry {
     /// Set when a DH2Q create context was present at create time. Used by
     /// `handle_close` and `cleanup` to remove the durable entry.
     pub durable_guid: Option<[u8; 16]>,
+    /// SMB persistent id for v1 (DHnQ) durable opens, which are keyed by
+    /// persistent id in the DurableTable's v1 side table. `None` for
+    /// non-durable and v2-durable opens.
+    pub durable_persistent_id: Option<u64>,
 }
 
 /// Per-open directory enumeration cursor (MS-SMB2 3.3.5.18).
@@ -2089,6 +2093,9 @@ async fn handle_logoff(
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
             }
+            if let Some(pid) = entry.durable_persistent_id {
+                state.durable_table.forget_v1(pid).await;
+            }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
             tokio::spawn(async move {
@@ -2508,6 +2515,9 @@ async fn handle_tree_disconnect(
                 .await;
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
+            }
+            if let Some(pid) = entry.durable_persistent_id {
+                state.durable_table.forget_v1(pid).await;
             }
             // Close the VFS handle — fire and forget, log on error.
             let vfs = entry.vfs.clone();
@@ -3178,7 +3188,18 @@ async fn handle_create(
                 path: durable_entry.path.clone(),
                 is_pipe: false,
                 pipe_state: None,
-                durable_guid: Some(durable_guid),
+                // v1 durables key the persistent-id side table; v2 the guid
+                // table. take_by_persistent_id returns a zero guid for v1.
+                durable_guid: if reconnect.create_guid.is_some() {
+                    Some(durable_guid)
+                } else {
+                    None
+                },
+                durable_persistent_id: if reconnect.create_guid.is_some() {
+                    None
+                } else {
+                    Some(file_id.persistent)
+                },
             },
         );
 
@@ -3384,6 +3405,7 @@ async fn handle_create(
                     rssmb_rpc_server::PipeState::new(),
                 ))),
                 durable_guid: None,
+                durable_persistent_id: None,
             },
         );
         let create_response = rssmb_proto::create::CreateResponse {
@@ -3580,6 +3602,9 @@ async fn handle_create(
 
             let mut durable_granted = false;
             let mut durable_guid: Option<[u8; 16]> = None;
+            // For v1 (DHnQ) durables: the SMB persistent id of this open
+            // (the v1 table key). None for v2 durables.
+            let mut durable_persistent_id: Option<u64> = None;
 
             // (OpenEntry insert happens after the lease/oplock grant, when
             // the durable decision is known.)
@@ -3689,6 +3714,9 @@ async fn handle_create(
                                     if let Some(guid) = durable_guid {
                                         state.durable_table.forget(&guid).await;
                                     }
+                                    if let Some(pid) = durable_persistent_id {
+                                        state.durable_table.forget_v1(pid).await;
+                                    }
                                     let _ = vfs.close(open_id).await;
                                     return error_response_for(
                                         Command::Create,
@@ -3748,10 +3776,19 @@ async fn handle_create(
             let durability_precondition = granted_oplock == rssmb_proto::oplock::OplockLevel::Batch
                 || granted_lease.as_ref().is_some_and(|l| l.state.handle);
             if durable_requested && durability_precondition {
+                // OpenEntry.durable_guid keys the guid-table side. For v1
+                // (DHnQ) durables there is no CreateGuid — the entry lives
+                // in the persistent-id side table, and the OpenEntry marks
+                // durability via durable_persistent_id instead.
                 durable_guid = match (&dh2q, &dhnq) {
                     (Some(q), _) => Some(q.create_guid),
-                    (None, Some(_)) => Some([0u8; 16]),
+                    (None, Some(_)) => None,
                     _ => None,
+                };
+                durable_persistent_id = if dhnq.is_some() {
+                    Some(file_id.persistent)
+                } else {
+                    None
                 };
                 durable_granted = true;
             }
@@ -3770,6 +3807,7 @@ async fn handle_create(
                     is_pipe: false,
                     pipe_state: None,
                     durable_guid,
+                    durable_persistent_id,
                 },
             );
 
@@ -3786,11 +3824,6 @@ async fn handle_create(
                     .as_ref()
                     .map(|i| i.username.clone())
                     .unwrap_or_default();
-                let create_guid = match (&dh2q, &dhnq) {
-                    (Some(q), _) => q.create_guid,
-                    (None, Some(_)) => [0u8; 16], // v1 durable: no CreateGuid
-                    _ => unreachable!("durable_granted implies a durable request context"),
-                };
                 let durable_entry = crate::durable::DurableEntry {
                     vfs: vfs.clone(),
                     open_id,
@@ -3817,7 +3850,24 @@ async fn handle_create(
                     lease: granted_lease.clone(),
                     orphaned: false,
                 };
-                state.durable_table.insert(create_guid, durable_entry).await;
+                // v2 durables are keyed by CreateGuid in the guid table;
+                // v1 durables carry no GUID and are keyed by their SMB
+                // persistent id in the side table (Samba: smbXsrv_open
+                // global table). Never share a key between distinct v1
+                // opens.
+                if let Some(q) = &dh2q {
+                    state
+                        .durable_table
+                        .insert(q.create_guid, durable_entry)
+                        .await;
+                } else if dhnq.is_some() {
+                    state
+                        .durable_table
+                        .insert_v1(file_id.persistent, durable_entry)
+                        .await;
+                } else {
+                    unreachable!("durable_granted implies a durable request context");
+                }
                 debug!(
                     conn_id = conn_state.conn_id,
                     timeout_msecs = durable_timeout_msecs,
@@ -4039,6 +4089,9 @@ async fn handle_close(
                 // close it, avoiding a double-close.
                 if let Some(guid) = entry.durable_guid {
                     state.durable_table.forget(&guid).await;
+                }
+                if let Some(pid) = entry.durable_persistent_id {
+                    state.durable_table.forget_v1(pid).await;
                 }
 
                 if let Err(e) = entry.vfs.close(entry.open_id).await {
@@ -6186,6 +6239,11 @@ async fn teardown_previous_session(
         if let Some(guid) = entry.durable_guid {
             state.durable_table.mark_orphaned(&guid).await;
             // Keep the lease record too — reconnect echoes it.
+            orphaned_count += 1;
+            continue;
+        }
+        if let Some(pid) = entry.durable_persistent_id {
+            state.durable_table.mark_orphaned_v1(pid).await;
             orphaned_count += 1;
             continue;
         }
