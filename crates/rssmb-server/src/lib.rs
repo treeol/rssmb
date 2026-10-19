@@ -155,6 +155,12 @@ pub struct ServerState {
     pub session_registry: std::sync::Arc<
         std::sync::RwLock<std::collections::HashMap<u64, Arc<crate::dispatch::SessionShared>>>,
     >,
+    /// SessionIds torn down by a PreviousSessionId reconnect (MS-SMB2 3.3.5.5:
+    /// the server SHOULD tear down the previous session when the new session
+    /// authenticates as the same user). Requests naming a torn-down session
+    /// fail with USER_SESSION_DELETED, mirroring Samba's session-table
+    /// lookup in smbd_smb2_request_validate.
+    pub retired_sessions: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
 }
 
 impl ServerState {
@@ -209,6 +215,7 @@ impl ServerState {
             next_conn_id: std::sync::atomic::AtomicU64::new(1),
             interface_snapshot: std::sync::Arc::new(crate::netinfo::InterfaceSnapshot::new()),
             session_registry: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            retired_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 

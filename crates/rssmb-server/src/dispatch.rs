@@ -112,6 +112,9 @@ pub struct SessionShared {
     pub persistent_base: u64,
     /// Set of channel connection IDs bound to this session.
     pub channels: std::sync::RwLock<std::collections::HashSet<u64>>,
+    /// Authenticated username of the session (for PreviousSessionId
+    /// same-user validation across connections).
+    pub username: std::sync::RwLock<String>,
 }
 
 impl SessionShared {
@@ -125,6 +128,7 @@ impl SessionShared {
             next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             persistent_base: rand::random::<u64>(),
             channels: std::sync::RwLock::new(std::collections::HashSet::from([conn_id])),
+            username: std::sync::RwLock::new(String::new()),
         }
     }
 }
@@ -968,6 +972,25 @@ async fn handle_plain(
                     ));
                 }
             }
+        }
+    }
+
+    // Retired-session gate (MS-SMB2 3.3.5.2.9, Samba
+    // smbd_smb2_request_validate): a session torn down by a
+    // PreviousSessionId reconnect no longer exists on the server. Any
+    // request naming it — on any connection — fails with
+    // USER_SESSION_DELETED. Exempts SESSION_SETUP (a fresh setup on the
+    // same id is a new conversation) and NEGOTIATE (no session).
+    if command != Command::Negotiate && command != Command::SessionSetup {
+        let sid = req.header.session_id;
+        if sid != 0 && state.retired_sessions.read().unwrap().contains(&sid) {
+            debug!(conn_id = conn_state.conn_id, session_id = sid,
+                command = %command, "request on retired session — USER_SESSION_DELETED");
+            return Some(error_response_for(
+                command,
+                NtStatus::UserSessionDeleted,
+                &req.header,
+            ));
         }
     }
 
@@ -1834,6 +1857,7 @@ async fn handle_session_setup(
                 // Register the SessionShared in the global registry so that
                 // a binding channel can find and share this session's state.
                 if let Some(ss) = conn_state.session_shared.read().unwrap().clone() {
+                    *ss.username.write().unwrap() = identity.username.clone();
                     state
                         .session_registry
                         .write()
@@ -1852,6 +1876,26 @@ async fn handle_session_setup(
                     .as_ref()
                     .map(|st| st.encrypt_data)
                     .unwrap_or(false);
+
+                // PreviousSessionId teardown (MS-SMB2 3.3.5.5; Samba
+                // smb2srv_session_close_previous): when the new session
+                // authenticates as the SAME user as the session named by
+                // PreviousSessionId, the old session is torn down — its
+                // trees and opens are closed (durable opens survive,
+                // orphaned for reconnect), the session is removed from the
+                // global tables, and subsequent requests naming it fail
+                // with USER_SESSION_DELETED. A different user's session is
+                // left untouched.
+                let previous_session_id = session_setup_req.previous_session_id;
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    session_id,
+                    previous_session_id,
+                    "session_setup complete — PreviousSessionId check"
+                );
+                if previous_session_id != 0 && previous_session_id != session_id {
+                    teardown_previous_session(state, previous_session_id, &identity.username).await;
+                }
             }
 
             // The auth provider builds the final SPNEGO response when it can
@@ -3020,6 +3064,38 @@ async fn handle_create(
                         &req.header,
                     );
                 }
+                // Client-GUID scoping (golden: reopen1a-lease): leases are
+                // keyed by (client_guid, lease_key); a reconnect presenting
+                // the right lease key from a different client GUID fails
+                // with OBJECT_NAME_NOT_FOUND. Oplock-backed durables have
+                // no client_guid recorded and are not scoped.
+                if let Some(stored_guid) = peeked.client_guid {
+                    let conn_guid: [u8; 16] = {
+                        let rec = conn_state.negotiate_record.lock().await;
+                        match &*rec {
+                            Some(r) => {
+                                let mut cg = [0u8; 16];
+                                cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                                cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                                cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                                cg[8..16].copy_from_slice(&r.client_guid.3);
+                                cg
+                            }
+                            None => [0u8; 16],
+                        }
+                    };
+                    if stored_guid != conn_guid {
+                        debug!(
+                            conn_id = conn_state.conn_id,
+                            "durable reconnect: client GUID mismatch on lease-backed durable"
+                        );
+                        return error_response_for(
+                            Command::Create,
+                            NtStatus::ObjectNameNotFound,
+                            &req.header,
+                        );
+                    }
+                }
                 // Name must match the original open for lease-backed
                 // durables (golden: reopen2-lease wrong-filename case).
                 let requested_name = create_req.name.to_string();
@@ -3193,6 +3269,7 @@ async fn handle_create(
             share_access: durable_entry.share_access,
             desired_access: durable_entry.desired_access,
             path: durable_entry.path.clone(),
+            client_guid: durable_entry.client_guid,
             deadline: durable_entry.deadline,
             oplock_level: durable_entry.oplock_level,
             lease: durable_entry.lease.clone(),
@@ -3531,6 +3608,26 @@ async fn handle_create(
             // the open is not lease-backed).
             let mut granted_lease: Option<crate::durable::LeaseEcho> = None;
 
+            // The connection's client GUID — stored on durable opens for
+            // lease-backed client-GUID scoping (reopen1a-lease golden:
+            // a reconnect with the right lease key from a different client
+            // GUID fails with OBJECT_NAME_NOT_FOUND; oplock-backed durables
+            // ignore it).
+            let conn_client_guid: [u8; 16] = {
+                let rec = conn_state.negotiate_record.lock().await;
+                match &*rec {
+                    Some(r) => {
+                        let mut cg = [0u8; 16];
+                        cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                        cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                        cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                        cg[8..16].copy_from_slice(&r.client_guid.3);
+                        cg
+                    }
+                    None => [0u8; 16],
+                }
+            };
+
             if state.config.leases && !info.attributes.directory {
                 if let Some(fid) = vfs_file_id {
                     let (dialect, client_guid) = {
@@ -3706,6 +3803,11 @@ async fn handle_create(
                     share_access,
                     desired_access,
                     path: file_path.clone(),
+                    client_guid: if granted_lease.is_some() {
+                        Some(conn_client_guid)
+                    } else {
+                        None
+                    },
                     deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
                     oplock_level: if granted_lease.is_none() {
                         Some(granted_oplock)
@@ -5993,6 +6095,144 @@ async fn tree_write_access(conn_state: &ConnState, tree_id: u32) -> bool {
         .get(&tree_id)
         .map(|t| t.write_access)
         .unwrap_or(false)
+}
+
+/// Tear down the session named by PreviousSessionId (MS-SMB2 3.3.5.5,
+/// Samba smb2srv_session_close_previous). Only runs when the NEW session
+/// authenticates as the same user; otherwise the old session stays.
+///
+/// Effects (golden: reopen1a / reopen1a-lease):
+/// - the old session's trees and opens are closed via the shared
+///   SessionShared arcs (visible to every channel of that session);
+///   durable opens survive, marked orphaned for reconnect;
+/// - the session is removed from the global registry and session list;
+/// - its id is added to `retired_sessions` so any request naming it —
+///   on any connection — fails with USER_SESSION_DELETED (Samba's
+///   session-table lookup behavior in smbd_smb2_request_validate).
+async fn teardown_previous_session(
+    state: &ServerState,
+    previous_session_id: u64,
+    new_username: &str,
+) {
+    // Find the old session: global registry entry + user identity.
+    let shared = state
+        .session_registry
+        .read()
+        .unwrap()
+        .get(&previous_session_id)
+        .cloned();
+    debug!(
+        previous_session_id,
+        found = shared.is_some(),
+        "teardown_previous_session: registry lookup"
+    );
+    let Some(shared) = shared else {
+        // Unknown/stale PreviousSessionId — nothing to do (Samba treats a
+        // freed record as success).
+        return;
+    };
+
+    // Same-user check (Samba: security_token_is_sid(previous_token, current_sid)).
+    // The username lives on the shared session state.
+    let old_username = shared.username.read().ok().map(|u| u.clone());
+    let Some(old_username) = old_username.filter(|u| !u.is_empty()) else {
+        // No username recorded — stale or anonymous registry entry; drop it.
+        state
+            .session_registry
+            .write()
+            .unwrap()
+            .remove(&previous_session_id);
+        return;
+    };
+    if old_username != new_username {
+        debug!(
+            previous_session_id,
+            old_username = %old_username,
+            new_username = %new_username,
+            "previous-session teardown skipped — different user"
+        );
+        return;
+    }
+
+    info!(
+        previous_session_id,
+        username = %new_username,
+        "previous-session teardown (PreviousSessionId reconnect)"
+    );
+
+    // Close all opens on the shared open map (visible on every channel).
+    // Durable opens survive: orphan them (the reconnecting session may
+    // re-attach them via DH2C/DHnC); everything else is closed.
+    let removed_opens: Vec<OpenEntry> = {
+        let mut opens = shared.opens.write().await;
+        let entries: Vec<OpenEntry> = opens.values().cloned().collect();
+        opens.clear();
+        entries
+    };
+    let mut orphaned_count = 0usize;
+    for entry in &removed_opens {
+        if entry.is_pipe {
+            continue;
+        }
+        let mut should_delete_on_close = false;
+        if let Some(fid) = entry.file_id {
+            let remove_result = state.open_table.remove(fid, entry.open_id).await;
+            should_delete_on_close = remove_result.was_last && remove_result.any_delete_on_close;
+        }
+        state
+            .open_table
+            .release_all_locks_for_open(entry.open_id)
+            .await;
+        if let Some(guid) = entry.durable_guid {
+            state.durable_table.mark_orphaned(&guid).await;
+            // Keep the lease record too — reconnect echoes it.
+            orphaned_count += 1;
+            continue;
+        }
+        state
+            .open_table
+            .remove_open_from_leases(entry.open_id)
+            .await;
+        let vfs = entry.vfs.clone();
+        let open_id = entry.open_id;
+        tokio::spawn(async move {
+            if should_delete_on_close {
+                let _ = vfs.set_delete_on_close(open_id, true).await;
+            }
+            if let Err(e) = vfs.close(open_id).await {
+                tracing::warn!(error = %e, "previous-session teardown: VFS close failed");
+            }
+        });
+    }
+    if orphaned_count > 0 {
+        debug!(
+            previous_session_id,
+            orphaned_count, "durable opens survived teardown"
+        );
+    }
+
+    // Clear the shared tree map (all channels see the empty map).
+    shared.trees.write().await.clear();
+
+    // Remove the session from the global registry and the session list.
+    state
+        .session_registry
+        .write()
+        .unwrap()
+        .remove(&previous_session_id);
+    state.remove_session(previous_session_id).await;
+
+    // Retire the id: every subsequent request naming it, on any
+    // connection, fails with USER_SESSION_DELETED (checked in
+    // handle_plain before dispatch). The signing state is left alone:
+    // marking it `retiring` would make the signature verifier discard
+    // old-session requests outright (no response at all), where the
+    // golden behavior is a proper USER_SESSION_DELETED error response.
+    state
+        .retired_sessions
+        .write()
+        .unwrap()
+        .insert(previous_session_id);
 }
 
 /// Build a share snapshot for the RPC context (Step 8.3 simplified — full

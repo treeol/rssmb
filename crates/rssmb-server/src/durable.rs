@@ -55,6 +55,14 @@ pub struct DurableEntry {
     pub desired_access: DesiredAccess,
     /// File path (for name-vs-lease validation and diagnostics).
     pub path: String,
+    /// The client GUID of the connection that created the durable open.
+    /// Lease-backed durables are scoped to it: a reconnect presenting the
+    /// right lease key from a different client GUID fails with
+    /// OBJECT_NAME_NOT_FOUND (golden: reopen1a-lease; Samba scopes leases
+    /// by (client_guid, lease_key) in leases_db). Oplock-backed durables
+    /// ignore it (durable_v2_open.c:634 — "for oplocks, the client guid
+    /// can be different").
+    pub client_guid: Option<[u8; 16]>,
     /// Deadline after which the durable open is closed and removed.
     pub deadline: Instant,
     /// Oplock granted on the original open, echoed on reconnect
@@ -440,6 +448,7 @@ fn clone_entry(entry: &DurableEntry) -> DurableEntry {
         share_access: entry.share_access,
         desired_access: entry.desired_access,
         path: entry.path.clone(),
+        client_guid: entry.client_guid,
         deadline: entry.deadline,
         oplock_level: entry.oplock_level,
         lease: entry.lease.clone(),
@@ -542,6 +551,7 @@ mod tests {
             share_access: ShareAccess::all(),
             desired_access: DesiredAccess::default(),
             path: "/test".to_string(),
+            client_guid: None,
             deadline: Instant::now() + Duration::from_secs(3600),
             oplock_level: None,
             lease: None,
