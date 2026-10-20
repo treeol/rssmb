@@ -5,10 +5,19 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.4] - 2026-10-20
 
 ### Added
 
+- **Leases: smbtorture smb2.lease 28/36** (was 3/36 at v0.1.3;
+  Samba 4.19.5 reference: 34/36). Deferred CREATEs now pend as
+  STATUS_PENDING and complete on lease-break ACK or the 35 s timeout
+  (L1), and lease/oplock grant rules match Samba's — upgrades grant only
+  the requested level per the current-open context, overwrite/truncate
+  breaks to NONE, rename and sharing violations break only handle caching,
+  stepped re-breaks keep read caching while write/handle caching is held
+  (L2). Remaining 8 failures tracked in `tests/conformance/results.md`
+  (L1.1 rename_wait intermittent, L2.1 ACK_REQUIRED, L2.2 v2 epoch).
 - **Durable handles v2/v1 conformance — smb2.durable-v2-open 14/15**
   (was 0/15; smbtorture 4.19.5). DHnQ/DHnC v1 contexts are parsed alongside
   DH2Q/DH2C; reconnects look up the durable open by the persistent file id
@@ -25,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cargo builds with `-D warnings` failed** (the setting CI uses): 21
+  clippy lints (needless clones, ignored `Result`s, unit-assert
+  comparisons) and one tokio `set_times` shadowing in the vfs. No
+  behavior changes intended; the rustls-webpki 0.103.16 bump is for
+  RUSTSEC-2026-0382.
 - **CREATE responses reported wrong create_action and file attributes.**
   Every open answered `create_action=Opened`; created files now correctly
   report Created, superseded files Superseded, overwritten files
