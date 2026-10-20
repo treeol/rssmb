@@ -3314,7 +3314,12 @@ async fn handle_create(
             lease: durable_entry.lease.clone(),
             orphaned: false,
         };
-        state
+        // Only conflicts if a duplicate CREATE or a second reconnect
+        // raced between our take() and this re-insert; the reconnect
+        // itself stays valid, so the duplicate error is intentionally
+        // dropped here (the DH2Q create path returns DUPLICATE_OBJECTID,
+        // but this open is already fully re-attached).
+        let _ = state
             .durable_table
             .insert(durable_guid, reinserted_entry)
             .await;
@@ -5324,7 +5329,7 @@ async fn handle_set_info(
                                 ),
                             };
                             // Spawn completion task.
-                            let state_clone = state.clone();
+                            let state_clone = state;
                             let conn_clone = conn_state.clone();
                             let vfs_clone = entry.vfs.clone();
                             let open_id = entry.open_id;

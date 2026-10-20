@@ -820,7 +820,7 @@ impl Vfs for LocalFs {
         if matches!(_class, InfoClass::FileBasicInfo) {
             use std::time::Duration;
             // Apply timestamps via fs-set-times (SetTimes for tokio::fs::File).
-            use fs_set_times::{SetTimes, SystemTimeSpec};
+            use fs_set_times::SystemTimeSpec;
             let to_spec = |ft: u64| -> Option<SystemTimeSpec> {
                 if ft == 0 {
                     return None;
@@ -831,7 +831,11 @@ impl Vfs for LocalFs {
                     std::time::UNIX_EPOCH + Duration::from_secs(unix_secs),
                 ))
             };
-            let _ = handle.file.set_times(
+            // Fully-qualified call: newer tokio adds an inherent 1-arg
+            // File::set_times that shadows the trait method and breaks
+            // method-syntax resolution (CI fuzz-build, no committed lock).
+            let _ = fs_set_times::SetTimes::set_times(
+                &handle.file,
                 to_spec(info.last_access_time),
                 to_spec(info.last_write_time),
             );
