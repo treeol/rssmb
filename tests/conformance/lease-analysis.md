@@ -105,6 +105,8 @@ The plumbing exists (`break_for_op` returns oneshot waiters; handle_write
 ignores them) but no handler awaits them and there is no server-side
 break-timeout timer.
 
+**L1.1 open:** rename_wait intermittent NT_STATUS_IO_TIMEOUT in release builds (1/3 runs on d1922cf), suspected lost wakeup in pending-rename completion; server logs nothing at INFO during the wait.
+
 ### L2 — Lease grant arithmetic (upgrade/upgrade2/upgrade3/break/statopen2)
 
 **Status: done (suite 28/36).** Grant now follows Samba 4.19.5
@@ -112,9 +114,9 @@ break-timeout timer.
 nor wait (lease stat opens skip other leases) and are exempt from share-mode
 checks; another open drops W; a non-lease open drops H; byte-range locks drop
 R; an existing lease changes only on a strict, fully-grantable upgrade.
-Oplock grants use the same rules (any H lease ⇒ no oplock). `statopen3` also
-fails against a Samba 4.19.5 reference server (lease.c:943), so it is not
-counted as an rssmb gap.
+Oplock grants use the same rules (any H lease ⇒ no oplock).
+
+statopen3: in Samba selftest/knownfail at 4.19.5, same-version smbtorture; not counted as an rssmb bug.
 
 The request_lease candidate computation grants the union of current+requested
 without honoring the Samba matrix:

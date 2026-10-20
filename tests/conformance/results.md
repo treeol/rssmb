@@ -46,4 +46,18 @@
 
 No suite regressed.
 
+## Durable regression gate for the conf/leases merge (2026-10-20)
+
+Release binaries were built fresh at each commit (`cargo clean --release -p rssmb-server`
+first). Each suite ran through `target/dbg/gate.sh` with a 300 s cap and smbtorture
+4.19.5.
+
+| Suite | 0bedeb5 (baseline, pre Campaign B) | d1922cf (L1+L2) |
+|---|---|---|
+| smb2.durable-open | 11/12: alloc-size, delete_on_close1, file-position, lease, open2-oplock, oplock, read-only, reopen1a, reopen2, reopen2-lease, reopen2-lease-v2, reopen4 | 12/11: same list minus `lease` (now passes) |
+| smb2.durable-v2-open | 14/1: app-instance | 14/1: app-instance |
+| smb2.lease | (5/36, see above) | 28/8, 3 skip: request, statopen3, lock1, complex1, unlink, v2_epoch3, v2_complex1, v2_complex2 |
+
+No subtest that passed at 0bedeb5 fails at d1922cf.
+
 Full logs: /tmp/torture-*.log
