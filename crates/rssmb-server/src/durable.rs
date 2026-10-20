@@ -773,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_take() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         assert_eq!(table.len().await, 1);
         let entry = table.take(&guid(1)).await.expect("should find entry");
         assert_eq!(entry.session_id, 100);
@@ -795,7 +795,7 @@ mod tests {
         let mut entry = test_entry();
         entry.orphaned = true;
         entry.deadline = Instant::now() - Duration::from_secs(1);
-        table.insert(guid(1), entry).await;
+        let _ = table.insert(guid(1), entry).await;
         let err = table.take(&guid(1)).await.unwrap_err();
         assert!(matches!(err, DurableReconnectError::Expired(_)));
         assert_eq!(table.len().await, 0);
@@ -810,7 +810,7 @@ mod tests {
         let mut entry = test_entry();
         entry.orphaned = false;
         entry.deadline = Instant::now() - Duration::from_secs(1);
-        table.insert(guid(1), entry).await;
+        let _ = table.insert(guid(1), entry).await;
         // take/peek succeed despite the stale deadline.
         assert!(table.peek(&guid(1)).await.is_ok());
         assert!(table.take(&guid(1)).await.is_ok());
@@ -818,7 +818,7 @@ mod tests {
         let mut entry2 = test_entry();
         entry2.orphaned = false;
         entry2.deadline = Instant::now() - Duration::from_secs(1);
-        table.insert(guid(2), entry2).await;
+        let _ = table.insert(guid(2), entry2).await;
         assert_eq!(table.sweep().await, 0);
         assert_eq!(table.len().await, 1);
     }
@@ -826,7 +826,7 @@ mod tests {
     #[tokio::test]
     async fn forget_returns_true_when_found() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         assert!(table.forget(&guid(1)).await);
         assert_eq!(table.len().await, 0);
         assert!(!table.forget(&guid(1)).await);
@@ -835,13 +835,13 @@ mod tests {
     #[tokio::test]
     async fn insert_replaces_stale() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         let mut entry2 = test_entry();
         entry2.session_id = 200;
         // Orphan the first entry, then insert a new one under the same
         // GUID: the stale entry is replaced.
         table.mark_orphaned(&guid(1)).await;
-        table.insert(guid(1), entry2).await;
+        let _ = table.insert(guid(1), entry2).await;
         let entry = table.take(&guid(1)).await.unwrap();
         assert_eq!(entry.session_id, 200);
     }
@@ -853,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn insert_rejects_duplicate_live_guid() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         let err = table.insert(guid(1), test_entry()).await;
         assert!(err.is_err(), "live duplicate must be rejected");
         // The original entry is untouched and still live.
@@ -868,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_cycle_refreshes_deadline_on_second_orphan() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         table.mark_orphaned(&guid(1)).await;
         let entry = table.take(&guid(1)).await.unwrap();
         // Reconnect re-inserts with orphaned=false.
@@ -876,7 +876,7 @@ mod tests {
             orphaned: false,
             ..clone_entry(&entry)
         };
-        table.insert(guid(1), reinserted).await;
+        let _ = table.insert(guid(1), reinserted).await;
         // Second disconnect: deadline refreshes from now.
         let before = table.peek(&guid(1)).await.unwrap().deadline;
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -893,8 +893,8 @@ mod tests {
         let mut expired = test_entry();
         expired.orphaned = true;
         expired.deadline = Instant::now() - Duration::from_secs(1);
-        table.insert(guid(1), expired).await;
-        table.insert(guid(2), test_entry()).await;
+        let _ = table.insert(guid(1), expired).await;
+        let _ = table.insert(guid(2), test_entry()).await;
         assert_eq!(table.len().await, 2);
         let swept = table.sweep().await;
         assert_eq!(swept, 1);
@@ -912,10 +912,10 @@ mod tests {
     #[tokio::test]
     async fn orphan_by_session_flips_only_matching_entries() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         let mut other = test_entry();
         other.session_id = 200;
-        table.insert(guid(2), other).await;
+        let _ = table.insert(guid(2), other).await;
         assert_eq!(table.orphan_by_session(100).await, 1);
         let e = table.peek(&guid(1)).await.unwrap();
         assert!(e.orphaned);
@@ -928,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn take_by_persistent_id_matches_and_verifies_guid() {
         let table = DurableTable::new();
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
 
         // Match by persistent id with the right GUID.
         let (entry, key) = table
@@ -940,7 +940,7 @@ mod tests {
 
         // Re-insert; wrong GUID must fail with NotFound and NOT consume
         // the entry.
-        table.insert(guid(1), test_entry()).await;
+        let _ = table.insert(guid(1), test_entry()).await;
         let err = table
             .take_by_persistent_id(0x1234_5678, Some(&guid(9)))
             .await
@@ -970,7 +970,7 @@ mod tests {
         let mut expired = test_entry();
         expired.orphaned = true;
         expired.deadline = Instant::now() - Duration::from_secs(1);
-        table.insert(guid(1), expired).await;
+        let _ = table.insert(guid(1), expired).await;
         let err = table
             .take_by_persistent_id(0x1234_5678, None)
             .await
@@ -988,12 +988,12 @@ mod tests {
     async fn sweeper_evicts_expired_and_lookup_reports_expiry() {
         let table = DurableTable::new();
         // A live entry and an expired orphan coexist.
-        table.insert(guid(2), test_entry()).await;
+        let _ = table.insert(guid(2), test_entry()).await;
         let mut expired = test_entry();
         expired.smb_persistent_id = 0xBEEF;
         expired.orphaned = true;
         expired.deadline = Instant::now() - Duration::from_millis(50);
-        table.insert(guid(1), expired).await;
+        let _ = table.insert(guid(1), expired).await;
         assert_eq!(table.len().await, 2);
 
         // Sweep: only the expired entry is evicted, the live one stays.
