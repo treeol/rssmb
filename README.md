@@ -63,7 +63,10 @@ minimal overhead and maximal security**.
 - NTLMv2 authentication via SPNEGO with AUTHENTICATE message MIC verification
 - `KEY_EXCH` session key derivation (ExportedSessionKey)
 - Large MTU (1 MiB) with multi-credit flow control
-- Durable handles v2 (DH2Q / DH2C) with reconnection
+- Durable handles v1/v2 (DHnQ/DHnC, DH2Q/DH2C) with reconnection —
+  smb2.durable-v2-open 14/15 (smbtorture 4.19.5; the one failure is
+  AppInstanceId, which Samba 4.19.5 itself does not implement — see
+  `tests/conformance/results.md`)
 - File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break handling
 - Multichannel (SMB 3.x): session binding across connections and
   `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
@@ -311,7 +314,7 @@ be reused in other SMB tools.
 
 **Implemented (1.0 scope):**
 - ✅ SMB 2.1 – 3.1.1 with encryption, signing, and NTLMv2
-- ✅ Durable handles v2, byte-range locks, change notify
+- ✅ Durable handles v1/v2 (smb2.durable-v2-open 14/15), byte-range locks, change notify
 - ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
 - ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 

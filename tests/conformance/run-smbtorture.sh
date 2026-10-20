@@ -57,17 +57,46 @@ echo "" >> "$RESULTS"
 echo "| Suite | Result | Subtests (pass/fail/error/skip) | Failing subtests |" >> "$RESULTS"
 echo "|---|---|---|---|" >> "$RESULTS"
 
+# Per-suite timeout budgets (seconds). smb2.lease needs ~140 s for all of
+# its verdicts and the pending-break work adds ~35 s server-side waits —
+# the old flat 120 s cap truncated the suite mid-run and the partial
+# "test:" tally recorded a wrong pass count (the "8/31" artifact corrected
+# in results.md and analyzed in tests/conformance/lease-analysis.md). Add
+# rows here when another suite outgrows 120 s (the console line prints
+# each suite's wall time to calibrate).
+suite_timeout() {
+  case "$1" in
+    smb2.lease) echo 300 ;;
+    *) echo 120 ;;
+  esac
+}
+
 rc=0
 for suite in $SUITES; do
-  echo -n "Running $suite ... "
+  tmo=$(suite_timeout "$suite")
+  echo -n "Running $suite (${tmo}s budget) ... "
   # smbtorture ignores torture:port options (verified via strace on 4.19.5:
   # it dials 445 regardless). The supported flags are -p/--smb-ports and
   # -U user%pass. UNC is plain //host/share — the host:port form is not
   # accepted by this build either.
-  if timeout 120 "$SMBTORTURE" -p "$PORT" -U "${RSSMB_USER:-alice}%${RSSMB_PASSWORD:-TestPass123}" \
+  start=$SECONDS
+  timeout -k 10 "$tmo" "$SMBTORTURE" -p "$PORT" -U "${RSSMB_USER:-alice}%${RSSMB_PASSWORD:-TestPass123}" \
       "//$HOST/$SHARE" "$suite" \
       --option="torture:share=$SHARE" \
-      > "/tmp/torture-$suite.log" 2>&1; then
+      > "/tmp/torture-$suite.log" 2>&1
+  st=$?
+  dur=$((SECONDS - start))
+  # A truncated suite must never yield a pass count — counting "test:"
+  # lines from a partial log once recorded a wrong lease total. Report
+  # INCOMPLETE with no count and fail the run (the nightly CI job sees
+  # this via the exit code; timeout 124 = TERM, 137 = KILL needed).
+  if [ "$st" -eq 124 ] || [ "$st" -eq 137 ]; then
+    echo "⚠️ INCOMPLETE (killed at ${dur}s, budget ${tmo}s — no count recorded)"
+    echo "| $suite | ⚠️ INCOMPLETE | — (truncated after ${tmo}s, no count) | — |" >> "$RESULTS"
+    rc=1
+    continue
+  fi
+  if [ "$st" -eq 0 ]; then
     result="✅ PASS"
   else
     result="❌ FAIL"
@@ -83,7 +112,7 @@ for suite in $SUITES; do
   failing=$(grep -oE '^(failure|error): [a-zA-Z0-9._-]+' "/tmp/torture-$suite.log" \
             | sed 's/^failure: //;s/^error: //' | sort -u | paste -sd ', ' -)
   notes="$pass/$fail/0/$skip"
-  echo "$result (subtests $notes)"
+  echo "$result (subtests $notes) [${dur}s]"
   # shellcheck disable=SC2016  # literal pipes are table cells, not commands
   echo "| $suite | $result | $notes | ${failing:- } |" >> "$RESULTS"
 done

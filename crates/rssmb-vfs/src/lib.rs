@@ -352,6 +352,29 @@ impl VfsError {
     }
 }
 
+/// Result of a successful `Vfs::create` — the open handle plus what the
+/// backend actually did, so the server can report the correct
+/// `CreateAction` in the CREATE response (MS-SMB2 §2.2.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateResult {
+    pub open: OpenId,
+    /// Whether a new file was created (vs an existing file opened).
+    pub created: bool,
+    /// Whether an existing file was replaced/truncated (Supersede/Overwrite).
+    pub superseded: bool,
+}
+
+impl CreateResult {
+    /// Plain open of an existing file, no replacement.
+    pub fn opened(open: OpenId) -> Self {
+        Self {
+            open,
+            created: false,
+            superseded: false,
+        }
+    }
+}
+
 /// The VFS trait. All operations are handle-centric.
 ///
 /// Security: the server layer performs authorization (access mask checks)
@@ -361,13 +384,13 @@ impl VfsError {
 #[async_trait]
 pub trait Vfs: Send + Sync {
     /// Open or create a file/directory.
-    /// Returns an `OpenId` for subsequent operations.
+    /// Returns the open handle plus the create/open/supersede outcome.
     async fn create(
         &self,
         share_root: &str,
         path: &str,
         args: &CreateArgs,
-    ) -> Result<OpenId, VfsError>;
+    ) -> Result<CreateResult, VfsError>;
 
     /// Read data from an open file at the given offset.
     /// Returns the bytes read (may be fewer than requested at EOF).

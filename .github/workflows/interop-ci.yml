@@ -119,9 +119,14 @@ jobs:
         run: kill "$(cat /tmp/rssmb.pid)" 2>/dev/null || true
 
   # Job 4: smbtorture baseline (nightly only — too slow for PR gating).
+  # Per-suite budgets live in run-smbtorture.sh (smb2.lease 300 s, others
+  # 120 s); a suite that overruns its budget is reported INCOMPLETE with
+  # no pass count and fails the run — never a silently truncated count.
   smbtorture:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    # Sum of per-suite budgets (~36 min worst case) plus build time.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
@@ -138,6 +143,21 @@ jobs:
           sudo apt-get install -y samba-testsuite cifs-utils
       - name: Run smbtorture baseline
         run: tests/conformance/run-smbtorture.sh
+      # Surface the baseline table and per-suite logs (incl. any
+      # INCOMPLETE rows) as artifacts for inspection.
+      - name: Collect baseline artifacts
+        if: always()
+        run: |
+          mkdir -p smbtorture-artifacts
+          cp tests/conformance/results.md smbtorture-artifacts/ 2>/dev/null || true
+          cp /tmp/torture-*.log smbtorture-artifacts/ 2>/dev/null || true
+      - name: Upload baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smbtorture-baseline
+          path: smbtorture-artifacts/
+          if-no-files-found: warn
 
   # Job 5: Fuzz targets build check (always — catches compile regressions).
   fuzz-build:

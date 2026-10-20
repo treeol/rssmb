@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Durable handles v2/v1 conformance — smb2.durable-v2-open 14/15**
+  (was 0/15; smbtorture 4.19.5). DHnQ/DHnC v1 contexts are parsed alongside
+  DH2Q/DH2C; reconnects look up the durable open by the persistent file id
+  (Samba's model), verify the CreateGuid for v2, and honor orphan gating — a
+  durable only reconnects after its owning connection dropped. Durable
+  opens survive metadata changes, multiple reconnect cycles, and
+  PreviousSessionId session reconnects (old session torn down; its traffic
+  then fails with USER_SESSION_DELETED, mirroring Samba). Lease-backed
+  durables validate the lease key and are scoped to the client GUID.
+- Background durable sweeper task: expired orphaned durables are evicted
+  (VFS handles closed) without waiting for client traffic to touch the
+  table; a live connection's durable never expires — the timeout counts
+  from the disconnect.
+
+### Fixed
+
+- **CREATE responses reported wrong create_action and file attributes.**
+  Every open answered `create_action=Opened`; created files now correctly
+  report Created, superseded files Superseded, overwritten files
+  Overwritten (the VFS create now reports the action). New files reported
+  FILE_ATTRIBUTE_ARCHIVE|NORMAL; NORMAL is now only set when no other
+  attribute applies (MS-FSCC). Side effect: smb2.create 5/12 → 6/11,
+  smb2.lease 3/36 → 8/31 (assertions on those fields), smb2.session
+  44/22 → 46/20.
+- **Concurrent v1 durable opens corrupted each other.** All DHnQ durables
+  shared one zero-GUID table key, so a second v1 open evicted the first
+  and closed its file handle mid-session (Linux cifs clients request a v1
+  durable on every SMB 2.1 open). v1 durables are keyed by their SMB
+  persistent file id, matching Samba.
+- **A durable open's VFS handle could be closed while still in use** when
+  the durable timeout elapsed on a live connection; the timeout now starts
+  at disconnect (Samba: disconnect_time), not at open.
+- **Strict CREATE parsing rejected legitimate durable-reconnect requests.**
+  Unknown OplockLevel / ImpersonationLevel / CreateDisposition wire values
+  failed the whole request decode; these fields are advisory and ignored
+  on reconnects (MS-SMB2 3.3.5.9.12), so they now parse leniently.
+
 ## [0.1.3] - 2026-10-18
 
 ### Changed

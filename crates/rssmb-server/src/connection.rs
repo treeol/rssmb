@@ -1262,6 +1262,27 @@ impl Connection {
                 should_delete_on_close =
                     remove_result.was_last && remove_result.any_delete_on_close;
             }
+            // Durable opens: leave the VFS handle alive in the durable
+            // table for reconnect. The OpenTable entry was removed above so
+            // new opens during the durable window don't conflict with the
+            // disconnected client. The lease record is kept (the reconnect
+            // echoes it), and the entry is marked orphaned so a DH2C/DHnC
+            // may now re-attach it (Samba: allow_reconnect flips in
+            // vfs_default_durable_disconnect at this exact point).
+            if entry.durable_guid.is_some() || entry.durable_persistent_id.is_some() {
+                if let Some(guid) = entry.durable_guid {
+                    state.durable_table.mark_orphaned(&guid).await;
+                }
+                if let Some(pid) = entry.durable_persistent_id {
+                    state.durable_table.mark_orphaned_v1(pid).await;
+                }
+                debug!(
+                    conn_id,
+                    open_id = ?entry.open_id,
+                    "cleanup: skipping VFS close for durable open (left in durable table)"
+                );
+                continue;
+            }
             state
                 .open_table
                 .remove_open_from_leases(entry.open_id)
@@ -1272,18 +1293,6 @@ impl Connection {
                 .await;
             if released > 0 {
                 debug!(conn_id, open_id = ?entry.open_id, released, "cleanup: released stale locks");
-            }
-            // Durable opens: leave the VFS handle alive in the durable
-            // table for reconnect. The OpenTable entry was removed above so
-            // new opens during the durable window don't conflict with the
-            // disconnected client.
-            if entry.durable_guid.is_some() {
-                debug!(
-                    conn_id,
-                    open_id = ?entry.open_id,
-                    "cleanup: skipping VFS close for durable open (left in durable table)"
-                );
-                continue;
             }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
@@ -1545,6 +1554,46 @@ where
     info!(addr = %bind_addr, "SMB listener bound");
 
     let state = state_fn(config);
+
+    // Background durable sweeper (bounded): periodically evicts expired
+    // durable opens, closing their VFS handles and releasing any state
+    // they still hold. Without it, expired durables are only evicted
+    // lazily on the next insert/take — an idle server leaks fds until a
+    // reconnect or a new durable open happens to touch the table.
+    // Bounded by: the shutdown signal (exits promptly), the sweep interval
+    // (never tighter than 1s), and the process lifetime of the listener.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Sweep at a coarse cadence: the negotiated timeout is >= 1s
+            // (60000ms default, MIN(client,300000)), so a 5s interval bounds
+            // the fd overstay to ~5s past expiry without busy-waiting.
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.shutdown.notified() => {
+                        tracing::debug!("durable sweeper: shutdown — exiting");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let (swept, evicted) = state.durable_table.sweep_with_ids().await;
+                        if swept > 0 {
+                            tracing::debug!(swept, "durable sweeper: evicted expired entries");
+                        }
+                        // Release the lease record for each evicted open —
+                        // the table cannot reach the OpenTable itself.
+                        for open_id in evicted {
+                            state
+                                .open_table
+                                .remove_open_from_leases(open_id)
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let mut connections = tokio::task::JoinSet::<()>::new();
 
@@ -1828,7 +1877,7 @@ mod tests {
             desired_access: Default::default(),
             create_options: Default::default(),
         };
-        let open_id = vfs.create("", "f.txt", &args).await.expect("create");
+        let open_id = vfs.create("", "f.txt", &args).await.expect("create").open;
         conn_state.opens_ref().write().await.insert(
             1,
             crate::dispatch::OpenEntry {
@@ -1842,6 +1891,7 @@ mod tests {
                 is_pipe: false,
                 pipe_state: None,
                 durable_guid: None,
+                durable_persistent_id: None,
             },
         );
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();

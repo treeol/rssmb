@@ -61,6 +61,10 @@ pub struct OpenEntry {
     /// Set when a DH2Q create context was present at create time. Used by
     /// `handle_close` and `cleanup` to remove the durable entry.
     pub durable_guid: Option<[u8; 16]>,
+    /// SMB persistent id for v1 (DHnQ) durable opens, which are keyed by
+    /// persistent id in the DurableTable's v1 side table. `None` for
+    /// non-durable and v2-durable opens.
+    pub durable_persistent_id: Option<u64>,
 }
 
 /// Per-open directory enumeration cursor (MS-SMB2 3.3.5.18).
@@ -112,6 +116,9 @@ pub struct SessionShared {
     pub persistent_base: u64,
     /// Set of channel connection IDs bound to this session.
     pub channels: std::sync::RwLock<std::collections::HashSet<u64>>,
+    /// Authenticated username of the session (for PreviousSessionId
+    /// same-user validation across connections).
+    pub username: std::sync::RwLock<String>,
 }
 
 impl SessionShared {
@@ -125,6 +132,7 @@ impl SessionShared {
             next_volatile_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             persistent_base: rand::random::<u64>(),
             channels: std::sync::RwLock::new(std::collections::HashSet::from([conn_id])),
+            username: std::sync::RwLock::new(String::new()),
         }
     }
 }
@@ -968,6 +976,25 @@ async fn handle_plain(
                     ));
                 }
             }
+        }
+    }
+
+    // Retired-session gate (MS-SMB2 3.3.5.2.9, Samba
+    // smbd_smb2_request_validate): a session torn down by a
+    // PreviousSessionId reconnect no longer exists on the server. Any
+    // request naming it — on any connection — fails with
+    // USER_SESSION_DELETED. Exempts SESSION_SETUP (a fresh setup on the
+    // same id is a new conversation) and NEGOTIATE (no session).
+    if command != Command::Negotiate && command != Command::SessionSetup {
+        let sid = req.header.session_id;
+        if sid != 0 && state.retired_sessions.read().unwrap().contains(&sid) {
+            debug!(conn_id = conn_state.conn_id, session_id = sid,
+                command = %command, "request on retired session — USER_SESSION_DELETED");
+            return Some(error_response_for(
+                command,
+                NtStatus::UserSessionDeleted,
+                &req.header,
+            ));
         }
     }
 
@@ -1831,9 +1858,15 @@ async fn handle_session_setup(
                     .auth_success_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 conn_state.sessions.write().await.push(Arc::new(session));
+                // A fresh session establishment on this id retires any
+                // tombstone left by a previous-session teardown (ids are
+                // server-assigned and effectively never reused, but prune
+                // anyway so the retired set stays tight).
+                state.retired_sessions.write().unwrap().remove(&session_id);
                 // Register the SessionShared in the global registry so that
                 // a binding channel can find and share this session's state.
                 if let Some(ss) = conn_state.session_shared.read().unwrap().clone() {
+                    *ss.username.write().unwrap() = identity.username.clone();
                     state
                         .session_registry
                         .write()
@@ -1852,6 +1885,26 @@ async fn handle_session_setup(
                     .as_ref()
                     .map(|st| st.encrypt_data)
                     .unwrap_or(false);
+
+                // PreviousSessionId teardown (MS-SMB2 3.3.5.5; Samba
+                // smb2srv_session_close_previous): when the new session
+                // authenticates as the SAME user as the session named by
+                // PreviousSessionId, the old session is torn down — its
+                // trees and opens are closed (durable opens survive,
+                // orphaned for reconnect), the session is removed from the
+                // global tables, and subsequent requests naming it fail
+                // with USER_SESSION_DELETED. A different user's session is
+                // left untouched.
+                let previous_session_id = session_setup_req.previous_session_id;
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    session_id,
+                    previous_session_id,
+                    "session_setup complete — PreviousSessionId check"
+                );
+                if previous_session_id != 0 && previous_session_id != session_id {
+                    teardown_previous_session(state, previous_session_id, &identity.username).await;
+                }
             }
 
             // The auth provider builds the final SPNEGO response when it can
@@ -2044,6 +2097,9 @@ async fn handle_logoff(
                 .await;
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
+            }
+            if let Some(pid) = entry.durable_persistent_id {
+                state.durable_table.forget_v1(pid).await;
             }
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
@@ -2465,6 +2521,9 @@ async fn handle_tree_disconnect(
             if let Some(guid) = entry.durable_guid {
                 state.durable_table.forget(&guid).await;
             }
+            if let Some(pid) = entry.durable_persistent_id {
+                state.durable_table.forget_v1(pid).await;
+            }
             // Close the VFS handle — fire and forget, log on error.
             let vfs = entry.vfs.clone();
             let open_id = entry.open_id;
@@ -2519,6 +2578,10 @@ async fn handle_tree_disconnect(
 
 // ── Durable handle & Lease create contexts (MS-SMB2 2.2.13.2.8–2.2.13.2.12) ──
 
+/// DHnQ create context name (durable handle v1 request, MS-SMB2 2.2.13.2.8).
+const DHNQ_NAME: &[u8; 4] = b"DHnQ";
+/// DHnC create context name (durable handle v1 reconnect, MS-SMB2 2.2.13.2.7).
+const DHNC_NAME: &[u8; 4] = b"DHnC";
 /// DH2Q create context name (durable handle v2 request).
 const DH2Q_NAME: &[u8; 4] = b"DH2Q";
 /// DH2C create context name (durable handle v2 reconnect).
@@ -2530,7 +2593,6 @@ const RQLS_NAME: &[u8; 4] = b"RqLs";
 #[derive(Debug)]
 struct Dh2qContext {
     /// Timeout in milliseconds the server should keep the handle alive.
-    #[allow(dead_code)]
     timeout: u32,
     /// Flags (bit 1 = persistent handle).
     _flags: u32,
@@ -2542,13 +2604,26 @@ struct Dh2qContext {
 #[derive(Debug)]
 struct Dh2cContext {
     /// The file ID for the open being re-established.
-    #[allow(dead_code)]
     file_id: rssmb_proto::create::FileId,
     /// The create GUID from the original DH2Q open.
     create_guid: [u8; 16],
     /// Flags (bit 1 = persistent handle).
     _flags: u32,
 }
+
+/// Parsed DHnC create context data (16 bytes: just the file id — v1
+/// reconnect carries no CreateGuid; it is valid to v1-reconnect a v2-opened
+/// handle, so the lookup matches on the persistent id alone, mirroring
+/// Samba's `smb2srv_open_recreate` with `create_guid == NULL`).
+#[derive(Debug)]
+struct DhncContext {
+    file_id: rssmb_proto::create::FileId,
+}
+
+/// Parsed DHnQ create context data (16 bytes, zeroed — the v1 request
+/// context body is all reserved).
+#[derive(Debug)]
+struct DhnqContext;
 
 /// Parsed RqLs create context data (32 bytes for v1, 52 bytes for v2).
 #[derive(Debug, Clone)]
@@ -2566,7 +2641,52 @@ struct RqLsContext {
 struct ParsedCreateContexts {
     dh2q: Option<Dh2qContext>,
     dh2c: Option<Dh2cContext>,
+    /// v1 durable request (DHnQ), present-flag.
+    dhnq: Option<DhnqContext>,
+    /// v1 durable reconnect (DHnC) — file id only.
+    dhnc: Option<DhncContext>,
     rqls: Option<RqLsContext>,
+}
+
+impl ParsedCreateContexts {
+    /// Samba's create-context combination validation
+    /// (source3/smbd/smb2_create.c, smbd_smb2_create_fetch_create_ctx):
+    /// a request must not carry more than one of the durable
+    /// request/reconnect contexts; mixed v1/v2 combinations are
+    /// `INVALID_PARAMETER` (MS-SMB2 3.3.5.9.12).
+    fn validate_combinations(&self) -> Result<(), NtStatus> {
+        if (self.dhnc.is_some() && self.dh2c.is_some())
+            || (self.dhnc.is_some() && self.dh2q.is_some())
+            || (self.dh2c.is_some() && self.dhnq.is_some())
+            || (self.dh2q.is_some() && self.dh2c.is_some())
+        {
+            return Err(NtStatus::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// Which reconnect context (if any) is present: DH2C or DHnC.
+    fn reconnect(&self) -> Option<ReconnectContext<'_>> {
+        if let Some(dh2c) = &self.dh2c {
+            return Some(ReconnectContext {
+                persistent_id: dh2c.file_id.persistent,
+                create_guid: Some(&dh2c.create_guid),
+            });
+        }
+        if let Some(dhnc) = &self.dhnc {
+            return Some(ReconnectContext {
+                persistent_id: dhnc.file_id.persistent,
+                create_guid: None,
+            });
+        }
+        None
+    }
+}
+
+/// A normalized durable-reconnect request (from DH2C or DHnC).
+struct ReconnectContext<'a> {
+    persistent_id: u64,
+    create_guid: Option<&'a [u8; 16]>,
 }
 
 /// Serialize a list of `(name, data)` create contexts into an 8-byte aligned
@@ -2697,6 +2817,19 @@ fn parse_create_contexts(
                         _flags: flags,
                         create_guid,
                     });
+                } else if name == DHNQ_NAME && data_length >= 16 {
+                    // v1 durable request: 16 reserved bytes (MS-SMB2 2.2.13.2.8).
+                    parsed.dhnq = Some(DhnqContext);
+                } else if name == DHNC_NAME && data_length >= 16 {
+                    // v1 durable reconnect: 16-byte file id (MS-SMB2 2.2.13.2.7).
+                    let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
+                    let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+                    parsed.dhnc = Some(DhncContext {
+                        file_id: rssmb_proto::create::FileId {
+                            persistent,
+                            volatile,
+                        },
+                    });
                 } else if name == DH2C_NAME && data_length >= 36 {
                     let persistent = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0; 8]));
                     let volatile = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
@@ -2795,11 +2928,12 @@ async fn handle_create(
     }
     let vfs = tree_entry.vfs.clone();
 
-    // Parse create contexts for durable handle (DH2Q/DH2C) and lease (RqLs) support.
-    // The CreateContextsOffset (u32 at body+48) and CreateContextsLength
-    // (u32 at body+52) are relative to the start of the SMB2 header.
-    // The SMB2 header is 64 bytes, so body starts at offset 64.
-    let ParsedCreateContexts { dh2q, dh2c, rqls } = {
+    // Parse create contexts for durable handle (DHnQ/DHnC/DH2Q/DH2C) and
+    // lease (RqLs) support. The CreateContextsOffset (u32 at body+48) and
+    // CreateContextsLength (u32 at body+52) are relative to the start of
+    // the SMB2 header. The SMB2 header is 64 bytes, so body starts at
+    // offset 64.
+    let parsed_ctx = {
         let ctx_offset = if raw_frame.len() >= 64 + 52 + 4 {
             u32::from_le_bytes(raw_frame[64 + 48..64 + 52].try_into().unwrap_or([0; 4]))
         } else {
@@ -2816,36 +2950,83 @@ async fn handle_create(
             ParsedCreateContexts::default()
         }
     };
+    let ParsedCreateContexts {
+        dh2q, dhnq, rqls, ..
+    } = &parsed_ctx;
 
-    // DH2C reconnect: look up the durable open and re-attach it.
-    if let Some(dh2c) = &dh2c {
+    // Combination validation (Samba smbd_smb2_create_fetch_create_ctx /
+    // MS-SMB2 3.3.5.9.12): only one durable request/reconnect context per
+    // create; mixed combos are INVALID_PARAMETER.
+    if let Err(status) = parsed_ctx.validate_combinations() {
+        debug!(
+            conn_id = conn_state.conn_id,
+            "create: invalid durable context combination"
+        );
+        return error_response_for(Command::Create, status, &req.header);
+    }
+
+    // Durable reconnect (DH2C v2 or DHnC v1): look up the durable open and
+    // re-attach it. All state transitions and status codes mirror Samba
+    // 4.19.5 (golden) — see tests/conformance/durable-v2-open-analysis.md G3.
+    if let Some(reconnect) = parsed_ctx.reconnect() {
         let durable_timeout = state.config.durable_timeout_secs;
         if durable_timeout == 0 {
             debug!(
                 conn_id = conn_state.conn_id,
-                "DH2C: durable handles disabled"
+                "durable reconnect: durable handles disabled"
             );
-            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
-            // STATUS_OBJECTID_NOT_FOUND = 0xC00000F4
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
-        // Peek first — validate identity and share without removing the
-        // entry. Only take (remove) if all checks pass, so a failed
-        // reconnect doesn't destroy the durable open.
-        let peeked = match state.durable_table.peek(&dh2c.create_guid).await {
+        // Peek first — validate everything without removing the entry.
+        // Only take (remove) if all checks pass, so a failed reconnect
+        // doesn't destroy the durable open. Lookup is by the persistent id
+        // carried in the reconnect context (Samba's primary key); the
+        // CreateGuid (DH2C only) is verified against the entry.
+        let peeked = match state
+            .durable_table
+            .peek_by_persistent_id(reconnect.persistent_id, reconnect.create_guid)
+            .await
+        {
             Ok(entry) => entry,
             Err(err) => {
-                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle not found or expired");
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    error = ?err,
+                    "durable reconnect: not found or expired"
+                );
+                // An expired entry's VFS handle was just closed in the
+                // background; its lease record must be released here (the
+                // table cannot reach the OpenTable).
+                if let crate::durable::DurableReconnectError::Expired(open_id) = err {
+                    state.open_table.remove_open_from_leases(open_id).await;
+                }
+                // Every match failure is OBJECT_NAME_NOT_FOUND in the
+                // golden: unknown persistent id, wrong CreateGuid, expiry.
                 return error_response_for(
                     Command::Create,
-                    NtStatus::Other(0xC000_00F4),
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         };
 
+        // A durable open only becomes reconnectable once its owning
+        // connection has dropped (Samba: allow_reconnect flips in
+        // vfs_default_durable_disconnect; a DH2C against a still-live
+        // handle fails — subtest reopen1).
+        if !peeked.orphaned {
+            debug!(
+                conn_id = conn_state.conn_id,
+                "durable reconnect: original handle still attached"
+            );
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
+        }
+
         // Validate that the reconnecting session matches the original
-        // session's user (MS-SMB2 3.3.5.15.11).
+        // session's user (MS-SMB2 3.3.5.15.11; golden: owner mismatch is
+        // OBJECT_NAME_NOT_FOUND, same as Samba's
+        // security_token_is_sid check landing in the `not_found` branch).
         let identity = lookup_session_identity(conn_state, session_id).await;
         let reconnect_user = identity.as_ref().map(|i| i.username.as_str()).unwrap_or("");
         if reconnect_user != peeked.username {
@@ -2853,20 +3034,20 @@ async fn handle_create(
                 conn_id = conn_state.conn_id,
                 original_user = %peeked.username,
                 reconnect_user,
-                "DH2C: session user mismatch — rejecting reconnect"
+                "durable reconnect: session user mismatch"
             );
-            return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
-        // Validate tree matches the original share.
+        // Validate tree matches the original share (golden: NOT_FOUND).
         if tree_entry.share_name != peeked.share_name {
             debug!(
                 conn_id = conn_state.conn_id,
                 original_share = %peeked.share_name,
                 reconnect_share = %tree_entry.share_name,
-                "DH2C: share mismatch — rejecting reconnect"
+                "durable reconnect: share mismatch"
             );
-            return error_response_for(Command::Create, NtStatus::Other(0xC000_00F4), &req.header);
+            return error_response_for(Command::Create, NtStatus::ObjectNameNotFound, &req.header);
         }
 
         // Enforce write access: if the original open had write access,
@@ -2877,27 +3058,139 @@ async fn handle_create(
         if !tree_entry.write_access && durable_has_write {
             debug!(
                 conn_id = conn_state.conn_id,
-                "DH2C: reconnect denied — tree has no write access for writable handle"
+                "durable reconnect: tree has no write access for writable handle"
             );
             return error_response_for(Command::Create, NtStatus::AccessDenied, &req.header);
         }
 
-        // All validations passed — take the entry from the durable table.
-        let durable_entry = match state.durable_table.take(&dh2c.create_guid).await {
-            Ok(entry) => entry,
-            Err(err) => {
-                // Race: the entry was taken by another reconnect or expired
-                // between peek and take.
-                debug!(conn_id = conn_state.conn_id, error = ?err, "DH2C: durable handle lost between peek and take");
+        // Lease validation (Samba smbd_smb2_create_durable_lease_check,
+        // golden): a lease-backed durable open requires the reconnect to
+        // carry a lease request with the SAME lease key — otherwise
+        // OBJECT_NAME_NOT_FOUND. The reconnect's oplock_level field is NOT
+        // consulted (the torture sends garbage there; Samba looks at the
+        // RqLs create context alone). An oplock-backed durable ignores any
+        // lease on the reconnect. A name mismatch WITH a matching lease
+        // is INVALID_PARAMETER (different from the oplock case, where the
+        // name is ignored entirely).
+        let requested_lease = rqls.as_ref();
+        match (&peeked.lease, requested_lease) {
+            (Some(durable_lease), Some(req_lease)) => {
+                if durable_lease.lease_key != req_lease.lease_key {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        "durable reconnect: lease key mismatch"
+                    );
+                    return error_response_for(
+                        Command::Create,
+                        NtStatus::ObjectNameNotFound,
+                        &req.header,
+                    );
+                }
+                // Client-GUID scoping (golden: reopen1a-lease): leases are
+                // keyed by (client_guid, lease_key); a reconnect presenting
+                // the right lease key from a different client GUID fails
+                // with OBJECT_NAME_NOT_FOUND. Oplock-backed durables have
+                // no client_guid recorded and are not scoped.
+                if let Some(stored_guid) = peeked.client_guid {
+                    let conn_guid: [u8; 16] = {
+                        let rec = conn_state.negotiate_record.lock().await;
+                        match &*rec {
+                            Some(r) => {
+                                let mut cg = [0u8; 16];
+                                cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                                cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                                cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                                cg[8..16].copy_from_slice(&r.client_guid.3);
+                                cg
+                            }
+                            None => [0u8; 16],
+                        }
+                    };
+                    if stored_guid != conn_guid {
+                        debug!(
+                            conn_id = conn_state.conn_id,
+                            "durable reconnect: client GUID mismatch on lease-backed durable"
+                        );
+                        return error_response_for(
+                            Command::Create,
+                            NtStatus::ObjectNameNotFound,
+                            &req.header,
+                        );
+                    }
+                }
+                // Name must match the original open for lease-backed
+                // durables (golden: reopen2-lease wrong-filename case).
+                let requested_name = create_req.name.to_string();
+                if requested_name != peeked.path {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        durable_path = %peeked.path,
+                        requested_name = %requested_name,
+                        "durable reconnect: name mismatch with matched lease"
+                    );
+                    return error_response_for(
+                        Command::Create,
+                        NtStatus::InvalidParameter,
+                        &req.header,
+                    );
+                }
+            }
+            (Some(_durable_lease), None) => {
+                // Reopened file has a lease, but no lease was requested.
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: lease-backed durable without lease request"
+                );
                 return error_response_for(
                     Command::Create,
-                    NtStatus::Other(0xC000_00F4),
+                    NtStatus::ObjectNameNotFound,
+                    &req.header,
+                );
+            }
+            (None, Some(_req_lease)) => {
+                // Lease requested, but the reopened file has no lease.
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: lease requested for non-leased durable"
+                );
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::ObjectNameNotFound,
+                    &req.header,
+                );
+            }
+            (None, None) => {}
+        }
+
+        // All validations passed — take the entry from the durable table.
+        let (durable_entry, durable_guid) = match state
+            .durable_table
+            .take_by_persistent_id(reconnect.persistent_id, reconnect.create_guid)
+            .await
+        {
+            Ok((entry, guid)) => (entry, guid),
+            Err(err) => {
+                // Race: the entry was taken by another reconnect or expired
+                // between peek and take. On expiry the VFS handle was just
+                // closed — release its lease record too.
+                if let crate::durable::DurableReconnectError::Expired(open_id) = err {
+                    state.open_table.remove_open_from_leases(open_id).await;
+                }
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    "durable reconnect: entry lost between peek and take"
+                );
+                return error_response_for(
+                    Command::Create,
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         };
 
-        // Re-attach: insert into the per-connection open table.
+        // Re-attach: insert into the per-connection open table. The
+        // re-attached open keeps its durable identity so a second
+        // disconnect (reopen2 reconnects twice) re-orphans it correctly.
         let file_id = next_file_id(conn_state);
         conn_state.opens_ref().write().await.insert(
             file_id.volatile,
@@ -2911,13 +3204,27 @@ async fn handle_create(
                 path: durable_entry.path.clone(),
                 is_pipe: false,
                 pipe_state: None,
-                durable_guid: None,
+                // v1 durables key the persistent-id side table; v2 the guid
+                // table. take_by_persistent_id returns a zero guid for v1.
+                durable_guid: if reconnect.create_guid.is_some() {
+                    Some(durable_guid)
+                } else {
+                    None
+                },
+                durable_persistent_id: if reconnect.create_guid.is_some() {
+                    None
+                } else {
+                    Some(file_id.persistent)
+                },
             },
         );
 
         // The durable entry was already removed from the OpenTable
         // when it was made durable (on disconnect). Re-add it so
-        // share-mode tracking continues.
+        // share-mode tracking continues. A share conflict here is
+        // OBJECT_NAME_NOT_FOUND in the golden (Samba maps every
+        // durable_reconnect backend failure to NOT_FOUND, smb2_create.c
+        // ~line 1002).
         if let Some(fid) = durable_entry.file_id {
             let ot_entry = opens::OpenEntry {
                 open_id: durable_entry.open_id,
@@ -2930,22 +3237,87 @@ async fn handle_create(
             if let Err(_conflict) = state.open_table.check_and_add(fid, ot_entry).await {
                 debug!(
                     conn_id = conn_state.conn_id,
-                    "DH2C: share conflict on reconnect"
+                    "durable reconnect: share conflict"
                 );
-                // Close the VFS handle we just re-attached.
-                let _ = durable_entry.vfs.close(durable_entry.open_id).await;
+                // Undo the re-attach and close the VFS handle.
                 conn_state
                     .opens_ref()
                     .write()
                     .await
                     .remove(&file_id.volatile);
+                let _ = durable_entry.vfs.close(durable_entry.open_id).await;
                 return error_response_for(
                     Command::Create,
-                    NtStatus::SharingViolation,
+                    NtStatus::ObjectNameNotFound,
                     &req.header,
                 );
             }
         }
+
+        // Re-register the lease/oplock with the re-attached open so breaks
+        // keep flowing and a CLOSE removes the right records. The lease
+        // record itself survived the disconnect (connection cleanup skips
+        // remove_open_from_leases for durable opens); we only need the
+        // oplock record restored for oplock-backed durables (Samba restores
+        // oplock_type from the smbXsrv_open record).
+        if durable_entry.oplock_level.is_some() {
+            if let Some(fid) = durable_entry.file_id {
+                let level = match durable_entry.oplock_level {
+                    Some(rssmb_proto::oplock::OplockLevel::Batch) => 0x09,
+                    Some(rssmb_proto::oplock::OplockLevel::Exclusive) => 0x08,
+                    Some(rssmb_proto::oplock::OplockLevel::II) => 0x01,
+                    _ => 0x00,
+                };
+                if level != 0x00 {
+                    let (granted, _breaks, _waiters) = state
+                        .open_table
+                        .request_oplock(
+                            fid,
+                            durable_entry.open_id,
+                            file_id,
+                            level,
+                            conn_state.write_tx.clone(),
+                            false,
+                        )
+                        .await;
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        granted, "durable reconnect: oplock restored"
+                    );
+                }
+            }
+        }
+
+        // The handle stays durable across reconnects (Samba keeps the
+        // smbXsrv_open record; reopen2 reconnects the same handle twice).
+        // Re-insert the entry keyed by the same CreateGuid, updated with
+        // the NEW file id assigned on this connection (the next reconnect
+        // presents that id), the new session/tree, and orphaned=false —
+        // it must be orphaned again by a disconnect before another
+        // reconnect is allowed.
+        let reinserted_entry = crate::durable::DurableEntry {
+            vfs: durable_entry.vfs.clone(),
+            open_id: durable_entry.open_id,
+            file_id: durable_entry.file_id,
+            smb_persistent_id: file_id.persistent,
+            session_id,
+            tree_id,
+            share_name: durable_entry.share_name.clone(),
+            username: durable_entry.username.clone(),
+            share_access: durable_entry.share_access,
+            desired_access: durable_entry.desired_access,
+            path: durable_entry.path.clone(),
+            client_guid: durable_entry.client_guid,
+            deadline: durable_entry.deadline,
+            timeout_msecs: durable_entry.timeout_msecs,
+            oplock_level: durable_entry.oplock_level,
+            lease: durable_entry.lease.clone(),
+            orphaned: false,
+        };
+        state
+            .durable_table
+            .insert(durable_guid, reinserted_entry)
+            .await;
 
         // Query file info for the response.
         let info = durable_entry
@@ -2967,8 +3339,44 @@ async fn handle_create(
                 file_name: durable_entry.path.clone(),
             });
 
+        // Response fields per golden: create_action = Opened (EXISTED),
+        // oplock_level = the ORIGINAL grant (batch oplock or Lease),
+        // NO DH2Q response blob (durable flag not re-negotiated),
+        // and for lease-backed durables an RqLs echo with the original
+        // lease key/state (Samba smb2_create.c:1622 — echoed from the
+        // open's stored lease, independent of the reconnect request).
+        let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
+        if let Some(lease) = &durable_entry.lease {
+            let grant = opens::LeaseGrant {
+                lease_key: lease.lease_key,
+                state: lease.state,
+                flags: 0,
+                epoch: lease.epoch,
+                parent_lease_key: lease.parent_lease_key,
+                is_v2: lease.is_v2,
+            };
+            resp_ctx_items.push((RQLS_NAME, build_rqls_response_data(&grant)));
+        }
+        let create_contexts = if resp_ctx_items.is_empty() {
+            Vec::new()
+        } else {
+            let refs: Vec<(&[u8], &[u8])> = resp_ctx_items
+                .iter()
+                .map(|(n, d)| (*n, d.as_slice()))
+                .collect();
+            encode_create_contexts(&refs)
+        };
+
+        let oplock_level = if durable_entry.lease.is_some() {
+            rssmb_proto::oplock::OplockLevel::Lease
+        } else {
+            durable_entry
+                .oplock_level
+                .unwrap_or(rssmb_proto::oplock::OplockLevel::None)
+        };
+
         let create_response = rssmb_proto::create::CreateResponse {
-            oplock_level: rssmb_proto::oplock::OplockLevel::None,
+            oplock_level,
             flags: Default::default(),
             create_action: rssmb_proto::create::CreateAction::Opened,
             creation_time: FileTime::from(info.creation_time),
@@ -2979,12 +3387,12 @@ async fn handle_create(
             endof_file: info.size,
             file_attributes: crate::fsinfo::file_attributes_to_fscc(&info.attributes),
             file_id,
-            create_contexts: Vec::new(),
+            create_contexts,
         };
         let response = build_response(&req.header, ResponseContent::Create(create_response));
         debug!(
             conn_id = conn_state.conn_id,
-            "DH2C: durable handle re-attached"
+            "durable reconnect: handle re-attached"
         );
         return FramedResponse::Plain(response);
     }
@@ -3015,6 +3423,7 @@ async fn handle_create(
                     rssmb_rpc_server::PipeState::new(),
                 ))),
                 durable_guid: None,
+                durable_persistent_id: None,
             },
         );
         let create_response = rssmb_proto::create::CreateResponse {
@@ -3122,7 +3531,33 @@ async fn handle_create(
     // the table. If a sharing conflict is found, we close the VFS handle
     // (undoing the open) and return SHARING_VIOLATION.
     match vfs.create("", &file_path, &create_args).await {
-        Ok(open_id) => {
+        Ok(create_result) => {
+            let open_id = create_result.open;
+            // Map the VFS create outcome to the MS-SMB2 §2.2.14 CreateAction:
+            //   Superseded (0) / Created (2) / Opened (1) / Overwritten (3).
+            // Supersede → Superseded; new file → Created; existing file
+            // truncated by Overwrite/OverwriteIf → Overwritten; plain open
+            // → Opened. (Golden: a fresh FILE_OPEN_IF answers Created=0x2.)
+            let create_action = match create_req.create_disposition {
+                rssmb_proto::create::CreateDisposition::Superseded => {
+                    rssmb_proto::create::CreateAction::Superseded
+                }
+                rssmb_proto::create::CreateDisposition::Overwrite
+                | rssmb_proto::create::CreateDisposition::OverwriteIf => {
+                    if create_result.superseded {
+                        rssmb_proto::create::CreateAction::Overwritten
+                    } else {
+                        rssmb_proto::create::CreateAction::Created
+                    }
+                }
+                _ => {
+                    if create_result.created {
+                        rssmb_proto::create::CreateAction::Created
+                    } else {
+                        rssmb_proto::create::CreateAction::Opened
+                    }
+                }
+            };
             // Get the stable file identity for the open table.
             let vfs_file_id = vfs.file_id(open_id).await.ok();
 
@@ -3145,6 +3580,37 @@ async fn handle_create(
                         );
                         // Undo the VFS open.
                         let _ = vfs.close(open_id).await;
+                        // Samba delay_for_oplock (open.c) with
+                        // have_sharing_violation: break Handle caching on the
+                        // conflicting leases (delay mask H) and pend the
+                        // create until the break completes (timeout-disconnect).
+                        // Deviation: after the wait we answer
+                        // SHARING_VIOLATION without re-trying the open — a
+                        // holder that closes its handle on the H break still
+                        // gets the opener a violation (Samba would retry).
+                        let will_overwrite = matches!(
+                            create_req.create_disposition,
+                            rssmb_proto::create::CreateDisposition::Superseded
+                                | rssmb_proto::create::CreateDisposition::Overwrite
+                                | rssmb_proto::create::CreateDisposition::OverwriteIf
+                        );
+                        let (breaks, mut waiters) = state
+                            .open_table
+                            .break_for_open(fid, open_id, will_overwrite, true)
+                            .await;
+                        send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
+                        waiters.retain(|w| w.delay);
+                        if !waiters.is_empty() {
+                            return pend_until_breaks(
+                                conn_state,
+                                &req.header,
+                                waiters,
+                                Command::Create,
+                                Err(NtStatus::SharingViolation),
+                            )
+                            .await;
+                        }
                         return error_response_for(
                             Command::Create,
                             NtStatus::SharingViolation,
@@ -3156,63 +3622,41 @@ async fn handle_create(
 
             let file_id = next_file_id(conn_state);
 
-            // DH2Q: if a durable handle request was present and durable
-            // handles are enabled, record the open in the durable table
-            // so it can survive a disconnect.
-            let durable_timeout = state.config.durable_timeout_secs;
-            let durable_guid = if dh2q.is_some() && durable_timeout > 0 {
-                dh2q.as_ref().map(|q| q.create_guid)
-            } else {
-                None
+            // Durable handles are enabled via config; a DH2Q request is only
+            // honored when the durability precondition holds (see the grant
+            // section below — batch oplock, or a lease with Handle caching,
+            // per MS-SMB2 3.3.5.9.10 and the golden tables).
+            let durable_enabled = state.config.durable_timeout_secs > 0;
+            // A v1 (DHnQ) durable request is honored under the same
+            // precondition; its response context is the 8-byte DHnQ blob
+            // (timeout=0 — v1 has no timeout negotiation; Samba returns
+            // all-zero bytes, smb2_create.c:1567).
+            let durable_requested = (dh2q.is_some() || dhnq.is_some()) && durable_enabled;
+
+            // Server-chosen durable timeout in milliseconds, mirroring Samba
+            // (source3/smbd/smb2_create.c:1305-1313): MIN(client, 300000),
+            // or 60000 when the client requested 0. Config's
+            // durable_timeout_secs acts as the enable/disable switch; the
+            // per-open deadline uses this negotiated value.
+            let durable_timeout_msecs: u32 = match &dh2q {
+                Some(q) => {
+                    if q.timeout == 0 {
+                        60_000
+                    } else {
+                        q.timeout.min(300_000)
+                    }
+                }
+                None => (state.config.durable_timeout_secs * 1000) as u32,
             };
 
-            // Store the open in the per-connection open table
-            conn_state.opens_ref().write().await.insert(
-                file_id.volatile,
-                OpenEntry {
-                    session_id,
-                    tree_id,
-                    open_id,
-                    vfs: vfs.clone(),
-                    file_id: vfs_file_id,
-                    dir_cursor: Default::default(),
-                    path: file_path.clone(),
-                    is_pipe: false,
-                    pipe_state: None,
-                    durable_guid,
-                },
-            );
+            let mut durable_granted = false;
+            let mut durable_guid: Option<[u8; 16]> = None;
+            // For v1 (DHnQ) durables: the SMB persistent id of this open
+            // (the v1 table key). None for v2 durables.
+            let mut durable_persistent_id: Option<u64> = None;
 
-            if let Some(dh2q) = &dh2q {
-                if durable_timeout > 0 {
-                    let identity = lookup_session_identity(conn_state, session_id).await;
-                    let username = identity
-                        .as_ref()
-                        .map(|i| i.username.clone())
-                        .unwrap_or_default();
-                    let durable_entry = crate::durable::DurableEntry {
-                        vfs: vfs.clone(),
-                        open_id,
-                        file_id: vfs_file_id,
-                        session_id,
-                        tree_id,
-                        share_name: tree_entry.share_name.clone(),
-                        username,
-                        share_access,
-                        desired_access,
-                        path: file_path.clone(),
-                        deadline: crate::durable::deadline_from_timeout(durable_timeout),
-                    };
-                    state
-                        .durable_table
-                        .insert(dh2q.create_guid, durable_entry)
-                        .await;
-                    debug!(
-                        conn_id = conn_state.conn_id,
-                        "DH2Q: durable handle recorded"
-                    );
-                }
-            }
+            // (OpenEntry insert happens after the lease/oplock grant, when
+            // the durable decision is known.)
 
             // Query file info for the response
             let info = vfs
@@ -3234,7 +3678,45 @@ async fn handle_create(
             let mut granted_oplock = rssmb_proto::oplock::OplockLevel::None;
             let mut resp_ctx_items: Vec<(&[u8], Vec<u8>)> = Vec::new();
             let mut pending_breaks: Vec<opens::BreakNotification> = Vec::new();
+            // Break waiters from the lease/oplock grant — the oneshot
+            // receivers that resolve when each holder acks (or the 35 s
+            // server break-timeout fires). Non-empty when the create must
+            // pend for a break acknowledgment (L1: breaking1/timeout/etc.).
+            let mut pending_break_waiters: Vec<opens::BreakWaiter> = Vec::new();
+            // Lease grant to echo on a future durable reconnect (None if
+            // the open is not lease-backed).
+            let mut granted_lease: Option<crate::durable::LeaseEcho> = None;
 
+            // The connection's client GUID — stored on durable opens for
+            // lease-backed client-GUID scoping (reopen1a-lease golden:
+            // a reconnect with the right lease key from a different client
+            // GUID fails with OBJECT_NAME_NOT_FOUND; oplock-backed durables
+            // ignore it).
+            let conn_client_guid: [u8; 16] = {
+                let rec = conn_state.negotiate_record.lock().await;
+                match &*rec {
+                    Some(r) => {
+                        let mut cg = [0u8; 16];
+                        cg[0..4].copy_from_slice(&r.client_guid.0.to_le_bytes());
+                        cg[4..6].copy_from_slice(&r.client_guid.1.to_le_bytes());
+                        cg[6..8].copy_from_slice(&r.client_guid.2.to_le_bytes());
+                        cg[8..16].copy_from_slice(&r.client_guid.3);
+                        cg
+                    }
+                    None => [0u8; 16],
+                }
+            };
+
+            // Samba delay_for_oplock (open.c): SUPERSEDE/OVERWRITE/OVERWRITE_IF
+            // set `will_overwrite`, which drops H and R from the break target.
+            let will_overwrite = matches!(
+                create_req.create_disposition,
+                rssmb_proto::create::CreateDisposition::Superseded
+                    | rssmb_proto::create::CreateDisposition::Overwrite
+                    | rssmb_proto::create::CreateDisposition::OverwriteIf
+            );
+            // Raw desired-access bits for Samba's stat-open checks.
+            let raw_access_mask = u32::from_le_bytes(create_req.desired_access.into_bytes());
             if state.config.leases && !info.attributes.directory {
                 if let Some(fid) = vfs_file_id {
                     let (dialect, client_guid) = {
@@ -3259,7 +3741,7 @@ async fn handle_create(
                             let is_v2 = rqls.is_v2 && dialect >= DialectConfig::Smb30;
                             match state
                                 .open_table
-                                .request_lease(
+                                .request_lease_with_access(
                                     fid,
                                     open_id,
                                     client_guid,
@@ -3268,15 +3750,25 @@ async fn handle_create(
                                     is_v2,
                                     rqls.parent_lease_key,
                                     rqls.epoch,
+                                    will_overwrite,
                                     conn_state.write_tx.clone(),
+                                    raw_access_mask,
                                 )
                                 .await
                             {
-                                Ok((grant, breaks)) => {
+                                Ok((grant, breaks, lease_waiters)) => {
                                     granted_oplock = rssmb_proto::oplock::OplockLevel::Lease;
+                                    granted_lease = Some(crate::durable::LeaseEcho {
+                                        lease_key: grant.lease_key,
+                                        state: grant.state,
+                                        is_v2: grant.is_v2,
+                                        parent_lease_key: grant.parent_lease_key,
+                                        epoch: grant.epoch,
+                                    });
                                     resp_ctx_items
                                         .push((RQLS_NAME, build_rqls_response_data(&grant)));
                                     pending_breaks = breaks;
+                                    pending_break_waiters = lease_waiters;
                                 }
                                 Err(()) => {
                                     // Lease key collision with a different underlying file.
@@ -3288,6 +3780,9 @@ async fn handle_create(
                                         .remove(&file_id.volatile);
                                     if let Some(guid) = durable_guid {
                                         state.durable_table.forget(&guid).await;
+                                    }
+                                    if let Some(pid) = durable_persistent_id {
+                                        state.durable_table.forget_v1(pid).await;
                                     }
                                     let _ = vfs.close(open_id).await;
                                     return error_response_for(
@@ -3306,14 +3801,16 @@ async fn handle_create(
                             _ => 0x00,
                         };
                         if req_level != 0x00 {
-                            let (granted, breaks) = state
+                            let (granted, breaks, oplock_waiters) = state
                                 .open_table
-                                .request_oplock(
+                                .request_oplock_with_access(
                                     fid,
                                     open_id,
                                     file_id,
                                     req_level,
                                     conn_state.write_tx.clone(),
+                                    will_overwrite,
+                                    raw_access_mask,
                                 )
                                 .await;
                             granted_oplock = match granted {
@@ -3323,13 +3820,21 @@ async fn handle_create(
                                 _ => rssmb_proto::oplock::OplockLevel::None,
                             };
                             pending_breaks = breaks;
+                            pending_break_waiters = oplock_waiters;
                         } else {
                             // Non-leased open still breaks any existing Write lease/oplock on this file.
-                            let (breaks, _waiters) = state
+                            let (breaks, waiters) = state
                                 .open_table
-                                .break_for_op(fid, Some(open_id), opens::ConflictOp::Read)
+                                .break_for_open_with_access(
+                                    fid,
+                                    open_id,
+                                    will_overwrite,
+                                    false,
+                                    raw_access_mask,
+                                )
                                 .await;
                             pending_breaks = breaks;
+                            pending_break_waiters = waiters;
                         }
                     }
                 }
@@ -3337,6 +3842,172 @@ async fn handle_create(
 
             // Deliver any triggered break notifications to other lease/oplock holders.
             send_break_notifications(&pending_breaks).await;
+
+            // Arm the 35 s server break-timeout for each pending break
+            // (MS-SMB2 3.3.4.7; Samba OPLOCK_BREAK_TIMEOUT=35). The timer
+            // downgrades the lease to NONE and resolves the waiter if the
+            // holder never acks (L1: timeout, timeout-disconnect).
+            state.open_table.arm_break_timers(&pending_break_waiters);
+            // Only breaks that remove a delay-mask bit (or hit a lease that
+            // is already mid-break) make the create pend (breaking4).
+            pending_break_waiters.retain(|w| w.delay);
+
+            // Durability precondition (MS-SMB2 3.3.5.9.10, golden tables in
+            // tests/conformance/durable-v2-open-analysis.md): a durable
+            // request (DH2Q or DHnQ) is only granted when the open holds a
+            // batch oplock or a lease with Handle caching (RH/RWH/RHWE).
+            // Any other open gets no durable response context — the
+            // durable flag stays 0 in the CREATE response, matching the
+            // golden open-oplock/open-lease tables (durable column).
+            let durability_precondition = granted_oplock == rssmb_proto::oplock::OplockLevel::Batch
+                || granted_lease.as_ref().is_some_and(|l| l.state.handle);
+            if durable_requested && durability_precondition {
+                // OpenEntry.durable_guid keys the guid-table side. For v1
+                // (DHnQ) durables there is no CreateGuid — the entry lives
+                // in the persistent-id side table, and the OpenEntry marks
+                // durability via durable_persistent_id instead.
+                durable_guid = match (&dh2q, &dhnq) {
+                    (Some(q), _) => Some(q.create_guid),
+                    (None, Some(_)) => None,
+                    _ => None,
+                };
+                durable_persistent_id = if dhnq.is_some() {
+                    Some(file_id.persistent)
+                } else {
+                    None
+                };
+                durable_granted = true;
+            }
+
+            // Store the open in the per-connection open table.
+            conn_state.opens_ref().write().await.insert(
+                file_id.volatile,
+                OpenEntry {
+                    session_id,
+                    tree_id,
+                    open_id,
+                    vfs: vfs.clone(),
+                    file_id: vfs_file_id,
+                    dir_cursor: Default::default(),
+                    path: file_path.clone(),
+                    is_pipe: false,
+                    pipe_state: None,
+                    durable_guid,
+                    durable_persistent_id,
+                },
+            );
+
+            // Record the granted durable open in the durable table, storing
+            // the original oplock/lease grant for the reconnect echo. The
+            // entry is NOT orphaned yet — it only becomes reconnectable
+            // after its owning connection drops (Samba: allow_reconnect).
+            // For v1 (DHnQ) opens there is no client GUID, so the entry
+            // is keyed by a zero GUID — v1 reconnects (DHnC) match by the
+            // persistent id alone, which is all they carry.
+            if durable_granted {
+                let identity = lookup_session_identity(conn_state, session_id).await;
+                let username = identity
+                    .as_ref()
+                    .map(|i| i.username.clone())
+                    .unwrap_or_default();
+                let durable_entry = crate::durable::DurableEntry {
+                    vfs: vfs.clone(),
+                    open_id,
+                    file_id: vfs_file_id,
+                    smb_persistent_id: file_id.persistent,
+                    session_id,
+                    tree_id,
+                    share_name: tree_entry.share_name.clone(),
+                    username,
+                    share_access,
+                    desired_access,
+                    path: file_path.clone(),
+                    client_guid: if granted_lease.is_some() {
+                        Some(conn_client_guid)
+                    } else {
+                        None
+                    },
+                    deadline: crate::durable::deadline_from_millis(durable_timeout_msecs),
+                    timeout_msecs: durable_timeout_msecs,
+                    oplock_level: if granted_lease.is_none() {
+                        Some(granted_oplock)
+                    } else {
+                        None
+                    },
+                    lease: granted_lease.clone(),
+                    orphaned: false,
+                };
+                // v2 durables are keyed by CreateGuid in the guid table;
+                // v1 durables carry no GUID and are keyed by their SMB
+                // persistent id in the side table (Samba: smbXsrv_open
+                // global table). Never share a key between distinct v1
+                // opens.
+                if let Some(q) = &dh2q {
+                    if let Err(_existing) = state
+                        .durable_table
+                        .insert(q.create_guid, durable_entry)
+                        .await
+                    {
+                        // A LIVE open already holds this CreateGuid — a
+                        // non-replay DH2Q reusing an in-flight GUID fails
+                        // with STATUS_DUPLICATE_OBJECTID (MS-SMB2
+                        // 3.3.5.9.10; Samba's replay-cache lookup). Undo
+                        // the open so no state is orphaned.
+                        debug!(
+                            conn_id = conn_state.conn_id,
+                            "DH2Q: duplicate CreateGuid on live durable open"
+                        );
+                        if let Some(fid) = vfs_file_id {
+                            let _ = state.open_table.remove(fid, open_id).await;
+                        }
+                        state.open_table.remove_open_from_leases(open_id).await;
+                        conn_state
+                            .opens_ref()
+                            .write()
+                            .await
+                            .remove(&file_id.volatile);
+                        let _ = vfs.close(open_id).await;
+                        return error_response_for(
+                            Command::Create,
+                            NtStatus::DuplicateObjectId,
+                            &req.header,
+                        );
+                    }
+                } else if dhnq.is_some() {
+                    state
+                        .durable_table
+                        .insert_v1(file_id.persistent, durable_entry)
+                        .await;
+                } else {
+                    unreachable!("durable_granted implies a durable request context");
+                }
+                debug!(
+                    conn_id = conn_state.conn_id,
+                    timeout_msecs = durable_timeout_msecs,
+                    v1 = dhnq.is_some(),
+                    "durable handle recorded"
+                );
+            }
+
+            // Durable response contexts (Samba source3/smbd/smb2_create.c
+            // :1567-1604): emitted only when the durable handle was
+            // actually granted.
+            //  - DHnQ (v1): 8 zero bytes — no timeout negotiation; the
+            //    client parses `durable_open = true` from the presence of
+            //    the blob alone (libcli create.c:406-411).
+            //  - DH2Q (v2): negotiated timeout (ms) + flags; flags stay 0
+            //    — persistent handles are not implemented (analysis G6).
+            if durable_granted {
+                if dhnq.is_some() {
+                    let blob = vec![0u8; 8];
+                    resp_ctx_items.push((DHNQ_NAME, blob));
+                } else {
+                    let mut blob = Vec::with_capacity(8);
+                    blob.extend_from_slice(&durable_timeout_msecs.to_le_bytes());
+                    blob.extend_from_slice(&0u32.to_le_bytes());
+                    resp_ctx_items.push((DH2Q_NAME, blob));
+                }
+            }
 
             let create_contexts = if resp_ctx_items.is_empty() {
                 Vec::new()
@@ -3351,7 +4022,7 @@ async fn handle_create(
             let create_response = rssmb_proto::create::CreateResponse {
                 oplock_level: granted_oplock,
                 flags: Default::default(),
-                create_action: rssmb_proto::create::CreateAction::Opened,
+                create_action,
                 creation_time: FileTime::from(info.creation_time),
                 last_access_time: FileTime::from(info.last_access_time),
                 last_write_time: FileTime::from(info.last_write_time),
@@ -3362,6 +4033,21 @@ async fn handle_create(
                 file_id,
                 create_contexts,
             };
+
+            // A break that removes a delay-mask bit pends the CREATE
+            // (MS-SMB2 3.3.4.7; Samba delay_for_oplock_fn): interim
+            // STATUS_PENDING now, the CreateResponse once every holder acks
+            // or its 35 s break timer expires.
+            if !pending_break_waiters.is_empty() {
+                return pend_until_breaks(
+                    conn_state,
+                    &req.header,
+                    std::mem::take(&mut pending_break_waiters),
+                    Command::Create,
+                    Ok(ResponseContent::Create(create_response)),
+                )
+                .await;
+            }
 
             let response = build_response(&req.header, ResponseContent::Create(create_response));
             FramedResponse::Plain(response)
@@ -3532,6 +4218,9 @@ async fn handle_close(
                 if let Some(guid) = entry.durable_guid {
                     state.durable_table.forget(&guid).await;
                 }
+                if let Some(pid) = entry.durable_persistent_id {
+                    state.durable_table.forget_v1(pid).await;
+                }
 
                 if let Err(e) = entry.vfs.close(entry.open_id).await {
                     debug!(conn_id = conn_state.conn_id, error = %e, "close VFS failed");
@@ -3545,7 +4234,10 @@ async fn handle_close(
                 let mut pending = conn_state.pending_async.lock().await;
                 let to_remove: Vec<u64> = pending
                     .iter()
-                    .filter(|(_, op)| op.tree_id == tree_id)
+                    // Only CHANGE_NOTIFY is tied to a handle being closed;
+                    // other async ops (deferred CREATE / rename awaiting a
+                    // lease-break ack) must survive unrelated CLOSEs.
+                    .filter(|(_, op)| op.tree_id == tree_id && op.command == Command::ChangeNotify)
                     .map(|(k, _)| *k)
                     .collect();
                 for key in to_remove {
@@ -3661,11 +4353,12 @@ async fn handle_read(
             );
         }
         // Break any Write lease/oplock held by another client on this file.
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Read)
             .await;
         send_break_notifications(&breaks).await;
+        state.open_table.arm_break_timers(&waiters);
     }
 
     // Read from VFS
@@ -3856,11 +4549,15 @@ async fn handle_write(
             );
         }
         // Break any Read or Write lease/oplock held by another client on this file.
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
             .await;
         send_break_notifications(&breaks).await;
+        // Arm the 35 s break-timeout for any ack-required breaks (the
+        // write itself is fire-and-forget, but the lease must not stay
+        // stuck in breaking if the holder never acks).
+        state.open_table.arm_break_timers(&waiters);
     }
 
     match entry
@@ -4439,11 +5136,12 @@ async fn handle_set_info(
             match rssmb_proto::fscc::FileEndOfFileInformation::read_le(&mut cursor) {
                 Ok(eof) => {
                     if let Some(fid) = entry.file_id {
-                        let (breaks, _waiters) = state
+                        let (breaks, waiters) = state
                             .open_table
                             .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Write)
                             .await;
                         send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
                     }
                     let mut info = match entry
                         .vfs
@@ -4515,7 +5213,7 @@ async fn handle_set_info(
                     }
                     if delete_pending {
                         if let Some(fid) = entry.file_id {
-                            let (breaks, _waiters) = state
+                            let (breaks, waiters) = state
                                 .open_table
                                 .break_for_op(
                                     fid,
@@ -4524,6 +5222,7 @@ async fn handle_set_info(
                                 )
                                 .await;
                             send_break_notifications(&breaks).await;
+                            state.open_table.arm_break_timers(&waiters);
                         }
                     }
                     match entry
@@ -4579,18 +5278,130 @@ async fn handle_set_info(
             let mut cursor = std::io::Cursor::new(&raw_data[..]);
             match rssmb_proto::fscc::FileRenameInformation::read_le(&mut cursor) {
                 Ok(rename) => {
+                    let new_name = rename.file_name.to_string();
+                    let replace = rename.replace_if_exists.into();
                     if let Some(fid) = entry.file_id {
-                        let (breaks, _waiters) = state
+                        // Samba delay_rename_for_lease_break (smb2_setinfo.c):
+                        // a rename defers iff another lease on this file holds
+                        // Handle caching — the break target is state minus H
+                        // (keep R+W), and the rename pends until the holder
+                        // acks or the 70 s timeout fires (rename_wait golden).
+                        let (breaks, waiters) = state
                             .open_table
-                            .break_for_op(
-                                fid,
-                                Some(entry.open_id),
-                                opens::ConflictOp::HandleOrDelete,
-                            )
+                            .break_for_op(fid, Some(entry.open_id), opens::ConflictOp::Rename)
                             .await;
                         send_break_notifications(&breaks).await;
+                        state.open_table.arm_break_timers(&waiters);
+                        if !waiters.is_empty() {
+                            // Rename must pend for the H-removing break.
+                            // Return an interim PENDING and spawn a completion
+                            // task that awaits the break waiters (with 70 s
+                            // cap) then performs the rename.
+                            let message_id = req.header.message_id;
+                            let session_id = req.header.session_id;
+                            let tree_id = req.header.tree_id.unwrap_or(0);
+                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                            conn_state.pending_async.lock().await.insert(
+                                message_id,
+                                AsyncOp {
+                                    command: Command::SetInfo,
+                                    session_id,
+                                    tree_id,
+                                    cancel: cancel_tx,
+                                    notify_handle: None,
+                                },
+                            );
+                            // Send interim STATUS_PENDING. Construct manually
+                            // (build_response overwrites flags/status).
+                            let mut pending_hdr = req.header.clone();
+                            pending_hdr.status = NtStatus::Pending.to_u32();
+                            pending_hdr.to_async(message_id);
+                            pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+                            let pending_resp = PlainResponse {
+                                header: pending_hdr,
+                                content: ResponseContent::Error(
+                                    rssmb_proto::error::ErrorResponse { error_data: vec![] },
+                                ),
+                            };
+                            // Spawn completion task.
+                            let state_clone = state.clone();
+                            let conn_clone = conn_state.clone();
+                            let vfs_clone = entry.vfs.clone();
+                            let open_id = entry.open_id;
+                            let req_header = req.header.clone();
+                            let client_signed = req.header.flags.signed();
+                            tokio::spawn(async move {
+                                let timeout =
+                                    tokio::time::sleep(std::time::Duration::from_secs(70));
+                                let wait_all = futures::future::join_all(
+                                    waiters.into_iter().map(|w| w.receiver),
+                                );
+                                tokio::pin!(wait_all);
+                                tokio::pin!(timeout);
+                                tokio::select! {
+                                    _ = wait_all => {}
+                                    _ = timeout => {}
+                                    _ = cancel_rx => {
+                                        conn_clone.pending_async.lock().await.remove(&message_id);
+                                        return;
+                                    }
+                                }
+                                conn_clone.pending_async.lock().await.remove(&message_id);
+                                match vfs_clone.rename(open_id, &new_name, replace).await {
+                                    Ok(()) => {
+                                        let mut resp = build_response(
+                                            &req_header,
+                                            ResponseContent::SetInfo(
+                                                rssmb_proto::info::SetInfoResponse::default(),
+                                            ),
+                                        );
+                                        resp.header.to_async(message_id);
+                                        let framed = FramedResponse::Plain(resp);
+                                        send_unsolicited(&conn_clone, &framed, client_signed).await;
+                                    }
+                                    Err(e) => {
+                                        let status = match e {
+                                            rssmb_vfs::VfsError::InvalidHandle => {
+                                                NtStatus::InvalidHandle
+                                            }
+                                            rssmb_vfs::VfsError::AlreadyExists => {
+                                                NtStatus::ObjectNameCollision
+                                            }
+                                            rssmb_vfs::VfsError::AccessDenied => {
+                                                NtStatus::AccessDenied
+                                            }
+                                            rssmb_vfs::VfsError::NotFound => {
+                                                NtStatus::ObjectNameNotFound
+                                            }
+                                            rssmb_vfs::VfsError::DirectoryNotEmpty => {
+                                                NtStatus::DirectoryNotEmpty
+                                            }
+                                            rssmb_vfs::VfsError::DiskFull => NtStatus::DiskFull,
+                                            _ => NtStatus::InvalidParameter,
+                                        };
+                                        let err_resp = error_response_for(
+                                            Command::SetInfo,
+                                            status,
+                                            &req_header,
+                                        );
+                                        // Convert to async for the pended response.
+                                        let framed = match err_resp {
+                                            FramedResponse::Plain(mut p) => {
+                                                p.header.to_async(message_id);
+                                                FramedResponse::Plain(p)
+                                            }
+                                            other => other,
+                                        };
+                                        send_unsolicited(&conn_clone, &framed, client_signed).await;
+                                    }
+                                }
+                                let _ = state_clone; // keep alive
+                            });
+                            // Return the interim PENDING response; the
+                            // completion is sent out-of-band.
+                            return FramedResponse::Plain(pending_resp);
+                        }
                     }
-                    let new_name = rename.file_name.to_string();
                     debug!(conn_id = conn_state.conn_id, new_name = %new_name, "set_info rename");
                     match entry
                         .vfs
@@ -5205,11 +6016,12 @@ async fn handle_lock(
         ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
     );
     if !acquired.is_empty() {
-        let (breaks, _waiters) = state
+        let (breaks, waiters) = state
             .open_table
             .break_for_op(file_id, Some(entry.open_id), opens::ConflictOp::Lock)
             .await;
         send_break_notifications(&breaks).await;
+        state.open_table.arm_break_timers(&waiters);
     }
     FramedResponse::Plain(response)
 }
@@ -5437,6 +6249,70 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
 /// plaintext once encryption is selected — if the encryption state is
 /// missing after the decision, the response is dropped (not sent
 /// unencrypted).
+/// Pend a request until every break waiter resolves (ack or 35 s expiry),
+/// then send `outcome` as the async final response. Returns the interim
+/// STATUS_PENDING to send now. Registered in `pending_async` so CANCEL and
+/// disconnect drop it. Same wire shape as the deferred-CREATE path.
+async fn pend_until_breaks(
+    conn_state: &ConnState,
+    req_header: &Header,
+    waiters: Vec<opens::BreakWaiter>,
+    command: Command,
+    outcome: Result<ResponseContent, NtStatus>,
+) -> FramedResponse {
+    let message_id = req_header.message_id;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    conn_state.pending_async.lock().await.insert(
+        message_id,
+        AsyncOp {
+            command,
+            session_id: req_header.session_id,
+            tree_id: req_header.tree_id.unwrap_or(0),
+            cancel: cancel_tx,
+            notify_handle: None,
+        },
+    );
+    let mut pending_hdr = req_header.clone();
+    pending_hdr.status = NtStatus::Pending.to_u32();
+    pending_hdr.to_async(message_id);
+    pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+    let pending_resp = PlainResponse {
+        header: pending_hdr,
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+    };
+    let conn_clone = conn_state.clone();
+    let req_header = req_header.clone();
+    tokio::spawn(async move {
+        let wait_all = futures::future::join_all(waiters.into_iter().map(|w| w.receiver));
+        let safety_timeout = tokio::time::sleep(std::time::Duration::from_secs(36));
+        tokio::pin!(wait_all);
+        tokio::pin!(safety_timeout);
+        tokio::select! {
+            _ = wait_all => {}
+            _ = safety_timeout => {}
+            _ = cancel_rx => {
+                conn_clone.pending_async.lock().await.remove(&message_id);
+                return;
+            }
+        }
+        conn_clone.pending_async.lock().await.remove(&message_id);
+        let (content, status) = match outcome {
+            Ok(c) => (c, NtStatus::Success),
+            Err(s) => (
+                ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+                s,
+            ),
+        };
+        let mut resp = build_response(&req_header, content);
+        resp.header.to_async(message_id);
+        resp.header.status = status.to_u32();
+        resp.header.credit_charge = 0;
+        resp.header.credit_request = 0;
+        send_unsolicited(&conn_clone, &FramedResponse::Plain(resp), true).await;
+    });
+    FramedResponse::Plain(pending_resp)
+}
+
 pub(crate) async fn send_unsolicited(
     conn_state: &ConnState,
     resp: &FramedResponse,
@@ -5589,6 +6465,149 @@ async fn tree_write_access(conn_state: &ConnState, tree_id: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Tear down the session named by PreviousSessionId (MS-SMB2 3.3.5.5,
+/// Samba smb2srv_session_close_previous). Only runs when the NEW session
+/// authenticates as the same user; otherwise the old session stays.
+///
+/// Effects (golden: reopen1a / reopen1a-lease):
+/// - the old session's trees and opens are closed via the shared
+///   SessionShared arcs (visible to every channel of that session);
+///   durable opens survive, marked orphaned for reconnect;
+/// - the session is removed from the global registry and session list;
+/// - its id is added to `retired_sessions` so any request naming it —
+///   on any connection — fails with USER_SESSION_DELETED (Samba's
+///   session-table lookup behavior in smbd_smb2_request_validate).
+async fn teardown_previous_session(
+    state: &ServerState,
+    previous_session_id: u64,
+    new_username: &str,
+) {
+    // Find the old session: global registry entry + user identity.
+    let shared = state
+        .session_registry
+        .read()
+        .unwrap()
+        .get(&previous_session_id)
+        .cloned();
+    debug!(
+        previous_session_id,
+        found = shared.is_some(),
+        "teardown_previous_session: registry lookup"
+    );
+    let Some(shared) = shared else {
+        // Unknown/stale PreviousSessionId — nothing to do (Samba treats a
+        // freed record as success).
+        return;
+    };
+
+    // Same-user check (Samba: security_token_is_sid(previous_token, current_sid)).
+    // The username lives on the shared session state.
+    let old_username = shared.username.read().ok().map(|u| u.clone());
+    let Some(old_username) = old_username.filter(|u| !u.is_empty()) else {
+        // No username recorded — stale or anonymous registry entry; drop it.
+        state
+            .session_registry
+            .write()
+            .unwrap()
+            .remove(&previous_session_id);
+        return;
+    };
+    if old_username != new_username {
+        debug!(
+            previous_session_id,
+            old_username = %old_username,
+            new_username = %new_username,
+            "previous-session teardown skipped — different user"
+        );
+        return;
+    }
+
+    info!(
+        previous_session_id,
+        username = %new_username,
+        "previous-session teardown (PreviousSessionId reconnect)"
+    );
+
+    // Close all opens on the shared open map (visible on every channel).
+    // Durable opens survive: orphan them (the reconnecting session may
+    // re-attach them via DH2C/DHnC); everything else is closed.
+    let removed_opens: Vec<OpenEntry> = {
+        let mut opens = shared.opens.write().await;
+        let entries: Vec<OpenEntry> = opens.values().cloned().collect();
+        opens.clear();
+        entries
+    };
+    let mut orphaned_count = 0usize;
+    for entry in &removed_opens {
+        if entry.is_pipe {
+            continue;
+        }
+        let mut should_delete_on_close = false;
+        if let Some(fid) = entry.file_id {
+            let remove_result = state.open_table.remove(fid, entry.open_id).await;
+            should_delete_on_close = remove_result.was_last && remove_result.any_delete_on_close;
+        }
+        state
+            .open_table
+            .release_all_locks_for_open(entry.open_id)
+            .await;
+        if let Some(guid) = entry.durable_guid {
+            state.durable_table.mark_orphaned(&guid).await;
+            // Keep the lease record too — reconnect echoes it.
+            orphaned_count += 1;
+            continue;
+        }
+        if let Some(pid) = entry.durable_persistent_id {
+            state.durable_table.mark_orphaned_v1(pid).await;
+            orphaned_count += 1;
+            continue;
+        }
+        state
+            .open_table
+            .remove_open_from_leases(entry.open_id)
+            .await;
+        let vfs = entry.vfs.clone();
+        let open_id = entry.open_id;
+        tokio::spawn(async move {
+            if should_delete_on_close {
+                let _ = vfs.set_delete_on_close(open_id, true).await;
+            }
+            if let Err(e) = vfs.close(open_id).await {
+                tracing::warn!(error = %e, "previous-session teardown: VFS close failed");
+            }
+        });
+    }
+    if orphaned_count > 0 {
+        debug!(
+            previous_session_id,
+            orphaned_count, "durable opens survived teardown"
+        );
+    }
+
+    // Clear the shared tree map (all channels see the empty map).
+    shared.trees.write().await.clear();
+
+    // Remove the session from the global registry and the session list.
+    state
+        .session_registry
+        .write()
+        .unwrap()
+        .remove(&previous_session_id);
+    state.remove_session(previous_session_id).await;
+
+    // Retire the id: every subsequent request naming it, on any
+    // connection, fails with USER_SESSION_DELETED (checked in
+    // handle_plain before dispatch). The signing state is left alone:
+    // marking it `retiring` would make the signature verifier discard
+    // old-session requests outright (no response at all), where the
+    // golden behavior is a proper USER_SESSION_DELETED error response.
+    state
+        .retired_sessions
+        .write()
+        .unwrap()
+        .insert(previous_session_id);
+}
+
 /// Build a share snapshot for the RPC context (Step 8.3 simplified — full
 /// visibility filtering comes in Step 8.5). Returns all configured shares
 /// that the session can see, sorted by name, plus a synthetic IPC$ entry.
@@ -5685,7 +6704,13 @@ fn error_response_for(command: Command, status: NtStatus, req_header: &Header) -
 
 /// Construct a PlainResponse mirroring the request header.
 pub(crate) fn build_response(req_header: &Header, content: ResponseContent) -> PlainResponse {
-    let command = content.associated_cmd();
+    // Error responses don't carry their own command — use the request's
+    // command (the command that errored). All other content variants map
+    // to their associated command.
+    let command = match &content {
+        ResponseContent::Error(_) => req_header.command,
+        _ => content.associated_cmd(),
+    };
     PlainResponse {
         header: Header {
             credit_charge: req_header.credit_charge,

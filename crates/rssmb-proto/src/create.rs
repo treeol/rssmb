@@ -34,43 +34,207 @@ impl std::fmt::Debug for FileId {
 // ── OplockLevel (MS-SMB2 2.2.13) ──────────────────────────────────
 
 /// Oplock level values.
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
-#[brw(repr(u8))]
-#[derive(Default)]
+///
+/// The wire format allows any u8; clients send arbitrary values on
+/// durable-reconnect requests that the server is expected to ignore
+/// (MS-SMB2 3.3.5.9.12; Samba parses oplock_level as a plain u8). The wire
+/// struct stores the raw byte; this enum is the typed view used in
+/// response construction and comparisons.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum OplockLevel {
     #[default]
-    None = 0x00,
-    II = 0x01,
-    Exclusive = 0x08,
-    Batch = 0x09,
-    Lease = 0xFF,
+    None,
+    II,
+    Exclusive,
+    Batch,
+    Lease,
+}
+
+impl OplockLevel {
+    pub fn from_wire(raw: u8) -> OplockLevel {
+        match raw {
+            0x00 => OplockLevel::None,
+            0x01 => OplockLevel::II,
+            0x08 => OplockLevel::Exclusive,
+            0x09 => OplockLevel::Batch,
+            0xFF => OplockLevel::Lease,
+            // Unknown values behave as "no oplock requested" — the server
+            // ignores them (they appear on reconnects that only care
+            // about the durable contexts).
+            _ => OplockLevel::None,
+        }
+    }
+
+    pub fn to_wire(self) -> u8 {
+        match self {
+            OplockLevel::None => 0x00,
+            OplockLevel::II => 0x01,
+            OplockLevel::Exclusive => 0x08,
+            OplockLevel::Batch => 0x09,
+            OplockLevel::Lease => 0xFF,
+        }
+    }
+}
+
+impl BinRead for OplockLevel {
+    type Args<'a> = ();
+
+    fn read_options<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<Self> {
+        let raw = <u8 as BinRead>::read_options(reader, endian, ())?;
+        Ok(Self::from_wire(raw))
+    }
+}
+
+impl BinWrite for OplockLevel {
+    type Args<'a> = ();
+
+    fn write_options<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut W,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<()> {
+        self.to_wire().write_options(writer, endian, ())
+    }
 }
 
 // ── ImpersonationLevel (MS-SMB2 2.2.13) ───────────────────────────
 
 /// Impersonation level requested by the application.
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy)]
-#[brw(repr(u32))]
+///
+/// MS-SMB2 2.2.13: the server MUST validate but otherwise ignore this
+/// field; durable reconnects carry arbitrary values here (Samba parses
+/// a plain u32). Unknown wire values are treated as `Impersonation`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum ImpersonationLevel {
-    Anonymous = 0x0,
-    Identification = 0x1,
-    Impersonation = 0x2,
-    Delegate = 0x3,
+    Anonymous,
+    Identification,
+    #[default]
+    Impersonation,
+    Delegate,
+}
+
+impl ImpersonationLevel {
+    pub fn from_wire(raw: u32) -> ImpersonationLevel {
+        match raw {
+            0x0 => ImpersonationLevel::Anonymous,
+            0x1 => ImpersonationLevel::Identification,
+            0x2 => ImpersonationLevel::Impersonation,
+            0x3 => ImpersonationLevel::Delegate,
+            // Arbitrary values must not fail the whole request parse —
+            // the field is advisory-only per MS-SMB2.
+            _ => ImpersonationLevel::Impersonation,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            ImpersonationLevel::Anonymous => 0x0,
+            ImpersonationLevel::Identification => 0x1,
+            ImpersonationLevel::Impersonation => 0x2,
+            ImpersonationLevel::Delegate => 0x3,
+        }
+    }
+}
+
+impl BinRead for ImpersonationLevel {
+    type Args<'a> = ();
+
+    fn read_options<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<Self> {
+        let raw = <u32 as BinRead>::read_options(reader, endian, ())?;
+        Ok(Self::from_wire(raw))
+    }
+}
+
+impl BinWrite for ImpersonationLevel {
+    type Args<'a> = ();
+
+    fn write_options<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut W,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<()> {
+        self.to_wire().write_options(writer, endian, ())
+    }
 }
 
 // ── CreateDisposition (MS-SMB2 2.2.13) ────────────────────────────
 
 /// Action the server must take if the file already exists.
-#[derive(BinRead, BinWrite, Debug, PartialEq, Eq, Clone, Copy, Default)]
-#[brw(repr(u32))]
+///
+/// Durable reconnect requests carry arbitrary garbage here that the
+/// server ignores (MS-SMB2 3.3.5.9.12 — only the durable contexts and the
+/// name are examined). Unknown wire values map to `Open` and never fail
+/// the request parse; the reconnect path does not consult the disposition.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum CreateDisposition {
-    Superseded = 0x0,
+    Superseded,
     #[default]
-    Open = 0x1,
-    Create = 0x2,
-    OpenIf = 0x3,
-    Overwrite = 0x4,
-    OverwriteIf = 0x5,
+    Open,
+    Create,
+    OpenIf,
+    Overwrite,
+    OverwriteIf,
+}
+
+impl CreateDisposition {
+    pub fn from_wire(raw: u32) -> CreateDisposition {
+        match raw {
+            0x0 => CreateDisposition::Superseded,
+            0x1 => CreateDisposition::Open,
+            0x2 => CreateDisposition::Create,
+            0x3 => CreateDisposition::OpenIf,
+            0x4 => CreateDisposition::Overwrite,
+            0x5 => CreateDisposition::OverwriteIf,
+            _ => CreateDisposition::Open,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            CreateDisposition::Superseded => 0x0,
+            CreateDisposition::Open => 0x1,
+            CreateDisposition::Create => 0x2,
+            CreateDisposition::OpenIf => 0x3,
+            CreateDisposition::Overwrite => 0x4,
+            CreateDisposition::OverwriteIf => 0x5,
+        }
+    }
+}
+
+impl BinRead for CreateDisposition {
+    type Args<'a> = ();
+
+    fn read_options<R: std::io::Read + std::io::Seek>(
+        reader: &mut R,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<Self> {
+        let raw = <u32 as BinRead>::read_options(reader, endian, ())?;
+        Ok(Self::from_wire(raw))
+    }
+}
+
+impl BinWrite for CreateDisposition {
+    type Args<'a> = ();
+
+    fn write_options<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut W,
+        endian: binrw::Endian,
+        _args: Self::Args<'_>,
+    ) -> binrw::BinResult<()> {
+        self.to_wire().write_options(writer, endian, ())
+    }
 }
 
 // ── CreateOptions (MS-SMB2 2.2.13) ────────────────────────────────

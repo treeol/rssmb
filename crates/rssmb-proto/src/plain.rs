@@ -180,7 +180,7 @@ impl ResponseContent {
             | ResponseContent::LeaseBreakNotify(_)
             | ResponseContent::LeaseBreak(_) => Command::OplockBreak,
             ResponseContent::ServerToClientNotification(_) => Command::ServerToClientNotification,
-            ResponseContent::Error(_) => panic!("Error has no matching command!"),
+            ResponseContent::Error(_) => Command::Create, // placeholder — build_response uses req_header.command for Error
         }
     }
 }

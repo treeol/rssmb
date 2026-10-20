@@ -104,7 +104,9 @@ fn attributes_from_metadata(meta: &std::fs::Metadata) -> FileAttributes {
         system: false,
         directory: is_dir,
         archive: !is_dir && !read_only,
-        normal: !is_dir,
+        // NORMAL is only valid when no other attribute is set (MS-FSCC
+        // 2.6): a file with ARCHIVE set reports ARCHIVE, not ARCHIVE|NORMAL.
+        normal: is_dir && !read_only,
         temporary: false,
         sparse_file: false,
         reparse_point: meta.file_type().is_symlink(),
@@ -393,7 +395,7 @@ impl Vfs for LocalFs {
         _share_root: &str,
         path: &str,
         args: &CreateArgs,
-    ) -> Result<OpenId, VfsError> {
+    ) -> Result<CreateResult, VfsError> {
         let rel = self.resolve_rel(path)?;
 
         // cap-std uses "." to refer to the Dir itself. Empty paths don't work.
@@ -448,6 +450,7 @@ impl Vfs for LocalFs {
         };
 
         // Disposition handling.
+        let existed_before = exists;
         let mut needs_create = !exists;
         match args.disposition {
             CreateDisposition::Open => {
@@ -497,13 +500,18 @@ impl Vfs for LocalFs {
         // which surfaced as STATUS_INVALID_PARAMETER on every mkdir.
         // Directory "writes" (creating children, rename, delete) go through
         // the share Dir, not this fd.
+        // Always open writable when we might create or truncate: SMB access
+        // masks are enforced by the server layer, and a read-only fd cannot
+        // express O_CREAT/O_TRUNC through cap-std's openat2 backend (EINVAL).
+        // Samba opens O_RDWR and enforces the access mask in the same way.
         let wants_write = !target_is_dir
             && (matches!(
                 args.disposition,
                 CreateDisposition::Supersede
                     | CreateDisposition::Create
                     | CreateDisposition::OverwriteIf
-            ) || args.desired_access.write
+            ) || needs_create
+                || args.desired_access.write
                 || args.desired_access.generic_write
                 || args.desired_access.generic_all);
         opts.write(wants_write);
@@ -558,6 +566,23 @@ impl Vfs for LocalFs {
 
         let file_name = Self::file_name_from_rel(&effective_rel);
 
+        // Determine the create outcome (existed on entry, replaced by
+        // Supersede/Overwrite semantics) so the server can report the
+        // correct CreateAction. `needs_create`/`exists` above may have been
+        // updated by the disposition handling; recompute the outcome:
+        //   created     — a new file was created
+        //   superseded  — an existing file was replaced (Supersede) or
+        //                  truncated by an overwrite disposition
+        let created = needs_create;
+        let superseded = !needs_create
+            && existed_before
+            && matches!(
+                args.disposition,
+                CreateDisposition::Supersede
+                    | CreateDisposition::Overwrite
+                    | CreateDisposition::OverwriteIf
+            );
+
         let open_id = self.next_open_id().await;
         let mut opens = self.opens.write().await;
         opens.insert(
@@ -571,7 +596,11 @@ impl Vfs for LocalFs {
                 delete_on_close: args.create_options.delete_on_close,
             })),
         );
-        Ok(open_id)
+        Ok(CreateResult {
+            open: open_id,
+            created,
+            superseded,
+        })
     }
 
     async fn read_at(&self, open: OpenId, offset: u64, len: u32) -> Result<Bytes, VfsError> {
@@ -917,7 +946,8 @@ impl Vfs for LocalFs {
                 system: false,
                 directory: is_dir,
                 archive: !is_dir && !read_only,
-                normal: !is_dir,
+                // NORMAL only when no other attribute applies (MS-FSCC 2.6).
+                normal: is_dir && !read_only,
                 temporary: false,
                 sparse_file: false,
                 reparse_point: meta.file_type().is_symlink(),
@@ -1289,6 +1319,7 @@ fn matches_pattern_impl(name: &[char], pattern: &[char]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn tmp_root() -> tempfile::TempDir {
@@ -1310,7 +1341,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "hello.txt", &args).await.unwrap();
+        let open = fs.create("", "hello.txt", &args).await.unwrap().open;
         let n = fs.write_at(open, 0, b"Hello, LocalFs!").await.unwrap();
         assert_eq!(n, 15);
         let data = fs.read_at(open, 0, 100).await.unwrap();
@@ -1333,14 +1364,15 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "f.txt", &create).await.unwrap();
+        let open = fs.create("", "f.txt", &create).await.unwrap().open;
         fs.write_at(open, 0, b"data").await.unwrap();
         fs.close(open).await.unwrap();
 
         let open2 = fs
             .create("", "f.txt", &CreateArgs::open_readonly())
             .await
-            .unwrap();
+            .unwrap()
+            .open;
         let data = fs.read_at(open2, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"data");
         fs.close(open2).await.unwrap();
@@ -1373,14 +1405,15 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "MyFile.txt", &create).await.unwrap();
+        let open = fs.create("", "MyFile.txt", &create).await.unwrap().open;
         fs.close(open).await.unwrap();
 
         // Open with different case — should succeed.
         let open2 = fs
             .create("", "myfile.txt", &CreateArgs::open_readonly())
             .await
-            .expect("case-insensitive open should succeed");
+            .expect("case-insensitive open should succeed")
+            .open;
         fs.close(open2).await.unwrap();
     }
 
@@ -1400,7 +1433,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "MyFile.txt", &create).await.unwrap();
+        let open = fs.create("", "MyFile.txt", &create).await.unwrap().open;
         fs.close(open).await.unwrap();
 
         // Open with different case — should fail with NotFound.
@@ -1418,7 +1451,7 @@ mod tests {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "dup.txt", &create).await.unwrap();
+        let open = fs.create("", "dup.txt", &create).await.unwrap().open;
         fs.close(open).await.unwrap();
         let result = fs.create("", "dup.txt", &create).await;
         assert!(matches!(result, Err(VfsError::AlreadyExists)));
@@ -1458,7 +1491,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "info.txt", &create).await.unwrap();
+        let open = fs.create("", "info.txt", &create).await.unwrap().open;
         fs.write_at(open, 0, b"abc").await.unwrap();
         let info = fs.query_info(open, InfoClass::FileBasicInfo).await.unwrap();
         assert_eq!(info.size, 3);
@@ -1475,7 +1508,7 @@ mod tests {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "id.txt", &create).await.unwrap();
+        let open = fs.create("", "id.txt", &create).await.unwrap().open;
         let id = fs.file_id(open).await.unwrap();
         assert_ne!(id, FileId { dev: 0, ino: 0 });
         fs.close(open).await.unwrap();
@@ -1508,7 +1541,8 @@ mod tests {
             let open = fs
                 .create("", name, &args)
                 .await
-                .unwrap_or_else(|e| panic!("mkdir {name} ({disposition:?}) failed: {e}"));
+                .unwrap_or_else(|e| panic!("mkdir {name} ({disposition:?}) failed: {e}"))
+                .open;
             fs.close(open).await.unwrap();
             assert!(
                 dir.path().join(name).is_dir(),
@@ -1524,7 +1558,11 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "made_by_create/child", &args).await.unwrap();
+        let open = fs
+            .create("", "made_by_create/child", &args)
+            .await
+            .unwrap()
+            .open;
         fs.close(open).await.unwrap();
         assert!(dir.path().join("made_by_create/child").is_dir());
         // Create on an existing directory must collide, not succeed.
@@ -1561,7 +1599,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let dopen = fs.create("", "", &dir_args).await.unwrap();
+        let dopen = fs.create("", "", &dir_args).await.unwrap().open;
         let entries = fs
             .query_dir(dopen, "*", DirInfoClass::DirectoryInfo, true, 100)
             .await
@@ -1590,7 +1628,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "del.txt", &create).await.unwrap();
+        let open = fs.create("", "del.txt", &create).await.unwrap().open;
         fs.delete(open).await.unwrap();
         let result = fs.create("", "del.txt", &CreateArgs::open_readonly()).await;
         assert!(matches!(result, Err(VfsError::NotFound)));
@@ -1610,7 +1648,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "old.txt", &create).await.unwrap();
+        let open = fs.create("", "old.txt", &create).await.unwrap().open;
         fs.rename(open, "new.txt", false).await.unwrap();
         let info = fs.query_info(open, InfoClass::FileBasicInfo).await.unwrap();
         assert_eq!(info.file_name, "new.txt");
@@ -1636,7 +1674,7 @@ mod tests {
             ..CreateArgs::open_readonly()
         };
         args.create_options.delete_on_close = true;
-        let open = fs.create("", "tmp.txt", &args).await.unwrap();
+        let open = fs.create("", "tmp.txt", &args).await.unwrap().open;
         fs.close(open).await.unwrap();
         let result = fs.create("", "tmp.txt", &CreateArgs::open_readonly()).await;
         assert!(matches!(result, Err(VfsError::NotFound)));
@@ -1650,7 +1688,7 @@ mod tests {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "ioctl.txt", &create).await.unwrap();
+        let open = fs.create("", "ioctl.txt", &create).await.unwrap().open;
         let result = fs.ioctl(open, FsCtlCode::SetZeroData, &[]).await;
         assert!(matches!(result, Err(VfsError::NotSupported)));
         fs.close(open).await.unwrap();
@@ -1670,7 +1708,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "flush.txt", &create).await.unwrap();
+        let open = fs.create("", "flush.txt", &create).await.unwrap().open;
         fs.write_at(open, 0, b"flush me").await.unwrap();
         fs.flush(open).await.unwrap();
         fs.close(open).await.unwrap();
@@ -1684,7 +1722,7 @@ mod tests {
             disposition: CreateDisposition::Create,
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "lock.txt", &create).await.unwrap();
+        let open = fs.create("", "lock.txt", &create).await.unwrap().open;
         fs.lock(
             open,
             LockRange {
@@ -1764,7 +1802,8 @@ mod tests {
         let open = fs
             .create("", "link.txt", &CreateArgs::open_readonly())
             .await
-            .expect("within-share symlink should be followed");
+            .expect("within-share symlink should be followed")
+            .open;
         let data = fs.read_at(open, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"content");
         fs.close(open).await.unwrap();
@@ -1808,7 +1847,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let dopen = fs.create("", "", &dir_args).await.unwrap();
+        let dopen = fs.create("", "", &dir_args).await.unwrap().open;
         let entries = fs
             .query_dir(dopen, "link*", DirInfoClass::DirectoryInfo, true, 100)
             .await
@@ -1910,7 +1949,11 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "realdir\\file.txt", &create).await.unwrap();
+        let open = fs
+            .create("", "realdir\\file.txt", &create)
+            .await
+            .unwrap()
+            .open;
         // Try to rename to a path through the symlink dir
         let result = fs.rename(open, "linkdir\\moved.txt", false).await;
         assert!(
@@ -1934,7 +1977,8 @@ mod tests {
         let open = fs
             .create("", "linkdir\\file.txt", &CreateArgs::open_readonly())
             .await
-            .expect("within-share intermediate symlink should be followed");
+            .expect("within-share intermediate symlink should be followed")
+            .open;
         let data = fs.read_at(open, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"content");
         fs.close(open).await.unwrap();
@@ -1979,7 +2023,7 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open = fs.create("", "nonempty.txt", &create).await.unwrap();
+        let open = fs.create("", "nonempty.txt", &create).await.unwrap().open;
         fs.write_at(open, 0, b"hello world").await.unwrap();
         let mut info = fs
             .query_info(open, InfoClass::FileStandardInfo)
@@ -2015,7 +2059,8 @@ mod tests {
                 &CreateArgs::open_readonly(),
             )
             .await
-            .expect("nested case-insensitive open should succeed");
+            .expect("nested case-insensitive open should succeed")
+            .open;
         let data = fs.read_at(open, 0, 10).await.unwrap();
         assert_eq!(data.as_ref(), b"ok");
         fs.close(open).await.unwrap();
@@ -2033,7 +2078,8 @@ mod tests {
         let open2 = fs
             .create("", "SUBDIR\\inner\\Created.txt", &create)
             .await
-            .expect("creating new file in case-mismatched dir should succeed");
+            .expect("creating new file in case-mismatched dir should succeed")
+            .open;
         fs.close(open2).await.unwrap();
         assert!(dir.path().join("SubDir/Inner/Created.txt").exists());
     }
@@ -2052,11 +2098,12 @@ mod tests {
             },
             ..CreateArgs::open_readonly()
         };
-        let open1 = fs.create("", "orig.txt", &create).await.unwrap();
+        let open1 = fs.create("", "orig.txt", &create).await.unwrap().open;
         let open2 = fs
             .create("", "orig.txt", &CreateArgs::open_readonly())
             .await
-            .unwrap();
+            .unwrap()
+            .open;
 
         // Rename via open1, then set delete_on_close and close via open2.
         fs.rename(open1, "renamed.txt", false).await.unwrap();

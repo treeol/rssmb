@@ -124,7 +124,7 @@ mod tests {
             _share_root: &str,
             _path: &str,
             _args: &CreateArgs,
-        ) -> Result<OpenId, VfsError> {
+        ) -> Result<rssmb_vfs::CreateResult, VfsError> {
             Err(VfsError::NotSupported)
         }
         async fn read_at(&self, _open: OpenId, _offset: u64, _len: u32) -> Result<Bytes, VfsError> {

@@ -40,6 +40,10 @@ pub enum NtStatus {
     ObjectNameNotFound,
     /// Object name collision (0xC0000035)
     ObjectNameCollision,
+    /// Duplicate object ID (0xC0000042) — e.g. a non-replay DH2Q reusing a
+    /// CreateGuid that is still held by a live durable open (MS-SMB2
+    /// 3.3.5.9.10).
+    DuplicateObjectId,
     /// Object name invalid (0xC0000033) — invalid path/name
     ObjectNameInvalid,
     /// Sharing violation (0xC0000043)
@@ -100,6 +104,7 @@ impl NtStatus {
             NtStatus::AccessDenied => 0xC0000022,
             NtStatus::ObjectNameNotFound => 0xC0000034,
             NtStatus::ObjectNameCollision => 0xC0000035,
+            NtStatus::DuplicateObjectId => 0xC0000042,
             NtStatus::ObjectNameInvalid => 0xC0000033,
             NtStatus::SharingViolation => 0xC0000043,
             NtStatus::FileIsADirectory => 0xC00000BA,

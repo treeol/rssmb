@@ -15,6 +15,7 @@ rssmb-rpc-server = { workspace = true }
 rssmb-proto = { workspace = true }
 binrw = "0.15"
 tokio = { workspace = true }
+futures = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
