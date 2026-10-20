@@ -3715,6 +3715,8 @@ async fn handle_create(
                     | rssmb_proto::create::CreateDisposition::Overwrite
                     | rssmb_proto::create::CreateDisposition::OverwriteIf
             );
+            // Raw desired-access bits for Samba's stat-open checks.
+            let raw_access_mask = u32::from_le_bytes(create_req.desired_access.into_bytes());
             if state.config.leases && !info.attributes.directory {
                 if let Some(fid) = vfs_file_id {
                     let (dialect, client_guid) = {
@@ -3739,7 +3741,7 @@ async fn handle_create(
                             let is_v2 = rqls.is_v2 && dialect >= DialectConfig::Smb30;
                             match state
                                 .open_table
-                                .request_lease(
+                                .request_lease_with_access(
                                     fid,
                                     open_id,
                                     client_guid,
@@ -3750,6 +3752,7 @@ async fn handle_create(
                                     rqls.epoch,
                                     will_overwrite,
                                     conn_state.write_tx.clone(),
+                                    raw_access_mask,
                                 )
                                 .await
                             {
@@ -3800,13 +3803,14 @@ async fn handle_create(
                         if req_level != 0x00 {
                             let (granted, breaks, oplock_waiters) = state
                                 .open_table
-                                .request_oplock(
+                                .request_oplock_with_access(
                                     fid,
                                     open_id,
                                     file_id,
                                     req_level,
                                     conn_state.write_tx.clone(),
                                     will_overwrite,
+                                    raw_access_mask,
                                 )
                                 .await;
                             granted_oplock = match granted {
@@ -3821,7 +3825,13 @@ async fn handle_create(
                             // Non-leased open still breaks any existing Write lease/oplock on this file.
                             let (breaks, waiters) = state
                                 .open_table
-                                .break_for_open(fid, open_id, will_overwrite, false)
+                                .break_for_open_with_access(
+                                    fid,
+                                    open_id,
+                                    will_overwrite,
+                                    false,
+                                    raw_access_mask,
+                                )
                                 .await;
                             pending_breaks = breaks;
                             pending_break_waiters = waiters;

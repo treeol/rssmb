@@ -107,6 +107,15 @@ break-timeout timer.
 
 ### L2 — Lease grant arithmetic (upgrade/upgrade2/upgrade3/break/statopen2)
 
+**Status: done (suite 28/36).** Grant now follows Samba 4.19.5
+`delay_for_oplock` + `try_lease_upgrade` (open.c): stat opens neither break
+nor wait (lease stat opens skip other leases) and are exempt from share-mode
+checks; another open drops W; a non-lease open drops H; byte-range locks drop
+R; an existing lease changes only on a strict, fully-grantable upgrade.
+Oplock grants use the same rules (any H lease ⇒ no oplock). `statopen3` also
+fails against a Samba 4.19.5 reference server (lease.c:943), so it is not
+counted as an rssmb gap.
+
 The request_lease candidate computation grants the union of current+requested
 without honoring the Samba matrix:
 - upgrade while another lease exists or after a break must not re-grant

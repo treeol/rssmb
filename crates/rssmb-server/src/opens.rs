@@ -122,6 +122,30 @@ impl LeaseCaching {
     };
 }
 
+/// Placeholder access mask for callers that don't supply one: treated as a
+/// full (non-stat) open.
+pub const ACCESS_MASK_UNKNOWN: u32 = 0xFFFF_FFFF;
+
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
+
+/// Samba `is_oplock_stat_open` (open.c): only SYNCHRONIZE / READ_ATTRIBUTES
+/// / WRITE_ATTRIBUTES requested. Such opens never break or get oplocks.
+pub fn is_oplock_stat_open(access_mask: u32) -> bool {
+    let bits = SYNCHRONIZE_ACCESS | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES;
+    access_mask & bits != 0 && access_mask & !bits == 0
+}
+
+/// Samba `is_lease_stat_open` (open.c): as [`is_oplock_stat_open`] plus
+/// READ_CONTROL. Such opens don't break other leases.
+pub fn is_lease_stat_open(access_mask: u32) -> bool {
+    let bits =
+        SYNCHRONIZE_ACCESS | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL_ACCESS;
+    access_mask & bits != 0 && access_mask & !bits == 0
+}
+
 /// Unique identifier for a Lease in the global lease table: `(ClientGuid, LeaseKey)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseId {
@@ -260,13 +284,17 @@ impl LeaseManager {
     /// is being replaced/truncated). `sharing_violation` flips the delay
     /// mask from WRITE to HANDLE — under a share conflict the create must
     /// pend on an H-removing break (timeout-disconnect golden), not just W.
-    fn break_other_holders_on_open(
+    ///
+    /// `skip_leases` (Samba `is_lease_stat_open`) leaves other leases
+    /// untouched — only oplocks are considered for breaking.
+    fn break_other_holders_on_open_mask(
         &mut self,
         file_id: FileId,
         actor_lease: Option<LeaseId>,
         actor_open: OpenId,
         will_overwrite: bool,
         sharing_violation: bool,
+        skip_leases: bool,
     ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
         // Samba delay_for_oplock (open.c): the delay mask is H under a
         // sharing violation, W otherwise; overwrite dispositions also drop
@@ -279,7 +307,11 @@ impl LeaseManager {
         let mut out = Vec::new();
         let mut waiters = Vec::new();
         for (id, rec) in self.leases.iter_mut() {
-            if rec.file_id != file_id || Some(*id) == actor_lease || rec.handles.is_empty() {
+            if rec.file_id != file_id
+                || Some(*id) == actor_lease
+                || rec.handles.is_empty()
+                || skip_leases
+            {
                 continue;
             }
             let e = rec.state;
@@ -798,8 +830,26 @@ impl OpenTable {
                 || entry.desired_access.generic_write
                 || entry.desired_access.generic_all;
             let new_wants_delete = entry.desired_access.delete || entry.desired_access.generic_all;
+            // Samba open_mode_check / share_conflict (open.c): a stat open
+            // (attributes only, no data/delete access) never conflicts in
+            // either direction. Narrowed to attribute-only opens so opens
+            // that request nothing at all keep the existing behaviour.
+            let is_stat = |d: &DesiredAccess| {
+                d.read_attributes
+                    && !(d.read
+                        || d.write
+                        || d.delete
+                        || d.generic_read
+                        || d.generic_write
+                        || d.generic_execute
+                        || d.generic_all)
+            };
+            let new_is_stat = is_stat(&entry.desired_access);
 
             for ex in existing {
+                if new_is_stat || is_stat(&ex.desired_access) {
+                    continue;
+                }
                 // (a) Existing must share what the new open wants.
                 if new_wants_read && !ex.share_access.read {
                     debug!(
@@ -1268,7 +1318,65 @@ impl OpenTable {
         will_overwrite: bool,
         notify_tx: LeaseNotifySender,
     ) -> Result<(LeaseGrant, Vec<BreakNotification>, Vec<BreakWaiter>), ()> {
-        let total_opens = self.count(file_id).await;
+        self.request_lease_with_access(
+            file_id,
+            open_id,
+            client_guid,
+            lease_key,
+            requested,
+            is_v2,
+            parent_lease_key,
+            client_epoch,
+            will_overwrite,
+            notify_tx,
+            ACCESS_MASK_UNKNOWN,
+        )
+        .await
+    }
+
+    /// Open ids of every other open on `file_id` (excluding `open_id`).
+    async fn other_open_ids(&self, file_id: FileId, open_id: OpenId) -> Vec<OpenId> {
+        let map = self.opens.read().await;
+        map.get(&file_id)
+            .map(|v| {
+                v.iter()
+                    .map(|e| e.open_id)
+                    .filter(|o| *o != open_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn file_has_brlocks(&self, file_id: FileId) -> bool {
+        self.range_locks
+            .read()
+            .await
+            .get(&file_id)
+            .is_some_and(|l| !l.is_empty())
+    }
+
+    /// [`Self::request_lease`] with the opener's raw desired-access mask.
+    /// Grant rules follow Samba `delay_for_oplock` / `try_lease_upgrade`
+    /// (open.c): stat opens break nothing, another open drops W, a non-lease
+    /// open drops H, byte-range locks drop R, and an existing lease is only
+    /// upgraded to a strict superset that can be granted in full.
+    #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
+    pub async fn request_lease_with_access(
+        &self,
+        file_id: FileId,
+        open_id: OpenId,
+        client_guid: [u8; 16],
+        lease_key: [u8; 16],
+        requested: LeaseCaching,
+        is_v2: bool,
+        parent_lease_key: Option<[u8; 16]>,
+        client_epoch: u16,
+        will_overwrite: bool,
+        notify_tx: LeaseNotifySender,
+        access_mask: u32,
+    ) -> Result<(LeaseGrant, Vec<BreakNotification>, Vec<BreakWaiter>), ()> {
+        let others = self.other_open_ids(file_id, open_id).await;
+        let has_brlocks = self.file_has_brlocks(file_id).await;
         let mut mgr = self.leases.write().await;
         let id = LeaseId {
             client_guid,
@@ -1283,57 +1391,61 @@ impl OpenTable {
             }
         }
 
-        // 2. Break any conflicting leases/oplocks held by OTHER owners on `file_id`
-        //    if our requested state requires exclusivity or if existing holders
-        //    hold Write caching.
-        let other_leases_exist = mgr
-            .leases
-            .iter()
-            .any(|(k, v)| *k != id && v.file_id == file_id && !v.handles.is_empty());
-        let other_oplocks_exist = mgr
-            .oplocks
-            .values()
-            .any(|o| o.file_id == file_id && o.open_id != open_id && o.level != 0);
-
-        // Count opens belonging to THIS lease (plus the new `open_id` if not yet recorded).
-        let this_lease_opens = mgr
+        // 2. Classify the other opens on `file_id` (Samba delay_for_oplock_fn):
+        //    any open outside this lease is an "other lease" (drops W); any
+        //    open not covered by a lease at all is an "oplock" entry (drops H).
+        let this_lease_handles: HashSet<OpenId> = mgr
             .leases
             .get(&id)
-            .map(|e| {
-                let mut c = e.handles.len();
-                if !e.handles.contains(&open_id) {
-                    c += 1;
-                }
-                c
-            })
-            .unwrap_or(1);
-        let non_leased_other_opens = total_opens > this_lease_opens && !other_leases_exist;
+            .map(|e| e.handles.clone())
+            .unwrap_or_default();
+        let leased_handles: HashSet<OpenId> = mgr
+            .leases
+            .values()
+            .filter(|v| v.file_id == file_id)
+            .flat_map(|v| v.handles.iter().copied())
+            .collect();
+        let have_other_lease = others.iter().any(|o| !this_lease_handles.contains(o));
+        let got_oplock = others.iter().any(|o| !leased_handles.contains(o));
 
-        // Opening a file from another lease key breaks Write caching on existing leases/oplocks.
-        let (breaks, break_waiters) =
-            mgr.break_other_holders_on_open(file_id, Some(id), open_id, will_overwrite, false);
-
-        // 3. Compute the maximum caching we can grant for `requested`.
-        //    - Write caching (W) requires R (or RH) and NO other opens outside this lease.
-        //    - Handle caching (H) requires R.
-        //    - Read caching (R) can be shared across multiple readers if no other open has W.
-        let can_grant_write = requested.write
-            && requested.read
-            && !other_leases_exist
-            && !other_oplocks_exist
-            && !non_leased_other_opens;
-        let can_grant_read = requested.read;
-        let can_grant_handle = requested.handle && can_grant_read;
-
-        let candidate = LeaseCaching {
-            read: can_grant_read,
-            handle: can_grant_handle,
-            write: can_grant_write,
+        // Stat opens (oplock sense) neither break nor wait; lease stat opens
+        // additionally skip breaking other leases.
+        let (breaks, break_waiters) = if is_oplock_stat_open(access_mask) {
+            (Vec::new(), Vec::new())
+        } else {
+            mgr.break_other_holders_on_open_mask(
+                file_id,
+                Some(id),
+                open_id,
+                will_overwrite,
+                false,
+                is_lease_stat_open(access_mask),
+            )
         };
 
+        // 3. Compute the grant (Samba delay_for_oplock `grant:` block).
+        let mut candidate = requested;
+        if !candidate.read && !candidate.write {
+            candidate = LeaseCaching::NONE;
+        }
+        if !candidate.read && candidate.write {
+            // W or WH without R is never granted.
+            candidate = LeaseCaching::NONE;
+        }
+        if has_brlocks {
+            candidate.read = false;
+        }
+        if have_other_lease {
+            candidate.write = false;
+        }
+        if got_oplock {
+            candidate.handle = false;
+        }
+
+        let is_new = !mgr.leases.contains_key(&id);
         let entry = mgr.leases.entry(id).or_insert_with(|| LeaseRecord {
             file_id,
-            state: LeaseCaching::NONE,
+            state: candidate,
             breaking: false,
             break_to: LeaseCaching::NONE,
             pending_break_to: None,
@@ -1364,12 +1476,18 @@ impl OpenTable {
         let (granted_state, flags) = if entry.breaking {
             (entry.state, 0x0000_0002) // SMB2_LEASE_FLAG_BREAK_IN_PROGRESS
         } else {
-            let merged = entry.state.union(candidate);
-            if merged != entry.state {
+            // Samba try_lease_upgrade: only a strict superset of the
+            // existing state, granted in full, changes the lease.
+            let existing = entry.state;
+            let do_upgrade = !is_new
+                && existing.is_subset_of(requested)
+                && candidate != existing
+                && candidate == requested;
+            if do_upgrade {
                 if entry.is_v2 {
                     entry.epoch = entry.epoch.wrapping_add(1);
                 }
-                entry.state = merged;
+                entry.state = candidate;
             }
             (entry.state, 0)
         };
@@ -1398,27 +1516,84 @@ impl OpenTable {
         notify_tx: LeaseNotifySender,
         will_overwrite: bool,
     ) -> (u8, Vec<BreakNotification>, Vec<BreakWaiter>) {
-        let total_opens = self.count(file_id).await;
+        self.request_oplock_with_access(
+            file_id,
+            open_id,
+            smb_file_id,
+            requested_level,
+            notify_tx,
+            will_overwrite,
+            ACCESS_MASK_UNKNOWN,
+        )
+        .await
+    }
+
+    /// [`Self::request_oplock`] with the opener's raw desired-access mask.
+    /// Grant rules follow Samba `delay_for_oplock` (open.c): stat opens get
+    /// no oplock and break nothing; another open drops W; any handle-caching
+    /// lease on the file forbids an oplock; byte-range locks drop R.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_oplock_with_access(
+        &self,
+        file_id: FileId,
+        open_id: OpenId,
+        smb_file_id: rssmb_proto::create::FileId,
+        requested_level: u8,
+        notify_tx: LeaseNotifySender,
+        will_overwrite: bool,
+        access_mask: u32,
+    ) -> (u8, Vec<BreakNotification>, Vec<BreakWaiter>) {
+        if is_oplock_stat_open(access_mask) {
+            return (0x00, Vec::new(), Vec::new());
+        }
+        let others = self.other_open_ids(file_id, open_id).await;
+        let has_brlocks = self.file_has_brlocks(file_id).await;
         let mut mgr = self.leases.write().await;
 
-        let (breaks, break_waiters) =
-            mgr.break_other_holders_on_open(file_id, None, open_id, will_overwrite, false);
-
-        let granted = if total_opens <= 1
-            && !mgr
-                .leases
+        // Samba evaluates holder state before sending breaks.
+        let got_handle_lease = mgr
+            .leases
+            .values()
+            .any(|l| l.file_id == file_id && !l.handles.is_empty() && l.state.handle)
+            || mgr
+                .oplocks
                 .values()
-                .any(|l| l.file_id == file_id && !l.handles.is_empty())
-        {
-            match requested_level {
-                0x09 | 0x08 | 0x01 => requested_level,
-                _ => 0x00,
-            }
-        } else if requested_level == 0x01 || requested_level == 0x08 || requested_level == 0x09 {
-            // Multiple readers can share a Level II oplock if no one holds write caching.
-            0x01
-        } else {
+                .any(|o| o.file_id == file_id && o.open_id != open_id && o.level == 0x09);
+
+        let (breaks, break_waiters) = mgr.break_other_holders_on_open_mask(
+            file_id,
+            None,
+            open_id,
+            will_overwrite,
+            false,
+            is_lease_stat_open(access_mask),
+        );
+
+        let mut want = match requested_level {
+            0x09 => LeaseCaching::from_bits(0x07),
+            0x08 => LeaseCaching::from_bits(0x05),
+            0x01 => LeaseCaching::R,
+            _ => LeaseCaching::NONE,
+        };
+        if has_brlocks {
+            want.read = false;
+        }
+        if !others.is_empty() {
+            want.write = false;
+        }
+        if got_handle_lease {
+            want = LeaseCaching::NONE;
+        }
+        let granted = match (want.read, want.write, want.handle) {
+            (true, true, true) => 0x09,
+            (true, true, false) => 0x08,
+            (true, false, _) => 0x01,
+            _ => 0x00,
+        };
+        let granted = if requested_level == 0x00 {
             0x00
+        } else {
+            granted
         };
 
         if granted != 0x00 {
@@ -1457,13 +1632,37 @@ impl OpenTable {
         will_overwrite: bool,
         sharing_violation: bool,
     ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
+        self.break_for_open_with_access(
+            file_id,
+            actor_open,
+            will_overwrite,
+            sharing_violation,
+            ACCESS_MASK_UNKNOWN,
+        )
+        .await
+    }
+
+    /// [`Self::break_for_open`] honouring Samba's stat-open exemptions:
+    /// oplock stat opens break nothing, lease stat opens skip leases.
+    pub async fn break_for_open_with_access(
+        &self,
+        file_id: FileId,
+        actor_open: OpenId,
+        will_overwrite: bool,
+        sharing_violation: bool,
+        access_mask: u32,
+    ) -> (Vec<BreakNotification>, Vec<BreakWaiter>) {
+        if is_oplock_stat_open(access_mask) {
+            return (Vec::new(), Vec::new());
+        }
         let mut mgr = self.leases.write().await;
-        mgr.break_other_holders_on_open(
+        mgr.break_other_holders_on_open_mask(
             file_id,
             None,
             actor_open,
             will_overwrite,
             sharing_violation,
+            is_lease_stat_open(access_mask),
         )
     }
 
