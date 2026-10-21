@@ -76,6 +76,13 @@ valid_users = ["alice"]
 # read_users = ["alice", "bob"]
 # Optional: restrict write access to specific users (empty = all valid_users).
 # write_users = ["alice"]
+# Atomic publish-on-close: new files are written under a hidden temp name
+# (.rssmb-tmp.<name>.<8 hex>) and atomically renamed to the final name on the
+# last close. SMB clients always see the final name; only the backing
+# filesystem sees the temp. Useful when the share is consumed by host-side
+# watchers/backups that must not observe a pre-sized file with no data.
+# Default: false.
+# publish_on_close = true
 
 # ── Authentication ─────────────────────────────────────────────────────
 # User accounts for NTLM authentication.

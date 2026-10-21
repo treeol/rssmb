@@ -5,6 +5,26 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-share atomic publish-on-close (`publish_on_close`, default `false`).**
+  New files on shares with the option enabled are written under a hidden
+  temp name (`.rssmb-tmp.<final-name>.<8 hex>`, same directory) and atomically
+  renamed to the final name when the last SMB handle closes. SMB clients
+  observe the final name throughout (CREATE by name, QUERY_DIRECTORY,
+  QUERY_INFO, rename, delete, CHANGE_NOTIFY, case-insensitive lookup all go
+  through a single VFS resolution hook); only the backing filesystem sees the
+  temp name. Fixes host-side consumers (watchers, ingest pipelines, backups)
+  reading a pre-sized file with zero data while a client is still writing.
+  Covers CREATE / OPEN_IF-when-creating / OVERWRITE_IF / SUPERSEDE on regular
+  files; plain OPEN of an existing file is untouched (deliberate). Durable
+  handles carry the pending entry (reconnect resumes it; durable expiry
+  publishes as a close). Crash orphans (`.rssmb-tmp.*`, no map entry, older
+  than 1 h) are removed at share startup and by a 10-minute sweep in the
+  server sweeper.
+
 ## [0.1.4] - 2026-10-20
 
 ### Added

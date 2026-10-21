@@ -223,6 +223,7 @@ mod tests {
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
+            publish_on_close: false,
         };
         let tree = Arc::new(Tree::new(1, 1, "test".to_string(), share, vfs));
         session.add_tree(1, tree.clone()).await;
@@ -251,6 +252,7 @@ mod tests {
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
+            publish_on_close: false,
         };
         let tree = Arc::new(Tree::new(1, 1, "share".to_string(), share, vfs));
         session.add_tree(1, tree).await;
@@ -269,6 +271,7 @@ mod tests {
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
+            publish_on_close: false,
         };
         session
             .add_tree(

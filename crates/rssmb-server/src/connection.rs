@@ -1569,6 +1569,7 @@ where
             // (60000ms default, MIN(client,300000)), so a 5s interval bounds
             // the fd overstay to ~5s past expiry without busy-waiting.
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            let mut ticks: u64 = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -1583,11 +1584,40 @@ where
                         }
                         // Release the lease record for each evicted open —
                         // the table cannot reach the OpenTable itself.
+                        // (Durable expiry counts as a close: the VFS close
+                        // below publishes any pending publish-on-close file.)
                         for open_id in evicted {
                             state
                                 .open_table
                                 .remove_open_from_leases(open_id)
                                 .await;
+                        }
+                        // Periodic publish-on-close orphan sweep (every
+                        // 10 min at this 5s cadence — every 120th tick).
+                        // Removes `.rssmb-tmp.*` files with no pending map
+                        // entry and mtime older than 1 h (crash orphans).
+                        ticks = ticks.wrapping_add(1);
+                        if ticks % 120 == 0 {
+                            for (share_name, share) in state.shares_snapshot().iter() {
+                                if !share.publish_on_close || share.path.is_empty() {
+                                    continue;
+                                }
+                                let Ok(root) = std::fs::canonicalize(&share.path) else {
+                                    continue;
+                                };
+                                // Sweep only already-registered publish roots
+                                // (a table exists once the share's first
+                                // TREE_CONNECT opened a publish backend).
+                                let removed =
+                                    rssmb_vfs::publish::PendingPublishTable::sweep_registered_root(&root);
+                                if removed.unwrap_or(0) > 0 {
+                                    tracing::info!(
+                                        share = %share_name,
+                                        removed,
+                                        "publish_on_close: periodic orphan sweep"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

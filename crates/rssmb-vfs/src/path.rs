@@ -13,7 +13,8 @@ use unicode_normalization::UnicodeNormalization;
 const MAX_PATH_UTF16: usize = 32_767;
 
 /// Maximum component (name) length in UTF-16 code units (NTFS limit).
-const MAX_COMPONENT_UTF16: usize = 255;
+/// `pub(crate)`: used by `publish` to budget temp-name suffixes.
+pub(crate) const MAX_COMPONENT_UTF16: usize = 255;
 
 /// Characters that are forbidden in SMB path names.
 ///
