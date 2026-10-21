@@ -407,6 +407,12 @@ impl PendingPublishTable {
             dirs.get_mut(&kdir).and_then(|m| m.insert(kname, pending));
             return true;
         }
+        // The entry's client-visible display name follows the rename (the
+        // map key is case-folded; listings show the recorded spelling).
+        let pending = PendingPublish {
+            display_name: new_name.to_string(),
+            ..pending
+        };
         dirs.entry(nkdir).or_default().insert(nkname, pending);
         false
     }
@@ -449,27 +455,42 @@ impl PendingPublishTable {
     }
 
     /// Live (pending) temp paths, absolutized under each entry's recorded
-    /// root-relative temp path, for the orphan sweep exclusion.
+    /// root-relative temp path, for the orphan sweep exclusion. A leading
+    /// `./` component (temp minted in the root dir) is normalized away —
+    /// the sweep compares against `read_dir`-produced paths, which never
+    /// contain `.` components.
     fn live_temps(&self, root: &Path) -> std::collections::HashSet<PathBuf> {
         let dirs = self.share.dirs.read().expect("publish map lock poisoned");
         dirs.values()
             .flat_map(|m| m.values())
-            .map(|p| root.join(&p.temp_name))
+            .map(|p| {
+                // Normalize a leading "./" on the root-relative temp.
+                let rel = Path::new(&p.temp_name);
+                let rel = match rel.strip_prefix("./") {
+                    Ok(stripped) => stripped.to_path_buf(),
+                    Err(_) => p.temp_name.clone(),
+                };
+                root.join(rel)
+            })
             .collect()
     }
 
     /// Sweep an explicit root — only if a table is already registered for it
     /// (the periodic server sweeper must not create registry entries for
     /// shares that never opened a publish backend).
+    ///
+    /// The registry guard is dropped before sweeping: `sweep_orphans_at`
+    /// re-reads the registry (nested-root exclusion), and a recursive read
+    /// of a std RwLock can deadlock when a writer (a TREE_CONNECT calling
+    /// `for_root`) is queued behind it.
     pub fn sweep_registered_root(root: &Path) -> Option<usize> {
-        let reg = registry();
-        let reg = reg.read().expect("publish registry lock poisoned");
-        reg.get(root).map(|share| {
-            let t = Self {
-                share: share.clone(),
-            };
-            t.sweep_orphans_at(root)
-        })
+        let share = {
+            let reg = registry();
+            let reg = reg.read().expect("publish registry lock poisoned");
+            reg.get(root).cloned()?
+        };
+        let t = Self { share };
+        Some(t.sweep_orphans_at(root))
     }
 
     /// Remove `.rssmb-tmp.*` orphans: temp files with no pending-map entry
@@ -493,9 +514,11 @@ impl PendingPublishTable {
     /// per-share tables).
     pub fn sweep_orphans_at(&self, root: &Path) -> usize {
         let mut removed = 0usize;
+        // Nested-root exclusion: skip only roots STRICTLY beneath this one.
+        // (Including ancestors would skip this root's own subdirectories.)
         let other_roots: Vec<PathBuf> = registered_roots()
             .into_iter()
-            .filter(|r| r != root)
+            .filter(|r| r != root && r.starts_with(root))
             .collect();
         let live = self.live_temps(root);
         let mut stack = vec![root.to_path_buf()];
@@ -718,6 +741,40 @@ mod tests {
         // Source unchanged (still pending under a.txt).
         let (_, _, mapped) = unpack(t.resolve(Path::new("a.txt")));
         assert!(mapped.is_some());
+    }
+
+    #[test]
+    fn rename_updates_display_name() {
+        // Round-2: the listing name follows the rename (the map key is
+        // case-folded; the display spelling must be the new one).
+        let t = table(false);
+        let _ = t.resolve_or_acquire(Path::new(""), "old.txt", Path::new(""));
+        assert!(!t.rename(Path::new(""), "old.txt", Path::new(""), "New.TXT"));
+        let listed = t.pending_in_dir(Path::new(""));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "New.TXT");
+    }
+
+    #[test]
+    fn sweep_nested_root_only_excludes_deeper_roots() {
+        // Round-2 B3: sweeping the INNER root must still descend into its
+        // own subdirectories — only roots STRICTLY beneath the sweep root
+        // are excluded (an ANCESTOR root must not be skipped).
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir_in(outer.path()).unwrap();
+        let sub = inner.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let t0 = PendingPublishTable::for_root(outer.path(), false);
+        let t1 = PendingPublishTable::for_root(inner.path(), false);
+        let _ = t0;
+        let stale_inner = sub.join(format!("{TEMP_PREFIX}x.bin.deadbeef"));
+        std::fs::write(&stale_inner, b"x").unwrap();
+        f2_set_old(&stale_inner);
+        // The inner root's own sweep must reach its subdir (an outer
+        // registered root must not shadow it).
+        let removed = t1.sweep_orphans();
+        assert_eq!(removed, 1, "inner sweep must clean its own subtree");
+        assert!(!stale_inner.exists());
     }
 
     #[test]

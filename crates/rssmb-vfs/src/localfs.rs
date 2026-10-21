@@ -225,14 +225,13 @@ impl LocalFs {
         let dir = cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
             .map_err(|e| VfsError::Io(format!("open share root: {e}")))?;
         let publish = if publish_on_close {
-            let table = PendingPublishTable::for_root(&canonical_root, !case_sensitive);
-            // Startup sweep for `.rssmb-tmp.*` orphans left by a previous
-            // crash. Synchronous and cheap (pure std::fs walk); it must
-            // complete before the first client CREATE could race a fresh
-            // (young-mtime) temp file into the same directory.
-            let removed = table.sweep_orphans();
-            tracing::debug!(removed, "publish_on_close: startup orphan sweep");
-            Some(table)
+            // Startup orphan sweep runs inside for_root — ONCE per root
+            // (guarded by the registry entry's startup_swept flag), not per
+            // TREE_CONNECT (B6 round-1). do NOT sweep here.
+            Some(PendingPublishTable::for_root(
+                &canonical_root,
+                !case_sensitive,
+            ))
         } else {
             None
         };
@@ -475,35 +474,49 @@ impl Vfs for LocalFs {
         //   3. pend decision for create-dispositions on non-pending paths.
         let mut publish_ref: Option<PublishRef> = None;
         let mut pending_acquired = false;
+        // Did THIS handle mint the pending temp (vs attaching to an existing
+        // one)? Only a creator may unlink on rollback (B4).
+        let mut created_here = false;
         let mut effective_rel = rel.clone();
         // On-disk-cased parent dir for temp placement (differs from `rel`'s
-        // casing after CI resolution).
+        // casing after CI resolution). EMPTY = the root dir: a `.` would
+        // leak a literal `./` component into root-relative temp paths.
         let mut disk_parent = {
             let (d, _) = crate::publish::split_parent(&rel);
             if d.as_os_str().is_empty() {
-                PathBuf::from(".")
+                PathBuf::new()
             } else {
                 d
             }
         };
 
         if let Some(table) = &self.publish {
-            // (a) existing pending file: attach atomically (count++, same
-            // authoritative temp from the map). Normal share-mode/oplock/
-            // lease checks happen in the server layer on the returned open.
-            if let Some((dir, name, _)) = table.resolve(&rel) {
-                let acq = table.resolve_or_acquire(&dir, &name, &disk_parent);
-                let temp_rel = match acq {
-                    Acquire::Created(t) | Acquire::Attached(t) => t,
-                };
-                publish_ref = Some(PublishRef {
-                    dir,
-                    final_name: name,
-                });
-                pending_acquired = true;
-                effective_rel = temp_rel;
-                // Pending files are always regular files; the map entry
-                // guarantees the temp was created. exists = true below.
+            // (a) pending-file attach — ONE atomic transition (round-2 B5:
+            // a separate read-then-write pair could race a last-close
+            // publish between them). `resolve_or_acquire` distinguishes:
+            //   Attached — this path IS a pending file; open its temp;
+            //   Created  — the entry vanished (a racing publish) or was
+            //              never there: roll the reservation back and fall
+            //              through to the normal pend decision below (the
+            //              FINAL name's on-disk state is authoritative).
+            let (dir, name) = crate::publish::split_parent(&rel);
+            match table.resolve_or_acquire(&dir, &name, &disk_parent) {
+                Acquire::Attached(temp_rel) => {
+                    publish_ref = Some(PublishRef {
+                        dir,
+                        final_name: name,
+                    });
+                    pending_acquired = true;
+                    // An attach never owns the temp's lifecycle (B4).
+                    created_here = false;
+                    effective_rel = temp_rel;
+                }
+                Acquire::Created(_) => {
+                    // Raced publish or no pending entry: release the
+                    // reservation; the pend decision below re-checks the
+                    // FINAL name's on-disk state.
+                    let _ = table.abort(&dir, &name);
+                }
             }
         }
 
@@ -536,7 +549,7 @@ impl Vfs for LocalFs {
                 // The on-disk-cased parent is where a fresh temp must land.
                 let (d, _) = crate::publish::split_parent(&effective_rel);
                 disk_parent = if d.as_os_str().is_empty() {
-                    PathBuf::from(".")
+                    PathBuf::new()
                 } else {
                     d
                 };
@@ -569,23 +582,24 @@ impl Vfs for LocalFs {
                 if pend {
                     let (dir, name) = crate::publish::split_parent(&rel);
                     let acq = table.resolve_or_acquire(&dir, &name, &disk_parent);
-                    let temp_rel = match acq {
-                        Acquire::Created(t) => {
-                            // A brand-new pending file: the final name does
-                            // not exist; the temp is created (exclusively)
-                            // below.
-                            existed_before = false;
-                            t
-                        }
-                        // Attached cannot happen (publish_ref was None) but
-                        // the map is authoritative either way.
-                        Acquire::Attached(t) => t,
-                    };
+                    let temp_rel = acq.into_temp();
+                    // CreateAction tracks the FINAL name (B6): a fresh
+                    // Created temp reports FILE_CREATED only when the final
+                    // name did not exist; OVERWRITE_IF/SUPERSEDE over an
+                    // existing regular file keep `existed_before = true`
+                    // and report Overwritten/Superseded at the end.
+                    if !exists {
+                        existed_before = false;
+                    }
                     publish_ref = Some(PublishRef {
                         dir,
                         final_name: name,
                     });
                     pending_acquired = true;
+                    // Pend branch: this handle minted the temp (Attached
+                    // cannot happen here — publish_ref was None); only a
+                    // creator may unlink on rollback (B4).
+                    created_here = true;
                     effective_rel = temp_rel;
                     // The temp is what gets opened below; a Created temp
                     // does not exist yet.
@@ -594,18 +608,21 @@ impl Vfs for LocalFs {
             }
         }
 
-        // Error rollback (B2): on any failure after the acquisition, release
-        // this handle's reservation; if it was the last one, best-effort
-        // unlink the temp (a fresh empty Created temp). Without this a
-        // failed open permanently shadows the final name with a phantom
-        // pending entry.
+        // Error rollback (B2/B4): on any failure after the acquisition,
+        // release this handle's reservation. When the reservation reaches
+        // zero: unlink the temp ONLY when this handle CREATED it (a fresh
+        // empty temp); an ATTACH that rolls back must leave the temp alone —
+        // another handle's data lives there (the removed entry then becomes
+        // an age-guarded orphan).
         macro_rules! rollback_on_err {
             ($e:expr) => {{
                 let e = $e;
                 if pending_acquired {
                     if let (Some(table), Some(p)) = (&self.publish, &publish_ref) {
                         if let Some(temp) = table.abort(&p.dir, &p.final_name) {
-                            let _ = self.dir.remove_file(&temp);
+                            if created_here {
+                                let _ = self.dir.remove_file(&temp);
+                            }
                         }
                     }
                 }
@@ -710,10 +727,11 @@ impl Vfs for LocalFs {
                 || args.desired_access.generic_all);
         opts.write(wants_write);
         // B4: a freshly-minted pending temp is created EXCLUSIVELY (a
-        // same-named young orphan must never be silently reopened with
-        // stale content); the open below retries with a fresh suffix on
-        // EEXIST. Non-pending creates keep plain O_CREAT.
-        let exclusive_fresh = needs_create && publish_ref.is_some();
+        // same-named young orphan must never be silently reopened with stale
+        // content); the open below retries with a fresh suffix on EEXIST.
+        // An ATTACHED temp (this handle did not mint it) opens normally —
+        // it already exists and is shared (round-2 B7).
+        let exclusive_fresh = needs_create && publish_ref.is_some() && created_here;
         if needs_create && !target_is_dir {
             if exclusive_fresh {
                 opts.create_new(true);

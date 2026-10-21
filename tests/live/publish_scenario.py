@@ -56,14 +56,16 @@ def main():
         a.writeFile(tid_a, fid_a, chunk, offset=off)
         off += len(chunk)
 
-    # 1) Host ls -A: only the temp.
+    # 1) Host ls -A: only the temp (plus any pre-seeded fixtures like
+    # README.txt — the pending file must be a temp, and the final name must
+    # be absent).
     entries = sorted(e.name for e in os.scandir(BACKING))
     if not entries:
         fail("backing dir empty — nothing was created")
     temps = [e for e in entries if e.startswith(".rssmb-tmp.")]
-    if len(entries) != 1 or len(temps) != 1:
+    if len(temps) != 1:
         fail(f"expected exactly one .rssmb-tmp.* entry while pending, got {entries}")
-    print(f"ok: host ls -A shows only temp: {temps[0]}")
+    print(f"ok: host ls -A shows temp: {temps[0]} (fixtures: {entries})")
     if os.path.exists(os.path.join(BACKING, NAME)):
         fail("final name visible on backing fs while pending")
 
@@ -92,11 +94,12 @@ def main():
     print("ok: client B reads A's data via final name")
     b.closeFile(tid_b, fid_b)
 
-    # 4) A closes: publish. Final complete, no temp.
+    # 4) A closes: publish. The final file exists, complete; no temp
+    # remains (pre-seeded fixtures like README.txt are untouched).
     a.closeFile(tid_a, fid_a)
     entries = sorted(e.name for e in os.scandir(BACKING))
-    if entries != [NAME]:
-        fail(f"after close expected only {NAME}, got {entries}")
+    if NAME not in entries or any(e.startswith(".rssmb-tmp.") for e in entries):
+        fail(f"after close expected {NAME} and no temps, got {entries}")
     st = os.stat(os.path.join(BACKING, NAME))
     if st.st_size != SIZE:
         fail(f"published file wrong size {st.st_size}, expected {SIZE}")
