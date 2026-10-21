@@ -61,3 +61,29 @@ first). Each suite ran through `target/dbg/gate.sh` with a 300 s cap and smbtort
 No subtest that passed at 0bedeb5 fails at d1922cf.
 
 Full logs: /tmp/torture-*.log
+
+## publish_on_close baselines (2026-10-21, branch feat/publish-on-close, 3d9f174)
+
+Full smbtorture 4.19.5 baseline run with the per-share `publish_on_close`
+option **OFF** (default path, rssmb-mount.toml) and **ON**
+(rssmb-publish.toml), smbtorture from the smb-torture:419 container,
+target //172.17.0.2:4450/public. The suite lists below show pass counts;
+**OFF and ON failure sets are byte-identical per suite** (verified by
+diff of the failing-subtest lists for create/rename/dir/lock/lease/
+durable/sharemode/credits — diff_rc=0 — except where noted).
+
+| Suite | OFF | ON | Notes |
+|---|---|---|---|
+| smb2.create | 17 pass / 10 fail + 1 err | identical | required suite — no delta |
+| smb2.rename | 12 pass / 12 fail | identical | required suite — no delta |
+| smb2.dir | 9 pass / 7 fail | identical | required suite — no delta |
+| smb2.delete-on-close-perms | 9 pass / 9 fail | identical | required suite — no delta |
+| smb2.notify | 23 pass / 23 fail (120 s) | TIMEOUT at 120 s | **documented ON behavior**: with the final name hidden until publish, ADDED/MODIFY events the suite waits for on the final name only arrive as the publish MOVED_TO; the suite's waits time out. Notify ON filtering of `.rssmb-tmp.*` events is by design. |
+| smb2.lock | 25 pass / 22 fail | identical (diff verified) | `truncate` COLLISION etc. fail in BOTH configs — pre-existing, not a publish_on_close regression |
+| smb2.lease | 39 pass / 10 fail | 39 pass / 9-10 fail | `multibreak`/`rename_wait` flakes (lease suite timing); re-runs vary between 9/10, no publish-related delta in the stable set |
+| smb2.durable-v2-open | 15/1 (app-instance) | identical | |
+| smb2.sharemode / smb2.credits / rpc.srvsvc / smb2.getinfo / smb2.setinfo / smb2.session / smb2.ioctl / smb2.read / smb2.connect / smb2.compound | unchanged | unchanged | |
+
+Live interop gates (same day, final binary): run.sh 17/17, smbclient 9/9
+(4.17.12, OFF and ON), rclone 3/3 (go-smb2, OFF and ON), impacket
+publish_on_close end-to-end scenario PASS (tests/live/publish_scenario.py).
