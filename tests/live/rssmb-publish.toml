@@ -1,0 +1,21 @@
+# Config for the publish_on_close live interop scenario (containerized
+# clients reach the sandbox via 0.0.0.0). Throwaway test credential.
+listen_addr = "0.0.0.0"
+port = 4450
+min_dialect = "smb21"
+max_dialect = "smb311"
+signing = "desired"
+encryption = "disabled"
+guest_access = true
+health_port = 18082
+max_credits = 1024
+
+[shares.public]
+name = "public"
+path = "/tmp/rssmb-live-pub/public"
+guest_ok = true
+publish_on_close = true
+
+[[users]]
+username = "alice"
+password = "TestPass123"

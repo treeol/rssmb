@@ -362,6 +362,21 @@ pub struct ShareConfig {
     /// true only if all clients are cifs.ko on a case-sensitive filesystem.
     #[serde(default = "default_false")]
     pub case_sensitive: bool,
+
+    /// Publish-on-close (default: false): new files are written under a
+    /// hidden temp name (`.rssmb-tmp.<name>.<8 hex>`) in the same directory
+    /// and atomically renamed to the final name when the last SMB handle
+    /// closes. SMB clients observe the final name throughout; only the
+    /// backing filesystem sees the temp name. Intended for shares consumed
+    /// by filesystem watchers (ingest pipelines, backups) that must not
+    /// observe a pre-sized file with no data yet.
+    ///
+    /// Applies to CREATE / OPEN_IF-when-creating / OVERWRITE_IF / SUPERSEDE
+    /// on regular files. Directories, plain OPEN/OVERWRITE of existing
+    /// files, and streams are untouched — appends/overwrites via an OPEN of
+    /// an existing file write the real file directly (no temp, no rename).
+    #[serde(default = "default_false")]
+    pub publish_on_close: bool,
 }
 
 fn default_true() -> bool {
@@ -624,6 +639,7 @@ impl ServerConfig {
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
 
@@ -806,6 +822,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(
@@ -834,6 +851,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(config.validate().is_ok());
@@ -858,6 +876,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(
@@ -885,6 +904,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(
@@ -912,6 +932,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(
@@ -939,6 +960,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         assert!(
@@ -1066,6 +1088,7 @@ disabled = false
                 follow_symlinks: FollowSymlinks::Never,
                 strict_sync: true,
                 case_sensitive: false,
+                publish_on_close: false,
             },
         );
         let warnings = config.warnings();

@@ -25,6 +25,7 @@ use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::publish::PendingPublishTable;
 use crate::*;
 
 /// Maximum pooled read-buffer size (matches the largest READ the server
@@ -131,6 +132,16 @@ fn file_id_from_metadata(_meta: &std::fs::Metadata) -> FileId {
     FileId { dev: 0, ino: 0 }
 }
 
+/// One tracked open file, carrying its pending-publish identity when the
+/// handle is on a hidden temp file.
+#[derive(Default, Clone)]
+struct PublishRef {
+    /// Directory of the pending file (relative to the share root).
+    dir: PathBuf,
+    /// Client-visible final name.
+    final_name: String,
+}
+
 /// An open handle tracked by `LocalFs`.
 struct FileHandle {
     /// The async file handle (fd obtained from cap-std's confined open).
@@ -148,6 +159,9 @@ struct FileHandle {
     is_directory: bool,
     /// Whether to delete the file when the handle is closed.
     delete_on_close: bool,
+    /// Publish-on-close identity: `Some` when this handle is on a hidden
+    /// `.rssmb-tmp.*` file that pends publication under `final_name`.
+    publish: Option<PublishRef>,
 }
 
 /// A `LocalFs` VFS backend rooted at a directory, using `cap-std` for
@@ -161,6 +175,15 @@ pub struct LocalFs {
     case_sensitive: bool,
     opens: RwLock<HashMap<OpenId, Arc<Mutex<FileHandle>>>>,
     next_open_id: Mutex<u64>,
+    /// Publish-on-close state for this share root, when the share has the
+    /// option enabled. `None` → the feature is off for this backend; every
+    /// publish hook is a no-op.
+    ///
+    /// The table is a **process-global registry entry keyed by the canonical
+    /// share root path** (canonicalized in the constructor): a `LocalFs` is
+    /// constructed per TREE_CONNECT, so two trees on the same share must
+    /// share one pending map.
+    publish: Option<PendingPublishTable>,
 }
 
 impl LocalFs {
@@ -173,14 +196,53 @@ impl LocalFs {
         follow_symlinks: FollowSymlinks,
         case_sensitive: bool,
     ) -> Result<Self, VfsError> {
-        let dir = cap_std::fs::Dir::open_ambient_dir(root.as_ref(), cap_std::ambient_authority())
+        Self::new_impl(root.as_ref(), follow_symlinks, case_sensitive, false)
+    }
+
+    /// Construct a `LocalFs` with publish-on-close enabled (see
+    /// [`crate::publish`]). `root` must be the same canonical path for
+    /// every construction of a given share (the pending map is shared
+    /// process-wide by that key).
+    pub fn new_with_publish(
+        root: impl AsRef<Path>,
+        follow_symlinks: FollowSymlinks,
+        case_sensitive: bool,
+    ) -> Result<Self, VfsError> {
+        Self::new_impl(root.as_ref(), follow_symlinks, case_sensitive, true)
+    }
+
+    fn new_impl(
+        root: &Path,
+        follow_symlinks: FollowSymlinks,
+        case_sensitive: bool,
+        publish_on_close: bool,
+    ) -> Result<Self, VfsError> {
+        // Canonicalize the root path so every TREE_CONNECT of the same share
+        // shares one pending-publish registry entry (symlinks and relative
+        // paths would otherwise create distinct keys).
+        let canonical_root = std::fs::canonicalize(root)
+            .map_err(|e| VfsError::Io(format!("canonicalize share root: {e}")))?;
+        let dir = cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
             .map_err(|e| VfsError::Io(format!("open share root: {e}")))?;
+        let publish = if publish_on_close {
+            let table = PendingPublishTable::for_root(&canonical_root);
+            // Startup sweep for `.rssmb-tmp.*` orphans left by a previous
+            // crash. Synchronous and cheap (pure std::fs walk); it must
+            // complete before the first client CREATE could race a fresh
+            // (young-mtime) temp file into the same directory.
+            let removed = table.sweep_orphans(&canonical_root);
+            tracing::debug!(removed, "publish_on_close: startup orphan sweep");
+            Some(table)
+        } else {
+            None
+        };
         Ok(Self {
             dir,
             follow_symlinks,
             case_sensitive,
             opens: RwLock::new(HashMap::new()),
             next_open_id: Mutex::new(1),
+            publish,
         })
     }
 
@@ -405,10 +467,35 @@ impl Vfs for LocalFs {
             rel
         };
 
+        // Publish-on-close: consult the pending map before the filesystem, so
+        // clients only ever see final names. Two cases:
+        // (a) `rel` names a pending file → open the existing temp instead;
+        // (b) `rel` doesn't exist and this create would make a NEW file
+        //     (CREATE / OPEN_IF-creating / OVERWRITE_IF / SUPERSEDE on a
+        //     regular file) → create it as a new pending temp.
+        let mut publish_ref: Option<PublishRef> = None;
+        let mut effective_rel = rel.clone();
+
+        if let Some(table) = &self.publish {
+            // (a) existing pending file — this path is client-visible and
+            // maps to a temp. A second CREATE resolves to the same temp
+            // (normal share-mode/oplock/lease checks happen in the server
+            // layer on the returned open) and bumps the pending open count.
+            let (dir, name, temp) = table.resolve(&rel);
+            if let Some(temp_rel) = temp {
+                table.insert(&dir, &name, temp_rel.clone());
+                effective_rel = temp_rel;
+                publish_ref = Some(PublishRef {
+                    dir,
+                    final_name: name,
+                });
+            }
+        }
+
         // Check if the target exists (using symlink_metadata to detect
         // symlinks without following them — cap-std's exists() uses
         // openat2 which refuses symlink-escaped paths, returning false).
-        let mut exists = self.dir.symlink_metadata(&rel).is_ok();
+        let mut exists = self.dir.symlink_metadata(&effective_rel).is_ok();
 
         // Case-insensitive lookup: if the exact path doesn't exist and the
         // share is case-insensitive, scan from the share root down for a
@@ -416,9 +503,8 @@ impl Vfs for LocalFs {
         // `FollowSymlinks::WithinShare` (which opens the parent dir) a
         // case-mismatched parent directory is resolved to its on-disk case
         // before `open_dir(parent)` checks confinement.
-        let mut effective_rel = rel.clone();
         if !exists && !self.case_sensitive {
-            if let Some(ci_rel) = self.resolve_case_insensitive(&rel) {
+            if let Some(ci_rel) = self.resolve_case_insensitive(&effective_rel) {
                 if self.dir.symlink_metadata(&ci_rel).is_ok() {
                     effective_rel = ci_rel;
                     exists = true;
@@ -427,6 +513,39 @@ impl Vfs for LocalFs {
                     // though the final component does not exist yet (e.g.
                     // creating a new file inside a case-mismatched parent dir).
                     effective_rel = ci_rel;
+                }
+            }
+        }
+
+        // Publish-on-close case (b): no pending entry and (after CI
+        // resolution) the file does not exist — a create disposition that
+        // would mint a NEW regular file goes to a fresh temp instead.
+        // Existing-file OPEN/OVERWRITE (file exists, not replaced) and
+        // directories are untouched (spec §1). OVERWRITE_IF/SUPERSEDE of an
+        // existing regular file replace it, so they pend too.
+        if publish_ref.is_none() {
+            if let Some(table) = &self.publish {
+                let is_root = rel == Path::new(".");
+                let pend = !is_root
+                    && !args.create_options.directory
+                    && match args.disposition {
+                        CreateDisposition::Create => true,
+                        CreateDisposition::OpenIf => !exists,
+                        // Replacing/truncating dispositions pend even when
+                        // the file exists.
+                        CreateDisposition::OverwriteIf | CreateDisposition::Supersede => true,
+                        CreateDisposition::Open | CreateDisposition::Overwrite => false,
+                    };
+                if pend {
+                    let (dir, name) = crate::publish::split_parent(&rel);
+                    let temp_rel = table.temp_name_for(&dir, &name);
+                    table.insert(&dir, &name, temp_rel.clone());
+                    publish_ref = Some(PublishRef {
+                        dir,
+                        final_name: name,
+                    });
+                    effective_rel = temp_rel;
+                    exists = false;
                 }
             }
         }
@@ -448,6 +567,11 @@ impl Vfs for LocalFs {
         } else {
             wants_dir
         };
+
+        // A pending temp must be a regular file; if the client asked for a
+        // directory on a path that pends, the pendency was already skipped
+        // above (directories never pend).
+        debug_assert!(publish_ref.is_none() || !target_is_dir);
 
         // Disposition handling.
         let existed_before = exists;
@@ -564,7 +688,13 @@ impl Vfs for LocalFs {
         };
         let file = TokioFile::from_std(cap_file.into_std());
 
-        let file_name = Self::file_name_from_rel(&effective_rel);
+        let file_name = if let Some(ref p) = publish_ref {
+            // The client-visible name is the pending final name, never the
+            // on-disk temp name (it appears in query_info responses).
+            p.final_name.clone()
+        } else {
+            Self::file_name_from_rel(&effective_rel)
+        };
 
         // Determine the create outcome (existed on entry, replaced by
         // Supersede/Overwrite semantics) so the server can report the
@@ -594,6 +724,7 @@ impl Vfs for LocalFs {
                 file_name,
                 is_directory: target_is_dir,
                 delete_on_close: args.create_options.delete_on_close,
+                publish: publish_ref,
             })),
         );
         Ok(CreateResult {
@@ -705,16 +836,46 @@ impl Vfs for LocalFs {
         };
         // Lock the handle to read delete_on_close and rel_path, then drop
         // the lock (and the Arc, which closes the fd) before doing I/O.
-        let (rel, is_dir, delete_on_close) = {
+        let (rel, is_dir, delete_on_close, publish) = {
             let handle = handle_arc.lock().await;
             (
                 handle.rel_path.clone(),
                 handle.is_directory,
                 handle.delete_on_close,
+                handle.publish.clone(),
             )
         };
         // handle_arc is dropped here, closing the fd.
         drop(handle_arc);
+        if let (Some(table), Some(p)) = (&self.publish, publish) {
+            // This handle is on a pending temp file. Closing it counts
+            // against the pending entry; publish on the LAST close.
+            if let Some((temp_rel, delete)) = table.close(&p.dir, &p.final_name) {
+                if delete || delete_on_close {
+                    // Delete-on-close: unlink the temp, no publish.
+                    self.check_no_symlinks(&temp_rel)?;
+                    let _ = self.dir.remove_file(&temp_rel);
+                } else {
+                    // Last close: atomically publish temp → final. Same
+                    // directory, so rename(2) is atomic. No fsync (keep
+                    // today's durability). mtime/attrs were set on the temp
+                    // and ride along with the rename.
+                    self.check_no_symlinks(&temp_rel)?;
+                    let final_rel = p.dir.join(&p.final_name);
+                    self.check_no_symlinks(&final_rel)?;
+                    if let Err(e) = self.dir.rename(&temp_rel, &self.dir, &final_rel) {
+                        tracing::warn!(
+                            temp = ?temp_rel,
+                            final = %p.final_name,
+                            error = %e,
+                            "publish_on_close: rename to final name failed"
+                        );
+                        return Err(VfsError::Io(format!("publish rename: {e}")));
+                    }
+                }
+            }
+            return Ok(());
+        }
         if delete_on_close {
             self.check_no_symlinks(&rel)?;
             if is_dir {
@@ -928,6 +1089,10 @@ impl Vfs for LocalFs {
         for entry in read_dir {
             let entry = entry.map_err(|e| VfsError::Io(format!("dir entry: {e}")))?;
             let name = entry.file_name().to_string_lossy().to_string();
+            // Hide publish-on-close temp files from directory listings.
+            if crate::publish::is_temp_name(&name) {
+                continue;
+            }
             if !matches_pattern(&name, pattern) {
                 continue;
             }
@@ -1003,6 +1168,83 @@ impl Vfs for LocalFs {
                 break;
             }
         }
+
+        // Publish-on-close: append pending finals (their temps are hidden
+        // above) under their client-visible names, with the temp file's
+        // attributes. Pending files match `pattern` on the FINAL name.
+        if let Some(table) = &self.publish {
+            let dir_rel = table_dir_rel(&rel);
+            for (final_name, temp_rel) in table.pending_in_dir(&dir_rel) {
+                if entries.len() >= cap {
+                    break;
+                }
+                if !matches_pattern(&final_name, pattern) {
+                    continue;
+                }
+                // The temp must be in the SAME directory as the final
+                // (atomic-rename requirement); temp_rel is root-relative
+                // with the same parent as the final.
+                let Ok(meta) = self.dir.symlink_metadata(&temp_rel) else {
+                    continue;
+                };
+                let is_dir = meta.is_dir();
+                #[cfg(unix)]
+                let read_only = {
+                    use cap_std::fs::PermissionsExt;
+                    (meta.permissions().mode() & 0o200) == 0
+                };
+                #[cfg(not(unix))]
+                let read_only = meta.permissions().readonly();
+                let size = if is_dir { 0 } else { meta.len() };
+                #[cfg(unix)]
+                let allocation_size = {
+                    use cap_std::fs::MetadataExt;
+                    meta.blocks() * 512
+                };
+                #[cfg(not(unix))]
+                let allocation_size = (size + 4095) & !4095;
+                #[cfg(unix)]
+                let file_id = {
+                    use cap_std::fs::MetadataExt;
+                    Some(FileId {
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    })
+                };
+                #[cfg(not(unix))]
+                let file_id = None;
+                let to_ft = |t: Result<cap_std::time::SystemTime, std::io::Error>| -> u64 {
+                    t.map(|s| system_time_to_filetime(s.into_std()))
+                        .unwrap_or(0)
+                };
+                entries.push(DirEntry {
+                    file_name: final_name,
+                    short_name: None,
+                    attributes: FileAttributes {
+                        read_only,
+                        hidden: false,
+                        system: false,
+                        directory: is_dir,
+                        archive: !is_dir && !read_only,
+                        normal: is_dir && !read_only,
+                        temporary: false,
+                        sparse_file: false,
+                        reparse_point: false,
+                        compressed: false,
+                        offline: false,
+                        not_content_indexed: true,
+                        encrypted: false,
+                    },
+                    size,
+                    allocation_size,
+                    file_id,
+                    creation_time: to_ft(meta.created()),
+                    last_access_time: to_ft(meta.accessed()),
+                    last_write_time: to_ft(meta.modified()),
+                    change_time: to_ft(meta.modified()),
+                });
+            }
+        }
         Ok(entries)
     }
 
@@ -1026,12 +1268,18 @@ impl Vfs for LocalFs {
             let opens = self.opens.read().await;
             opens.get(&open).cloned().ok_or(VfsError::InvalidHandle)?
         };
-        let (rel, is_dir) = {
+        let (rel, is_dir, publish) = {
             let h = handle.lock().await;
-            (h.rel_path.clone(), h.is_directory)
+            (h.rel_path.clone(), h.is_directory, h.publish.clone())
         };
 
         self.check_no_symlinks(&rel)?;
+
+        // Publish-on-close: record the delete intent on the pending entry
+        // (the unlink happens on the last close, not here).
+        if let (Some(table), Some(p)) = (&self.publish, publish) {
+            table.set_delete_on_close(&p.dir, &p.final_name, delete);
+        }
 
         if delete && is_dir {
             // Check that the directory is empty (MS-FSCC).
@@ -1069,7 +1317,14 @@ impl Vfs for LocalFs {
         let h = handle.lock().await;
         let rel = h.rel_path.clone();
         let is_dir = h.is_directory;
+        let publish = h.publish.clone();
         drop(h);
+
+        // Publish-on-close: deleting a pending file removes the pending
+        // entry; the temp unlink proceeds below on the temp path.
+        if let (Some(table), Some(p)) = (&self.publish, publish) {
+            table.remove(&p.dir, &p.final_name);
+        }
 
         self.check_no_symlinks(&rel)?;
 
@@ -1091,6 +1346,7 @@ impl Vfs for LocalFs {
         };
         let handle_guard = handle.lock().await;
         let old_rel = handle_guard.rel_path.clone();
+        let publish = handle_guard.publish.clone();
         drop(handle_guard);
 
         let new_rel = self.resolve_rel(new_path)?;
@@ -1099,6 +1355,33 @@ impl Vfs for LocalFs {
         // acting through intermediate symlinks (finding 1 & 2).
         self.check_no_symlinks(&old_rel)?;
         self.check_no_symlinks(&new_rel)?;
+
+        // Publish-on-close: renaming a pending file keeps the temp file;
+        // only the map's final name changes (the publish at last close
+        // renames temp → NEW final name). The on-disk rename below is
+        // skipped entirely for pending files.
+        if let (Some(table), Some(p)) = (&self.publish, &publish) {
+            let (new_dir, new_name) = crate::publish::split_parent(&new_rel);
+            table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
+            // Update every handle on this pending entry: visible identity
+            // moves to the new final name; rel_path keeps pointing at the
+            // temp file.
+            let all_handles: Vec<Arc<Mutex<FileHandle>>> = {
+                let opens = self.opens.read().await;
+                opens.values().cloned().collect()
+            };
+            for h_arc in all_handles {
+                let mut h = h_arc.lock().await;
+                if let Some(hp) = &mut h.publish {
+                    if hp.dir == p.dir && hp.final_name == p.final_name {
+                        hp.dir = new_dir.clone();
+                        hp.final_name = new_name.clone();
+                        h.file_name = new_name.clone();
+                    }
+                }
+            }
+            return Ok(());
+        }
 
         // Open parent directories via cap-std (confined by RESOLVE_BENEATH
         // on Linux ≥5.6). Renaming using only the final component name
@@ -1319,6 +1602,16 @@ fn matches_pattern_impl(name: &[char], pattern: &[char]) -> bool {
     }
 
     pi == pattern.len()
+}
+
+/// Normalize a queried directory's relative path to the pending-map dir key:
+/// cap-std's "." (root) maps to the empty PathBuf used at insert time.
+fn table_dir_rel(rel: &Path) -> PathBuf {
+    if rel == Path::new(".") || rel.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        rel.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -2123,5 +2416,219 @@ mod tests {
         let pat = "a*a*a*a*a*a*a*a*a*a*a*a*b";
         assert!(!matches_pattern(&long_name, pat));
         assert!(matches_pattern(&("a".repeat(60) + "b"), pat));
+    }
+
+    // ── publish_on_close ─────────────────────────────────────────────────
+    // End-to-end LocalFs behavior with the pending-publish backend: new
+    // files under CREATE dispositions go to a hidden temp; the last close
+    // atomically renames temp → final.
+
+    fn write_args() -> CreateArgs {
+        CreateArgs {
+            disposition: CreateDisposition::Create,
+            desired_access: DesiredAccess {
+                write: true,
+                read: true,
+                read_attributes: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_create_write_close_is_atomic() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs.create("", "pub.txt", &write_args()).await.unwrap().open;
+        // While pending: only the temp exists on disk, not the final name.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(crate::publish::is_temp_name(&names[0]), "{names:?}");
+        assert!(!dir.path().join("pub.txt").exists());
+
+        fs.write_at(open, 0, b"payload").await.unwrap();
+        fs.close(open).await.unwrap();
+
+        // Last close publishes: temp gone, final name present with content.
+        assert!(!names.iter().any(|n| dir.path().join(n).exists()));
+        let content = std::fs::read(dir.path().join("pub.txt")).unwrap();
+        assert_eq!(content, b"payload");
+    }
+
+    #[tokio::test]
+    async fn publish_open_of_pending_final_resolves_to_temp() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let a = fs.create("", "two.txt", &write_args()).await.unwrap().open;
+        fs.write_at(a, 0, b"part1").await.unwrap();
+        // Second open by final name → same temp file, read sees the data.
+        let b = fs
+            .create("", "two.txt", &CreateArgs::open_readonly())
+            .await
+            .unwrap()
+            .open;
+        let data = fs.read_at(b, 0, 16).await.unwrap();
+        assert_eq!(data.as_ref(), b"part1");
+        // First close: still pending (temp on disk, final absent).
+        fs.close(a).await.unwrap();
+        assert!(!dir.path().join("two.txt").exists());
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| crate::publish::is_temp_name(n))
+            .collect();
+        assert_eq!(temps.len(), 1);
+        // Last close: published.
+        fs.close(b).await.unwrap();
+        assert!(dir.path().join("two.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn publish_delete_on_close_unlinks_no_publish() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let mut args = write_args();
+        args.create_options.delete_on_close = true;
+        let open = fs.create("", "del.txt", &args).await.unwrap().open;
+        fs.close(open).await.unwrap();
+        // Nothing remains: no final name, no temp.
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 0);
+    }
+
+    #[tokio::test]
+    async fn publish_rename_pending_keeps_temp_publishes_new() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs.create("", "old.txt", &write_args()).await.unwrap().open;
+        fs.write_at(open, 0, b"renamed-data").await.unwrap();
+        // Rename while pending: temp keeps its name; map moves to new final.
+        fs.rename(open, "new.txt", false).await.unwrap();
+        assert!(!dir.path().join("new.txt").exists());
+        // query_info reports the client-visible (renamed) name.
+        let info = fs.query_info(open, InfoClass::FileBasicInfo).await.unwrap();
+        assert_eq!(info.file_name, "new.txt");
+        fs.close(open).await.unwrap();
+        // Published under the NEW name.
+        let content = std::fs::read(dir.path().join("new.txt")).unwrap();
+        assert_eq!(content, b"renamed-data");
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 1);
+    }
+
+    #[tokio::test]
+    async fn publish_query_dir_hides_temp_shows_final() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs
+            .create("", "listed.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs.write_at(open, 0, b"0123456789").await.unwrap();
+
+        let dir_args = CreateArgs {
+            disposition: CreateDisposition::Open,
+            create_options: CreateOptions {
+                directory: true,
+                ..Default::default()
+            },
+            ..CreateArgs::open_readonly()
+        };
+        let dopen = fs.create("", "", &dir_args).await.unwrap().open;
+        let entries = fs
+            .query_dir(dopen, "*", DirInfoClass::DirectoryInfo, true, 100)
+            .await
+            .unwrap();
+        // Exactly one entry: the FINAL name with the temp's size.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_name, "listed.txt");
+        assert_eq!(entries[0].size, 10);
+        assert!(!crate::publish::is_temp_name(&entries[0].file_name));
+        fs.close(dopen).await.unwrap();
+        fs.close(open).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_open_existing_file_uses_real_file() {
+        // Spec §8: OPEN of an existing (published) file is untouched —
+        // handle on the real file, no temp.
+        let dir = tmp_root();
+        std::fs::write(dir.path().join("real.txt"), b"existing").unwrap();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs
+            .create("", "real.txt", &CreateArgs::open_readonly())
+            .await
+            .unwrap()
+            .open;
+        let data = fs.read_at(open, 0, 16).await.unwrap();
+        assert_eq!(data.as_ref(), b"existing");
+        // Nothing new on disk besides the real file.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        fs.close(open).await.unwrap();
+        assert!(dir.path().join("real.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn no_publish_when_disabled() {
+        // Default backend: byte-identical old behavior — final name from
+        // the first write.
+        let dir = tmp_root();
+        let fs = LocalFs::new(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs
+            .create("", "plain.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs.write_at(open, 0, b"x").await.unwrap();
+        assert!(dir.path().join("plain.txt").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        fs.close(open).await.unwrap();
+        assert!(dir.path().join("plain.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn publish_two_trees_share_pending_map() {
+        // A LocalFs per TREE_CONNECT must share one pending map: a pending
+        // file opened through instance A publishes on the close of the
+        // handle opened through instance B.
+        let dir = tmp_root();
+        let fs_a = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let fs_b = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let a = fs_a
+            .create("", "shared.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs_a.write_at(a, 0, b"via-a").await.unwrap();
+        let b = fs_b
+            .create("", "shared.txt", &CreateArgs::open_readonly())
+            .await
+            .unwrap()
+            .open;
+        let data = fs_b.read_at(b, 0, 16).await.unwrap();
+        assert_eq!(data.as_ref(), b"via-a");
+        fs_a.close(a).await.unwrap();
+        assert!(!dir.path().join("shared.txt").exists());
+        fs_b.close(b).await.unwrap();
+        assert!(dir.path().join("shared.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn publish_supersede_existing_pends() {
+        // SUPERSEDE replaces an existing file → temp + publish.
+        let dir = tmp_root();
+        std::fs::write(dir.path().join("sup.txt"), b"old").unwrap();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let mut args = write_args();
+        args.disposition = CreateDisposition::Supersede;
+        let open = fs.create("", "sup.txt", &args).await.unwrap().open;
+        // The old file was replaced; the new content is pending.
+        fs.write_at(open, 0, b"new").await.unwrap();
+        fs.close(open).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("sup.txt")).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
