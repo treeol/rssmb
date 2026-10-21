@@ -1,10 +1,19 @@
-# Don't send build artifacts to the Docker builder
-target/
-smb-rs/.git/
-smb-rs/target/
+# Don't send build artifacts to the Docker builder (** also covers fuzz/target)
+**/target/
+tmp/
+.git
 **/*.rs.bk
 .DS_Store
-.git
+
+# Vendored reference sources are not part of the build
+.reference/
+
+# Share data mounted at runtime, never needed by the build
+data/
+
+# Credentials (NT hashes) — config/rssmb.example.toml is fine to include
+config/rssmb.toml
+
 # Let the Docker image's Rust version be used. The Dockerfile uses rust:1.90
 # whose cargo can parse the v4 lock file; rust-toolchain.toml is for local MSRV
 # pinning only and would downgrade to 1.78 inside the builder.

@@ -8,3 +8,4 @@
 /data/
 /tmp/
 /fuzz/Cargo.lock
+/fuzz/target/
