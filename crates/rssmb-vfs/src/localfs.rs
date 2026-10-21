@@ -25,7 +25,7 @@ use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::publish::PendingPublishTable;
+use crate::publish::{Acquire, PendingPublishTable};
 use crate::*;
 
 /// Maximum pooled read-buffer size (matches the largest READ the server
@@ -225,12 +225,12 @@ impl LocalFs {
         let dir = cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
             .map_err(|e| VfsError::Io(format!("open share root: {e}")))?;
         let publish = if publish_on_close {
-            let table = PendingPublishTable::for_root(&canonical_root);
+            let table = PendingPublishTable::for_root(&canonical_root, !case_sensitive);
             // Startup sweep for `.rssmb-tmp.*` orphans left by a previous
             // crash. Synchronous and cheap (pure std::fs walk); it must
             // complete before the first client CREATE could race a fresh
             // (young-mtime) temp file into the same directory.
-            let removed = table.sweep_orphans(&canonical_root);
+            let removed = table.sweep_orphans();
             tracing::debug!(removed, "publish_on_close: startup orphan sweep");
             Some(table)
         } else {
@@ -468,33 +468,48 @@ impl Vfs for LocalFs {
         };
 
         // Publish-on-close: consult the pending map before the filesystem, so
-        // clients only ever see final names. Two cases:
-        // (a) `rel` names a pending file → open the existing temp instead;
-        // (b) `rel` doesn't exist and this create would make a NEW file
-        //     (CREATE / OPEN_IF-creating / OVERWRITE_IF / SUPERSEDE on a
-        //     regular file) → create it as a new pending temp.
+        // clients only ever see final names. Resolution order (B5):
+        //   1. pending map (the logical namespace) — attach/open the temp;
+        //   2. on-disk CI resolution (the on-disk casing becomes the temp's
+        //      placement directory);
+        //   3. pend decision for create-dispositions on non-pending paths.
         let mut publish_ref: Option<PublishRef> = None;
+        let mut pending_acquired = false;
         let mut effective_rel = rel.clone();
+        // On-disk-cased parent dir for temp placement (differs from `rel`'s
+        // casing after CI resolution).
+        let mut disk_parent = {
+            let (d, _) = crate::publish::split_parent(&rel);
+            if d.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                d
+            }
+        };
 
         if let Some(table) = &self.publish {
-            // (a) existing pending file — this path is client-visible and
-            // maps to a temp. A second CREATE resolves to the same temp
-            // (normal share-mode/oplock/lease checks happen in the server
-            // layer on the returned open) and bumps the pending open count.
-            let (dir, name, temp) = table.resolve(&rel);
-            if let Some(temp_rel) = temp {
-                table.insert(&dir, &name, temp_rel.clone());
-                effective_rel = temp_rel;
+            // (a) existing pending file: attach atomically (count++, same
+            // authoritative temp from the map). Normal share-mode/oplock/
+            // lease checks happen in the server layer on the returned open.
+            if let Some((dir, name, _)) = table.resolve(&rel) {
+                let acq = table.resolve_or_acquire(&dir, &name, &disk_parent);
+                let temp_rel = match acq {
+                    Acquire::Created(t) | Acquire::Attached(t) => t,
+                };
                 publish_ref = Some(PublishRef {
                     dir,
                     final_name: name,
                 });
+                pending_acquired = true;
+                effective_rel = temp_rel;
+                // Pending files are always regular files; the map entry
+                // guarantees the temp was created. exists = true below.
             }
         }
 
-        // Check if the target exists (using symlink_metadata to detect
-        // symlinks without following them — cap-std's exists() uses
-        // openat2 which refuses symlink-escaped paths, returning false).
+        // Check if the target exists (symlink_metadata: lstat — detects
+        // symlinks without following them; cap-std's exists() refuses
+        // symlink-escaped paths).
         let mut exists = self.dir.symlink_metadata(&effective_rel).is_ok();
 
         // Case-insensitive lookup: if the exact path doesn't exist and the
@@ -503,8 +518,12 @@ impl Vfs for LocalFs {
         // `FollowSymlinks::WithinShare` (which opens the parent dir) a
         // case-mismatched parent directory is resolved to its on-disk case
         // before `open_dir(parent)` checks confinement.
-        if !exists && !self.case_sensitive {
-            if let Some(ci_rel) = self.resolve_case_insensitive(&effective_rel) {
+        //
+        // Pending-aware (B5): the pending map was consulted above with the
+        // client's spelling; CI disk resolution only applies to non-pending
+        // paths. The resolved on-disk parent becomes the temp placement dir.
+        if !exists && !self.case_sensitive && publish_ref.is_none() {
+            if let Some(ci_rel) = self.resolve_case_insensitive(&rel) {
                 if self.dir.symlink_metadata(&ci_rel).is_ok() {
                     effective_rel = ci_rel;
                     exists = true;
@@ -514,40 +533,84 @@ impl Vfs for LocalFs {
                     // creating a new file inside a case-mismatched parent dir).
                     effective_rel = ci_rel;
                 }
+                // The on-disk-cased parent is where a fresh temp must land.
+                let (d, _) = crate::publish::split_parent(&effective_rel);
+                disk_parent = if d.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    d
+                };
             }
         }
 
-        // Publish-on-close case (b): no pending entry and (after CI
-        // resolution) the file does not exist — a create disposition that
-        // would mint a NEW regular file goes to a fresh temp instead.
-        // Existing-file OPEN/OVERWRITE (file exists, not replaced) and
-        // directories are untouched (spec §1). OVERWRITE_IF/SUPERSEDE of an
-        // existing regular file replace it, so they pend too.
+        // Publish-on-close case (b): no pending entry (after CI resolution)
+        // and a disposition that mints/replaces a *regular file* → a fresh
+        // pending temp. Directories never pend. `exists` is the FINAL name's
+        // on-disk state (after CI resolution): FILE_CREATE on an existing
+        // file never pends (B3, AlreadyExists below); OVERWRITE_IF/SUPERSEDE
+        // over an existing regular file pend (the final is replaced at
+        // publish) and report Overwritten/Superseded via `existed_before`.
+        let mut existed_before = exists;
         if publish_ref.is_none() {
             if let Some(table) = &self.publish {
                 let is_root = rel == Path::new(".");
+                let final_is_dir = exists && self.is_dir_rel(&effective_rel).unwrap_or(true);
                 let pend = !is_root
                     && !args.create_options.directory
+                    && !final_is_dir
                     && match args.disposition {
-                        CreateDisposition::Create => true,
+                        CreateDisposition::Create => !exists,
                         CreateDisposition::OpenIf => !exists,
-                        // Replacing/truncating dispositions pend even when
-                        // the file exists.
+                        // Replacing/truncating dispositions pend even over
+                        // an existing regular file (shadowed until publish).
                         CreateDisposition::OverwriteIf | CreateDisposition::Supersede => true,
                         CreateDisposition::Open | CreateDisposition::Overwrite => false,
                     };
                 if pend {
                     let (dir, name) = crate::publish::split_parent(&rel);
-                    let temp_rel = table.temp_name_for(&dir, &name);
-                    table.insert(&dir, &name, temp_rel.clone());
+                    let acq = table.resolve_or_acquire(&dir, &name, &disk_parent);
+                    let temp_rel = match acq {
+                        Acquire::Created(t) => {
+                            // A brand-new pending file: the final name does
+                            // not exist; the temp is created (exclusively)
+                            // below.
+                            existed_before = false;
+                            t
+                        }
+                        // Attached cannot happen (publish_ref was None) but
+                        // the map is authoritative either way.
+                        Acquire::Attached(t) => t,
+                    };
                     publish_ref = Some(PublishRef {
                         dir,
                         final_name: name,
                     });
+                    pending_acquired = true;
                     effective_rel = temp_rel;
+                    // The temp is what gets opened below; a Created temp
+                    // does not exist yet.
                     exists = false;
                 }
             }
+        }
+
+        // Error rollback (B2): on any failure after the acquisition, release
+        // this handle's reservation; if it was the last one, best-effort
+        // unlink the temp (a fresh empty Created temp). Without this a
+        // failed open permanently shadows the final name with a phantom
+        // pending entry.
+        macro_rules! rollback_on_err {
+            ($e:expr) => {{
+                let e = $e;
+                if pending_acquired {
+                    if let (Some(table), Some(p)) = (&self.publish, &publish_ref) {
+                        if let Some(temp) = table.abort(&p.dir, &p.final_name) {
+                            let _ = self.dir.remove_file(&temp);
+                        }
+                    }
+                }
+                return Err(e);
+            }};
         }
 
         // Check symlink policy on all components of the effective path
@@ -555,10 +618,11 @@ impl Vfs for LocalFs {
         // FollowSymlinks::Never this rejects any intermediate symlink
         // traversal even when the final target doesn't exist yet; for
         // WithinShare it verifies the resolved parent is confined.
-        self.check_no_symlinks(&effective_rel)?;
+        if let Err(e) = self.check_no_symlinks(&effective_rel) {
+            rollback_on_err!(e);
+        }
 
-        let is_dir = args.create_options.directory;
-        let wants_dir = is_dir;
+        let wants_dir = args.create_options.directory;
         let wants_file = args.create_options.non_directory_file;
 
         // Determine target type if it exists.
@@ -568,37 +632,42 @@ impl Vfs for LocalFs {
             wants_dir
         };
 
-        // A pending temp must be a regular file; if the client asked for a
-        // directory on a path that pends, the pendency was already skipped
-        // above (directories never pend).
-        debug_assert!(publish_ref.is_none() || !target_is_dir);
-
-        // Disposition handling.
-        let existed_before = exists;
+        // Disposition handling. `existed_before`/`needs_create` describe the
+        // FINAL name (for CreateAction); the actual open below targets the
+        // temp for pending files (freshly created when new).
         let mut needs_create = !exists;
         match args.disposition {
             CreateDisposition::Open => {
                 if !exists {
-                    return Err(VfsError::NotFound);
+                    rollback_on_err!(VfsError::NotFound);
                 }
                 needs_create = false;
             }
             CreateDisposition::Create => {
                 if exists {
-                    return Err(VfsError::AlreadyExists);
+                    // B3: the final name exists — the pend decision above
+                    // already skipped pending for this case; genuine
+                    // STATUS_OBJECT_NAME_COLLISION.
+                    rollback_on_err!(VfsError::AlreadyExists);
                 }
                 needs_create = true;
             }
             CreateDisposition::OpenIf => {}
             CreateDisposition::Supersede => {
                 if exists && !target_is_dir {
-                    let _ = self.dir.remove_file(&effective_rel);
+                    // SUPERSEDE over an existing final: for a NON-pending
+                    // supersede the original remove semantics apply. A
+                    // pending replace shadows the real file until publish —
+                    // never unlink a temp that other handles may use (R4).
+                    if publish_ref.is_none() {
+                        let _ = self.dir.remove_file(&effective_rel);
+                    }
                     needs_create = true;
                 }
             }
             CreateDisposition::Overwrite => {
                 if !exists {
-                    return Err(VfsError::NotFound);
+                    rollback_on_err!(VfsError::NotFound);
                 }
                 needs_create = false;
             }
@@ -606,14 +675,15 @@ impl Vfs for LocalFs {
         }
 
         if wants_dir && !exists {
-            self.dir
-                .create_dir(&effective_rel)
-                .map_err(|e| VfsError::from_io("create_dir", e))?;
+            // Directories never pend, so this is the non-pending path.
+            if let Err(e) = self.dir.create_dir(&effective_rel) {
+                rollback_on_err!(VfsError::from_io("create_dir", e));
+            }
             // The directory now exists; the open below must not try to
             // create it again.
             needs_create = false;
         } else if wants_file && exists && target_is_dir {
-            return Err(VfsError::IsDirectory);
+            rollback_on_err!(VfsError::IsDirectory);
         }
 
         // Build cap-std open options.
@@ -639,15 +709,27 @@ impl Vfs for LocalFs {
                 || args.desired_access.generic_write
                 || args.desired_access.generic_all);
         opts.write(wants_write);
+        // B4: a freshly-minted pending temp is created EXCLUSIVELY (a
+        // same-named young orphan must never be silently reopened with
+        // stale content); the open below retries with a fresh suffix on
+        // EEXIST. Non-pending creates keep plain O_CREAT.
+        let exclusive_fresh = needs_create && publish_ref.is_some();
         if needs_create && !target_is_dir {
-            opts.create(true);
+            if exclusive_fresh {
+                opts.create_new(true);
+            } else {
+                opts.create(true);
+            }
         }
+        // Truncate only for non-pending opens (a pending replace publishes
+        // over the final; the temp itself starts empty).
         if matches!(
             args.disposition,
             CreateDisposition::Supersede
                 | CreateDisposition::Overwrite
                 | CreateDisposition::OverwriteIf
         ) && !target_is_dir
+            && publish_ref.is_none()
         {
             opts.truncate(true);
         }
@@ -662,14 +744,60 @@ impl Vfs for LocalFs {
         // For the root directory (effective_rel == "."), we open the Dir
         // itself and convert to a File for handle tracking.
         let cap_file = if effective_rel == Path::new(".") {
-            self.dir
+            match self
+                .dir
                 .open_dir(".")
                 .map(|d| cap_std::fs::File::from_std(d.into_std_file()))
-                .map_err(|e| VfsError::from_io("open root dir", e))?
+            {
+                Ok(f) => f,
+                Err(e) => rollback_on_err!(VfsError::from_io("open root dir", e)),
+            }
         } else {
-            self.dir
-                .open_with(&effective_rel, &opts)
-                .map_err(|e| VfsError::from_io("open", e))?
+            let mut opened: Result<cap_std::fs::File, std::io::Error> =
+                self.dir.open_with(&effective_rel, &opts);
+            // B4 retry: an exclusive fresh temp collided with an existing
+            // (orphan) file of the same name — re-mint and retry, bounded.
+            let mut retries = 0;
+            while retries < 4 {
+                let collide = exclusive_fresh
+                    && matches!(
+                        &opened,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+                    );
+                if !collide {
+                    break;
+                }
+                retries += 1;
+                let (Some(table), Some(p)) = (&self.publish, &publish_ref) else {
+                    break;
+                };
+                // Drop this handle's reservation, then re-mint a fresh temp
+                // under the same map key (fresh reservation, count 1).
+                let _ = table.abort(&p.dir, &p.final_name);
+                if let Acquire::Created(fresh) =
+                    table.resolve_or_acquire(&p.dir, &p.final_name, &disk_parent)
+                {
+                    let mut opts2 = CapOpenOptions::new();
+                    opts2.read(true);
+                    opts2.write(wants_write);
+                    opts2.create_new(true);
+                    if self.follow_symlinks == FollowSymlinks::Never {
+                        opts2._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+                    }
+                    opened = self.dir.open_with(&fresh, &opts2);
+                    if opened.is_ok() {
+                        effective_rel = fresh;
+                    }
+                } else {
+                    // Attached cannot happen right after abort-at-zero; but
+                    // do not loop forever if it somehow does.
+                    break;
+                }
+            }
+            match opened {
+                Ok(f) => f,
+                Err(e) => rollback_on_err!(VfsError::from_io("open", e)),
+            }
         };
 
         // Convert to tokio for async I/O. The fd was obtained from a
@@ -681,10 +809,10 @@ impl Vfs for LocalFs {
         let pread_file = if target_is_dir {
             None
         } else {
-            let dup = cap_file
-                .try_clone()
-                .map_err(|e| VfsError::from_io("dup fd for pread", e))?;
-            Some(Arc::new(std::sync::Mutex::new(dup.into_std())))
+            match cap_file.try_clone() {
+                Ok(dup) => Some(Arc::new(std::sync::Mutex::new(dup.into_std()))),
+                Err(e) => rollback_on_err!(VfsError::from_io("dup fd for pread", e)),
+            }
         };
         let file = TokioFile::from_std(cap_file.into_std());
 
@@ -1086,11 +1214,26 @@ impl Vfs for LocalFs {
         } else {
             max_results
         };
+        // R3 dedupe: pending finals shadow same-named on-disk entries. Collect
+        // the pending names for this directory once and skip them in the
+        // on-disk loop below (the synthesized entries carry the temp's —
+        // current — attributes instead of the stale real file's).
+        let pend_list: Vec<(String, PathBuf)> = match &self.publish {
+            Some(table) => table.pending_in_dir(&table_dir_rel(&rel)),
+            None => Vec::new(),
+        };
+        let pend_names: std::collections::HashSet<String> =
+            pend_list.iter().map(|(n, _)| n.clone()).collect();
         for entry in read_dir {
             let entry = entry.map_err(|e| VfsError::Io(format!("dir entry: {e}")))?;
             let name = entry.file_name().to_string_lossy().to_string();
             // Hide publish-on-close temp files from directory listings.
             if crate::publish::is_temp_name(&name) {
+                continue;
+            }
+            // Skip shadowed on-disk entries — the pending synthesized entry
+            // below represents them with the temp's attributes.
+            if pend_names.contains(&name) {
                 continue;
             }
             if !matches_pattern(&name, pattern) {
@@ -1169,22 +1312,22 @@ impl Vfs for LocalFs {
             }
         }
 
-        // Publish-on-close: append pending finals (their temps are hidden
-        // above) under their client-visible names, with the temp file's
-        // attributes. Pending files match `pattern` on the FINAL name.
-        if let Some(table) = &self.publish {
-            let dir_rel = table_dir_rel(&rel);
-            for (final_name, temp_rel) in table.pending_in_dir(&dir_rel) {
+        // Publish-on-close: append pending finals (their temps and shadowed
+        // real files are hidden above) under their client-visible names,
+        // with the temp file's attributes. Pending files match `pattern` on
+        // the FINAL name.
+        if self.publish.is_some() {
+            for (final_name, temp_rel) in &pend_list {
                 if entries.len() >= cap {
                     break;
                 }
-                if !matches_pattern(&final_name, pattern) {
+                if !matches_pattern(final_name, pattern) {
                     continue;
                 }
                 // The temp must be in the SAME directory as the final
                 // (atomic-rename requirement); temp_rel is root-relative
                 // with the same parent as the final.
-                let Ok(meta) = self.dir.symlink_metadata(&temp_rel) else {
+                let Ok(meta) = self.dir.symlink_metadata(temp_rel) else {
                     continue;
                 };
                 let is_dir = meta.is_dir();
@@ -1218,7 +1361,7 @@ impl Vfs for LocalFs {
                         .unwrap_or(0)
                 };
                 entries.push(DirEntry {
-                    file_name: final_name,
+                    file_name: final_name.clone(),
                     short_name: None,
                     attributes: FileAttributes {
                         read_only,
@@ -1362,7 +1505,24 @@ impl Vfs for LocalFs {
         // skipped entirely for pending files.
         if let (Some(table), Some(p)) = (&self.publish, &publish) {
             let (new_dir, new_name) = crate::publish::split_parent(&new_rel);
-            table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
+            // Destination collision: a pending file already occupies the
+            // destination final name. With `replace` the destination's
+            // pending entry (and its unpublished temp) is discarded and
+            // the move proceeds; without `replace` the rename is refused
+            // (matching the non-pending AlreadyExists path semantics).
+            let collision = table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
+            if collision {
+                if !replace {
+                    return Err(VfsError::AlreadyExists);
+                }
+                if let Some(dest) = table.take_destination(&new_dir, &new_name) {
+                    // The destination pending file will never publish: its
+                    // data is silently discarded by the rename semantics.
+                    let _ = self.dir.remove_file(&dest.temp_name);
+                }
+                // Retry the move now that the destination key is free.
+                let _ = table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
+            }
             // Update every handle on this pending entry: visible identity
             // moves to the new final name; rel_path keeps pointing at the
             // temp file.

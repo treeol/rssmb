@@ -1605,10 +1605,12 @@ where
                                 let Ok(root) = std::fs::canonicalize(&share.path) else {
                                     continue;
                                 };
+                                // Sweep only already-registered publish roots
+                                // (a table exists once the share's first
+                                // TREE_CONNECT opened a publish backend).
                                 let removed =
-                                    rssmb_vfs::publish::PendingPublishTable::for_root(&root)
-                                        .sweep_orphans(&root);
-                                if removed > 0 {
+                                    rssmb_vfs::publish::PendingPublishTable::sweep_registered_root(&root);
+                                if removed.unwrap_or(0) > 0 {
                                     tracing::info!(
                                         share = %share_name,
                                         removed,
