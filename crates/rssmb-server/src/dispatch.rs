@@ -2391,9 +2391,27 @@ async fn handle_tree_connect(
         0x0012_00a9
     };
 
-    // Create VFS backend: LocalFs for real shares, MemoryFs for unnamed/test
+    // Create VFS backend: LocalFs for real shares, MemoryFs for unnamed/test.
+    // publish_on_close selects the LocalFs variant with the hidden-temp/
+    // atomic-rename backend (see rssmb_vfs::publish).
     let vfs: Arc<dyn rssmb_vfs::Vfs> = if share_config.path.is_empty() {
         Arc::new(rssmb_vfs::memoryfs::MemoryFs::new())
+    } else if share_config.publish_on_close {
+        match rssmb_vfs::localfs::LocalFs::new_with_publish(
+            &share_config.path,
+            share_config.follow_symlinks,
+            share_config.case_sensitive,
+        ) {
+            Ok(fs) => Arc::new(fs),
+            Err(e) => {
+                tracing::warn!(share = %share_name, path = share_config.path, error = %e, "failed to create LocalFs");
+                return error_response_for(
+                    Command::TreeConnect,
+                    NtStatus::InvalidParameter,
+                    &req.header,
+                );
+            }
+        }
     } else {
         match rssmb_vfs::localfs::LocalFs::new(
             &share_config.path,
@@ -7973,6 +7991,7 @@ mod tests {
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
+            publish_on_close: false,
         }
     }
 

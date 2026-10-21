@@ -12,6 +12,7 @@ use thiserror::Error;
 pub mod localfs;
 pub mod memoryfs;
 pub mod path;
+pub mod publish;
 
 pub use path::NormalizedPath;
 

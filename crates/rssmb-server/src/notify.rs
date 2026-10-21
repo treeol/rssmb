@@ -300,6 +300,18 @@ pub fn start_watch(
                                     })
                                     .collect();
 
+                                // Publish-on-close: temp files (`.rssmb-tmp.*`)
+                                // must never surface to clients. The final
+                                // name appears only via the publish rename.
+                                let entries: Vec<FileNotifyEntry> = entries
+                                    .into_iter()
+                                    .filter(|e| {
+                                        !rssmb_vfs::publish::is_temp_name(
+                                            e.file_name.rsplit('\\').next().unwrap_or(&e.file_name),
+                                        )
+                                    })
+                                    .collect();
+
                                 if entries.is_empty() {
                                     continue;
                                 }

@@ -170,6 +170,7 @@ fn make_config() -> (ServerConfig, tempfile::TempDir) {
             follow_symlinks: rssmb_vfs::FollowSymlinks::Never,
             strict_sync: true,
             case_sensitive: false,
+            publish_on_close: false,
         },
     );
 
