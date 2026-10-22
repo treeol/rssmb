@@ -120,13 +120,16 @@ jobs:
 
   # Job 4: smbtorture baseline (nightly only — too slow for PR gating).
   # Known subtest failures are expected here (see results.md), so the job
-  # is continue-on-error: the run reports success with a neutral-annotated
-  # baseline step. Per-suite budgets live in run-smbtorture.sh (smb2.lease
-  # 300 s, smb2.notify 240 s, others 120 s); a suite that overruns its
-  # budget is reported INCOMPLETE with no pass count — never a silently
-  # truncated count. Note: with continue-on-error the job itself can no
-  # longer fail the run; real harness breakage is still visible as a
-  # skipped "Review baseline results" step plus the neutral annotation.
+  # is continue-on-error and the nightly run always reports success.
+  # Per-suite budgets live in run-smbtorture.sh (smb2.lease 300 s,
+  # smb2.notify 240 s, others 120 s); a suite that overruns its budget is
+  # reported INCOMPLETE with no pass count — never a silently truncated
+  # count. The baseline step keeps step-level continue-on-error so the
+  # "Review baseline results" guard can classify its outcome; the guard's
+  # exit 1 surfaces as an ::error annotation only — job-level
+  # continue-on-error means the run cannot go red from inside this job.
+  # Regression surface: the smbtorture-baseline artifact (diff results.md
+  # against the previous night) and the per-suite console table.
   smbtorture:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -172,24 +175,33 @@ jobs:
           name: smbtorture-baseline
           path: smbtorture-artifacts/
           if-no-files-found: warn
-      # Success/neutral is the healthy nightly signal ("Baseline collected"
-      # = some suites still fail known debt; neutral = script bug). SKIPPED
-      # means the baseline step never ran — build or install broke; check
-      # that job. If the job ever reports failure, a hard error escaped
-      # continue-on-error (e.g. job-level timeout) and deserves attention.
+      # Success is the healthy nightly signal: known subtest failures are
+      # documented debt, so the baseline step exits nonzero most nights —
+      # step continue-on-error converts that to success outcome and this
+      # guard classifies it. Arms (steps.<id>.outcome is success | failure
+      # | cancelled | skipped — no neutral):
+      #   skipped  -> baseline never ran (build/install broke, or job
+      #               cancelled) — ::error annotation for attention.
+      #   failure  -> baseline RAN and exited nonzero: normal (known debt)
+      #               — no annotation beyond the step conclusion.
+      #   anything -> rare (cancelled is impossible here under
+      #               !cancelled(), anything else is undefined) — warn.
       - name: Review baseline results
         if: always() && !cancelled()
         run: |
           case "${{ steps.baseline.outcome }}" in
-            success|neutral)
-              echo "Baseline collected. Known failures are documented debt — compare results.md against the previous night for regressions."
+            success)
+              echo "Baseline collected with zero failures — unexpected; verify results.md is fresh."
+              ;;
+            failure)
+              echo "Baseline collected; nonzero suite exits are known, documented debt — diff results.md against the previous night for regressions."
               ;;
             skipped)
-              echo "::error::baseline step did NOT run (build/install failed or workflow changed) — inspect the smbtorture job"
+              echo "::error::baseline step did NOT run (build/install failed or job cancelled) — inspect the smbtorture job"
               exit 1
               ;;
             *)
-              echo "::warning::baseline runner exited abnormally (outcome: ${{ steps.baseline.outcome }}) — inspect logs/artifacts"
+              echo "::warning::baseline outcome '${{ steps.baseline.outcome }}' is undefined — inspect logs/artifacts"
               ;;
           esac
 
