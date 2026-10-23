@@ -2267,7 +2267,7 @@ async fn handle_logoff(
         }
     }
 
-    let mut resp = build_response(
+    let resp = build_response(
         req_header,
         ResponseContent::Logoff(rssmb_proto::session_setup::LogoffResponse::default()),
     );
