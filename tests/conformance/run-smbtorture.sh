@@ -63,10 +63,11 @@ echo "|---|---|---|---|" >> "$RESULTS"
 # "test:" tally recorded a wrong pass count (the "8/31" artifact corrected
 # in results.md and analyzed in tests/conformance/lease-analysis.md). Add
 # rows here when another suite outgrows 120 s (the console line prints
-# each suite's wall time to calibrate). smb2.notify gets 240 s: it
-# overran the 120 s budget in CI on 2026-10-21 and 2026-10-22 (the CI
-# baseline runs all 18 suites back-to-back on a cold tree; INCOMPLETE
-# rows carry no count, so the budget must cover worst-case runs).
+# each suite's wall time to calibrate). smb2.notify keeps 240 s: the
+# suite stalls deterministically at subtest `basedir` (attribute-change
+# filter fidelity — documented in results.md; the stall point is reached
+# ~180 s into a cold CI run, so 240 s still bounds it; the budget is not
+# the fix, the basedir subtest is future work).
 suite_timeout() {
   case "$1" in
     smb2.lease) echo 300 ;;
