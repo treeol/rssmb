@@ -129,8 +129,10 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 
-    /// Whether SMB 3.x multichannel is enabled. Default: true.
-    #[serde(default = "default_true")]
+    /// Whether SMB 3.x multichannel is enabled. Default: false (deferred
+    /// until binding hardening lands; clients won't open additional
+    /// channels unless this is on).
+    #[serde(default)]
     pub multichannel: bool,
 
     /// Explicit list of addresses to advertise for multichannel
@@ -667,7 +669,7 @@ impl ServerConfig {
             ntlm_require_timestamp: false,
             durable_timeout_secs: 900,
             leases: true,
-            multichannel: true,
+            multichannel: false,
             multichannel_interfaces: vec![],
             server_name: "rssmb".to_string(),
             shutdown_grace_secs: 10,

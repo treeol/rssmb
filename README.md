@@ -215,7 +215,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
 | `leases` | `true` | SMB 2.1+ file leases and traditional oplocks |
-| `multichannel` | `true` | SMB 3.x multichannel (advertised only when usable interfaces exist) |
+| `multichannel` | `false` | SMB 3.x multichannel (advertised only when usable interfaces exist; disabled by default until binding hardening lands) |
 | `multichannel_interfaces` | `[]` | Pin advertised addresses for NAT/Kubernetes (empty = enumerate host NICs) |
 | `quic_enabled` | `false` | SMB over QUIC (SMB 3.1.1 over TLS 1.3, UDP) |
 | `quic_port` | `443` | UDP port for SMB over QUIC |

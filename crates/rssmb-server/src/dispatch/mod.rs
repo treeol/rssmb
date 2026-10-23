@@ -1665,7 +1665,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_qnii_returns_interface_entries() {
-        let state = make_test_state();
+        // QNII requires multichannel=true; the default is now false.
+        let mut config = crate::config::ServerConfig::for_testing();
+        config.multichannel = true;
+        let state = Arc::new(ServerState::new(config));
         let conn = make_conn_state();
         establish_negotiation_with_dialect(&state, &conn, WireDialect::Smb030).await;
 
@@ -1713,7 +1716,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_qnii_truncation_boundaries_and_buffer_overflow() {
-        let state = make_test_state();
+        // QNII requires multichannel=true; the default is now false.
+        let mut config = crate::config::ServerConfig::for_testing();
+        config.multichannel = true;
+        let state = Arc::new(ServerState::new(config));
         let conn = make_conn_state();
         establish_negotiation_with_dialect(&state, &conn, WireDialect::Smb030).await;
 
