@@ -74,6 +74,7 @@ pub(crate) async fn handle_session_setup(
             state.identities_snapshot(),
             guest_allowed,
             state.config.ntlm_require_timestamp,
+            state.config.ntlm_max_clock_skew_secs,
         ));
 
     // Extract the security buffer from the session setup request
