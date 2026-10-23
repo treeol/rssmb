@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes its pending temp, (b) the startup orphan sweep runs on
   share mount (not only from the periodic sweeper), and (c) fresh temps
   survive the startup sweep.
+- **`publish_on_close` integration tests and CI.** Added a
+  `publish-on-close` job to the interop CI workflow that runs the
+  impacket two-client scenario (A creates+writes, B lists+opens during
+  pending, host `ls -A` shows only temp, B closes → publish) and a
+  rclone `--inplace` test with inotifywait (asserting only `MOVED_TO` on
+  the final name). Transcripts are uploaded as CI artifacts. The nightly
+  smbtorture baseline now also runs with `publish_on_close` ON
+  (`tests/live/rssmb-live-poc.toml`) and compares against
+  `results-poc.md`.
 
 ### Fixed
 
@@ -40,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rename_with_replace()` — one method, one write lock, one atomic
   table-level operation that does the move and collision handling
   (including discarding a displaced destination) in a single lock hold.
+- **`publish_on_close`: close race — rename under lock.** The `close()`
+  path removed the pending entry and returned the temp path before the
+  caller performed the filesystem rename, leaving a window where a
+  racing `resolve_or_acquire` could miss the entry and create a phantom
+  re-pend. Replaced with `close_publish()` which calls the rename
+  closure under the table's write lock — the entry is removed
+  atomically with the filesystem rename, so no racing acquire can
+  observe the gap.
+- **`publish_on_close`: attach race — no phantom entry.** The
+  pending-file probe in `LocalFs::create` used `resolve_or_acquire`
+  which minted a `Created` entry and immediately aborted it, leaving a
+  window where a racing `close` or `resolve_or_acquire` could see the
+  phantom entry. Replaced with `attach()` which finds an existing
+  pending entry and increments its count, or returns `None` — no mint,
+  no abort, no phantom.
 
 ### Changed
 
