@@ -213,6 +213,8 @@ def main():
         # terminates the connection on the next credit-checked request.
         # Closing the socket triggers the server's connection-cleanup path
         # which closes all VFS handles, publishing the pending temp.
+        # Wait a moment for the write to be processed before closing.
+        time.sleep(0.2)
         try:
             c._SMBConnection._NetBIOSSession._sock.close()
         except Exception:
