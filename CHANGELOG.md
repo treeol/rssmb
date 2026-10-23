@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`publish_on_close` hardening: CHANGE_NOTIFY event mapping.** When
+  publish_on_close is enabled on a share, the CHANGE_NOTIFY watcher now
+  maps inotify events on hidden temp files (`.rssmb-tmp.*`) to events on
+  the client-visible final name, so no temp name ever surfaces to SMB
+  clients:
+  - temp ADDED → `FILE_ACTION_ADDED` <final_name>
+  - temp MODIFIED → `FILE_ACTION_MODIFIED` <final_name>
+  - temp REMOVED → suppress (abort, delete-on-close, or publish rename)
+  Also confirmed via unit tests that (a) a durable handle's close
+  publishes its pending temp, (b) the startup orphan sweep runs on
+  share mount (not only from the periodic sweeper), and (c) fresh temps
+  survive the startup sweep.
+
 ### Changed
 
 - **`multichannel` default flipped to `false`.** SMB 3.x multichannel is
