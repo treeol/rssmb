@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-auth"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "hex",
@@ -2205,7 +2205,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-proto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-rpc-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-tests"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "binrw",
  "rssmb-proto",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-vfs"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "rssmb-wire-adapter"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "binrw",
  "bytes",

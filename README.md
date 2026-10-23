@@ -68,6 +68,8 @@ minimal overhead and maximal security**.
   AppInstanceId, which Samba 4.19.5 itself does not implement — see
   `tests/conformance/results.md`)
 - File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break handling
+- Byte-range locks with blocking, CANCEL, LockSequence replay detection —
+  smb2.lock 22/22 (smbtorture 4.19.5, full parity with smbd)
 - Multichannel (SMB 3.x): session binding across connections and
   `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
 - SMB over QUIC (SMB 3.1.1 over TLS 1.3, ALPN `smb`, UDP/443) — traverse
@@ -259,7 +261,7 @@ semantics, and config validation.
 ## Testing & conformance
 
 ```sh
-cargo test --workspace          # 612 unit + integration tests
+cargo test --workspace          # 616 unit + integration tests
 tests/live/run.sh               # impacket-based interop (needs Python)
 tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privileged)
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
@@ -315,7 +317,7 @@ be reused in other SMB tools.
 
 **Implemented (1.0 scope):**
 - ✅ SMB 2.1 – 3.1.1 with encryption, signing, and NTLMv2
-- ✅ Durable handles v1/v2 (smb2.durable-v2-open 14/15), byte-range locks, change notify
+- ✅ Durable handles v1/v2 (smb2.durable-v2-open 14/15), byte-range locks (smb2.lock 22/22), change notify
 - ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
 - ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
 

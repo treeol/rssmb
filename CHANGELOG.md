@@ -7,26 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-23
+
+### Added
+
+- **Byte-range locks: smb2.lock 22/22 (was 3/22; smb2.durable-v2-open
+  14/15, smb2.lease 30/9, smbtorture 4.19.5).** Campaign C brings the
+  lock suite to full golden parity with Samba 4.19.5 (22 pass / 3
+  cluster-only skips):
+  - **Blocking locks (MS-SMB2 3.3.5.14).** A lock without
+    `FAIL_IMMEDIATELY` that conflicts with an existing range now pends
+    as `STATUS_PENDING` and is granted when the conflicting range is
+    released, or `LOCK_NOT_GRANTED` after a 35 s timeout. `CANCEL`
+    completes the pended lock with `STATUS_CANCELLED`; `CLOSE`,
+    `TREE_DISCONNECT`, and `LOGOFF` complete it with
+    `RANGE_NOT_LOCKED`. Completion ownership is strict — only the path
+    that removes the pending-async entry sends the one out-of-band
+    response, preventing `INVALID_NETWORK_RESPONSE` from a double-send.
+  - **LockSequence replay detection (MS-SMB2 3.3.5.14).** Per-open
+    64-bucket array (`sequence >> 4` = bucket, `& 0xF` = value);
+    replayed successful sequences are silently suppressed. Enabled for
+    all opens (`SMB2_CAP_MULTI_CHANNEL`), matching smbd — this is also
+    what makes `replay_broken_windows` SKIP with golden parity.
+  - **Same-open conflict semantics.** Re-acquiring an exclusive lock
+    over an existing own lock conflicts (`LOCK_NOT_GRANTED`, no
+    auto-unlock); shared locks stack freely over own locks; the open's
+    own shared locks block its own writes (the point of a shared lock).
+  - **smbd-exact flag validation.** First-element switch determines
+    unlock vs lock mode; `SHARED|UNLOCK` etc → `INVALID_PARAMETER`;
+    unlock batching (applied unlocks persist, first miss →
+    `RANGE_NOT_LOCKED`); zero-length locks are valid stacked entries;
+    `offset+length` overflow → `INVALID_LOCK_RANGE` (but `max/1` is
+    valid — only true overflow errors).
+
 ### Fixed
 
-- **CHANGE_NOTIFY no longer hangs or dies with the session (S1, session
-  lifecycle).** Six server fixes, all verified against smbtorture 4.19.5
-  (`smb2.notify` no longer stalls the nightly; `close`, `logoff`,
-  `session-reconnect`, `tdis1` now pass):
-  - CLOSE of a handle cancels only that handle's pending watch and
-    completes it with `STATUS_NOTIFY_CLEANUP` (0x0000010B) per MS-SMB2
-    3.3.5.10/3.3.5.19.2 — previously every watch on the whole tree was
-    silently dropped (exposed by the publish_on_close merge, ceb20a3).
-  - Pre-interim CANCEL (MessageId 0, no AsyncId) cancels the newest
-    pending async op on the session, matching Samba's client behavior.
-  - TREE_DISCONNECT completes pending watches with
-    `STATUS_NOTIFY_CLEANUP`; LOGOFF does the same for the session.
-  - Durable reconnect re-binds pending watches to the new open instead
-    of orphaning them.
-  - Deleting the watched directory completes the watch with
-    `STATUS_DELETE_PENDING` instead of leaving it pending forever.
-  - CLOSE-cleanup no longer self-deadlocks when the closing handle is
-    itself the watched directory.
+- **Four wrong NTSTATUS wire values (K1).** Full audit of all 32 enum
+  variants + 15 raw `Other(0x…)` literals against Wine's `ntstatus.h`
+  (2717 defines, MS-ERREF §2.3.1 mirror): `LOCK_NOT_GRANTED` was
+  `0xC000005A` (STATUS_INVALID_OWNER) → `0xC0000055`; `FILE_LOCK_CONFLICT`
+  was `0xC0000070` (STATUS_INVALID_WORKSTATION) → `0xC0000054`;
+  `DuplicateObjectId` was `0xC0000042` (STATUS_INVALID_PORT_HANDLE) →
+  `0xC000022A`; `PIPE_EMPTY` was `0xC0000050` (STATUS_EA_TOO_LARGE) →
+  `0xC00000D9`. New named variants replace the raw literals so this
+  class of bug cannot silently recur.
+- **0-byte READ killed the connection.** The `ReadResponse` encoder
+  asserted `!buffer.is_empty()` and the wire encoder returned empty,
+  terminating the connection — a 0-byte READ (Length=0) is legal
+  (torture `zerobyteread`) and now returns `OK` + 0 bytes before the
+  lock-conflict check.
+- **`CHANGE_NOTIFY` no longer hangs or dies with the session** (S1,
+  session lifecycle). Six server fixes, all verified against smbtorture
+  4.19.5 (`smb2.notify` no longer stalls the nightly; `close`, `logoff`,
+  `session-reconnect`, `tdis1` now pass): CLOSE of a handle cancels
+  only that handle's watch with `STATUS_NOTIFY_CLEANUP`; pre-interim
+  CANCEL (mid=0) cancels the newest pending op; TDIS/LOGOFF complete
+  pending watches; durable reconnect re-binds watches; deleting the
+  watched directory completes the watch; CLOSE-cleanup no longer
+  self-deadlocks.
+- **TREE_DISCONNECT of an already-disconnected tree returned
+  `ACCESS_DENIED`** (was `NETWORK_NAME_DELETED`, MS-SMB2 3.3.5.9;
+  torture `connect.c:234`). `smb2.connect` now passes fully.
+- **Second LOGOFF returned `OK`** (was `USER_SESSION_DELETED`,
+  MS-SMB2 3.3.5.6; torture `connect.c:248`).
 
 ## [0.1.5] - 2026-10-21
 
