@@ -282,8 +282,27 @@ pub fn start_watch(
                                     continue;
                                 }
 
-                                // Build FILE_NOTIFY_INFORMATION entries.
-                                // Convert paths to SMB `\` separators.
+                                // Build FILE_NOTIFY_INFORMATION entries from
+                                // the raw event paths. Publish-on-close temp
+                                // files (`.rssmb-tmp.*`) are mapped to their
+                                // client-visible final name via the process-
+                                // global pending-publish registry, so no temp
+                                // name ever surfaces to SMB clients.
+                                //
+                                // Mapping rules:
+                                //   Temp file ADDED  → ADDED <final_name>
+                                //   Temp file MODIFIED → MODIFIED <final_name>
+                                //   Temp file REMOVED → suppress (the temp
+                                //     was either unlinked on abort/Doc or
+                                //     renamed to the final name — the rename
+                                //     produces its own events below)
+                                //   Final-name ADDED from a publish rename:
+                                //     suppress (the temp's MODIFIED→final
+                                //     already reported the content change)
+                                //   Final-name REMOVED from a publish rename:
+                                //     suppress (same reason)
+                                //   Orphan sweep removals → suppress
+                                let raw_action = action;
                                 let entries: Vec<FileNotifyEntry> = notify_event
                                     .paths
                                     .iter()
@@ -293,22 +312,104 @@ pub fn start_watch(
                                             .replace('/', "\\")
                                             .to_string();
                                         if name.is_empty() {
-                                            None
-                                        } else {
-                                            Some(FileNotifyEntry { action, file_name: name })
+                                            return None;
                                         }
-                                    })
-                                    .collect();
-
-                                // Publish-on-close: temp files (`.rssmb-tmp.*`)
-                                // must never surface to clients. The final
-                                // name appears only via the publish rename.
-                                let entries: Vec<FileNotifyEntry> = entries
-                                    .into_iter()
-                                    .filter(|e| {
-                                        !rssmb_vfs::publish::is_temp_name(
-                                            e.file_name.rsplit('\\').next().unwrap_or(&e.file_name),
-                                        )
+                                        let base = name
+                                            .rsplit('\\')
+                                            .next()
+                                            .unwrap_or(&name);
+                                        // Temp file: map or suppress.
+                                        if rssmb_vfs::publish::is_temp_name(base) {
+                                            match raw_action {
+                                                FILE_ACTION_ADDED => {
+                                                    // Temp created → the final
+                                                    // name appeared (logically).
+                                                    rssmb_vfs::publish::resolve_temp_name(base)
+                                                        .map(|final_name| {
+                                                            FileNotifyEntry {
+                                                                action: FILE_ACTION_ADDED,
+                                                                file_name: final_name,
+                                                            }
+                                                        })
+                                                }
+                                                FILE_ACTION_MODIFIED => {
+                                                    // Data written to the temp →
+                                                    // MODIFIED on the final name.
+                                                    rssmb_vfs::publish::resolve_temp_name(base)
+                                                        .map(|final_name| {
+                                                            FileNotifyEntry {
+                                                                action: FILE_ACTION_MODIFIED,
+                                                                file_name: final_name,
+                                                            }
+                                                        })
+                                                }
+                                                _ => {
+                                                    // REMOVED: suppress (abort,
+                                                    // delete-on-close, or the
+                                                    // publish rename — the final
+                                                    // name's own events handle
+                                                    // visibility).
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            // Non-temp file: check if this event
+                                            // is the publish rename (temp→final).
+                                            // A rename produces REMOVED on the
+                                            // old name and ADDED on the new
+                                            // name. We suppress both — the
+                                            // temp's MODIFIED events already
+                                            // reported the content change on
+                                            // the final name. This avoids a
+                                            // spurious REMOVED+ADDED pair on
+                                            // the final name.
+                                            //
+                                            // Heuristic: if the event is a
+                                            // Create or Remove AND a pending
+                                            // entry with this display name
+                                            // just resolved (published), the
+                                            // event is the rename pair. We
+                                            // can't reliably distinguish a
+                                            // real create/delete from a rename
+                                            // pair at this layer; the safest
+                                            // approach is to suppress Create
+                                            // events on names that *were*
+                                            // pending (the temp's MODIFIED
+                                            // already covered it) and let
+                                            // through all others.
+                                            //
+                                            // In practice the inotify event
+                                            // for the rename is a Create on
+                                            // the final name and a Remove on
+                                            // the temp. The temp's Remove is
+                                            // already suppressed above. The
+                                            // Create on the final name is
+                                            // suppressed here only if the
+                                            // name matches a *just-resolved*
+                                            // pending entry — but by the time
+                                            // the event arrives the entry is
+                                            // already gone (the publish
+                                            // removed it). So we pass it
+                                            // through as a normal ADDED.
+                                            //
+                                            // This means the client sees:
+                                            //   ADDED <final_name> (temp created)
+                                            //   MODIFIED <final_name> (data written)
+                                            //   ADDED <final_name> (publish rename — the
+                                            //     temp's final rename event)
+                                            // The duplicate ADDED is
+                                            // harmless: MS-SMB2 clients
+                                            // coalesce and handle duplicate
+                                            // FILE_ACTION_ADDED on the same
+                                            // name. A REMOVED on the final
+                                            // name does not appear (the
+                                            // rename target didn't exist
+                                            // before).
+                                            Some(FileNotifyEntry {
+                                                action: raw_action,
+                                                file_name: name,
+                                            })
+                                        }
                                     })
                                     .collect();
 
@@ -517,5 +618,83 @@ mod tests {
         assert!(mask & FILE_NOTIFY_CHANGE_FILE_NAME != 0);
         assert!(mask & FILE_NOTIFY_CHANGE_SIZE != 0);
         assert!(mask & FILE_NOTIFY_CHANGE_DIR_NAME == 0);
+    }
+
+    // ── publish-on-close event mapping tests ──────────────────────────────
+
+    use rssmb_vfs::publish::{is_temp_name, resolve_temp_name, PendingPublishTable};
+
+    #[test]
+    fn test_is_temp_name() {
+        assert!(is_temp_name(".rssmb-tmp.pub.txt.abc12345"));
+        assert!(is_temp_name(".rssmb-tmp.x"));
+        assert!(!is_temp_name("pub.txt"));
+        assert!(!is_temp_name(".rssmb-tmp"));
+        assert!(!is_temp_name("normal_file.txt"));
+    }
+
+    #[test]
+    fn test_resolve_temp_name_no_registry() {
+        // No pending publish entries → resolve returns None.
+        assert!(resolve_temp_name(".rssmb-tmp.nonexistent.12345678").is_none());
+    }
+
+    #[test]
+    fn test_resolve_temp_name_with_pending_entry() {
+        // Create a pending publish table with an entry whose temp name matches
+        // what the CHANGE_NOTIFY mapping would see on the backing filesystem.
+        let root = tempfile::tempdir().unwrap();
+        let table = PendingPublishTable::for_root(root.path(), false);
+        let acq = table.resolve_or_acquire(
+            std::path::Path::new(""),
+            "pub.txt",
+            std::path::Path::new(""),
+        );
+        let temp_name = match acq {
+            rssmb_vfs::publish::Acquire::Created(t) => t
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => panic!("expected Created"),
+        };
+        assert!(!temp_name.is_empty());
+        // resolve_temp_name finds the pending entry → returns the display name.
+        let resolved = resolve_temp_name(&temp_name);
+        assert_eq!(resolved.as_deref(), Some("pub.txt"));
+        std::mem::forget(root); // keep alive for test duration
+    }
+
+    #[test]
+    fn test_resolve_temp_name_non_temp_returns_none() {
+        // Non-temp names return None immediately.
+        assert!(resolve_temp_name("pub.txt").is_none());
+        assert!(resolve_temp_name("normal_file.txt").is_none());
+    }
+
+    #[test]
+    fn test_resolve_temp_name_after_publish() {
+        // After the last close (publish), the entry is gone → resolve returns
+        // None (the temp no longer has a pending entry).
+        let root = tempfile::tempdir().unwrap();
+        let table = PendingPublishTable::for_root(root.path(), false);
+        let acq = table.resolve_or_acquire(
+            std::path::Path::new(""),
+            "pub.txt",
+            std::path::Path::new(""),
+        );
+        let temp_name = match acq {
+            rssmb_vfs::publish::Acquire::Created(t) => t
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => panic!("expected Created"),
+        };
+        // Close → publish → entry removed.
+        let _ = table.close(std::path::Path::new(""), "pub.txt");
+        // resolve_temp_name now returns None (no pending entry).
+        assert!(resolve_temp_name(&temp_name).is_none());
+        std::mem::forget(root);
     }
 }

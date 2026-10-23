@@ -209,6 +209,38 @@ pub fn is_temp_name(name: &str) -> bool {
     name.starts_with(TEMP_PREFIX)
 }
 
+/// Resolve a temp file name (e.g. `.rssmb-tmp.pub.txt.abc12345`) to its
+/// client-visible final name by looking up the process-global pending
+/// publish registry. Returns `None` if the name is not a temp file or no
+/// pending entry matches (orphan, already published, or no publish table
+/// registered).
+///
+/// Used by the CHANGE_NOTIFY watcher to map inotify events on hidden
+/// temp files to events on the client-visible final name, so no temp
+/// name ever surfaces to SMB clients.
+pub fn resolve_temp_name(temp_name: &str) -> Option<String> {
+    if !is_temp_name(temp_name) {
+        return None;
+    }
+    let reg = registry().read().expect("publish registry lock poisoned");
+    for share in reg.values() {
+        let dirs = share.dirs.read().expect("publish map lock poisoned");
+        for dir_map in dirs.values() {
+            for pending in dir_map.values() {
+                if pending
+                    .temp_name
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == temp_name)
+                {
+                    return Some(pending.display_name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Process-global registry of pending-publish maps, keyed by canonical share
 /// root path.
 static REGISTRY: OnceLock<RwLock<HashMap<PathBuf, Arc<SharePending>>>> = OnceLock::new();

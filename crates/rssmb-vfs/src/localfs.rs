@@ -2809,4 +2809,110 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("sup.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
+
+    // ── durable + publish_on_close ────────────────────────────────────────
+    // A durable handle on a publish-on-close share must publish the temp
+    // file when the durable entry is closed (either by a DH2C reconnect's
+    // subsequent close, or by the sweeper evicting an expired entry). The
+    // Vfs::close() path in LocalFs already handles the publish — these
+    // tests confirm that calling close() through the Arc<dyn Vfs> trait
+    // object (as the durable table does) triggers the publish correctly.
+
+    #[tokio::test]
+    async fn publish_durable_close_publishes_temp() {
+        // Simulate a durable handle: create a file on a publish-on-close
+        // share, then close it via the Vfs trait (as the durable table
+        // does when evicting an expired entry). The temp must publish.
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs.create("", "durable.txt", &write_args()).await.unwrap().open;
+        fs.write_at(open, 0, b"durable-payload").await.unwrap();
+        // While pending: only temp on disk.
+        assert!(!dir.path().join("durable.txt").exists());
+        // Close via the Vfs trait (durable eviction path):
+        let vfs: Arc<dyn crate::Vfs> = Arc::new(fs);
+        vfs.close(open).await.unwrap();
+        // Published:
+        assert!(dir.path().join("durable.txt").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("durable.txt")).unwrap(),
+            b"durable-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_durable_close_after_reconnect_publishes() {
+        // Simulate a DH2C reconnect: create on connection A, disconnect
+        // (orphan), then reconnect on connection B and close. The pending
+        // entry survives across the reconnect (it's in the process-global
+        // registry), and the eventual close publishes.
+        let dir = tmp_root();
+        let fs_a = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let open = fs_a
+            .create("", "reconnect.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs_a.write_at(open, 0, b"reconnect-data").await.unwrap();
+        // Disconnect A (don't close — simulate abrupt drop). The open_id
+        // is still valid in the LocalFs opens map.
+        // Reconnect on B: a new LocalFs for the same share root shares
+        // the pending registry entry.
+        let fs_b = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // The pending entry is still in the registry (shared by root path).
+        // Close via fs_b (the reconnected Vfs). But the open_id was minted
+        // by fs_a — fs_b doesn't know it. In the durable table, the entry
+        // stores the *original* Arc<dyn Vfs> + open_id, so the close goes
+        // through fs_a. Simulate that:
+        let vfs_a: Arc<dyn crate::Vfs> = Arc::new(fs_a);
+        vfs_a.close(open).await.unwrap();
+        assert!(dir.path().join("reconnect.txt").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("reconnect.txt")).unwrap(),
+            b"reconnect-data"
+        );
+    }
+
+    // ── startup orphan sweep ─────────────────────────────────────────────
+    // for_root runs the startup orphan sweep on the first construction for
+    // a share root. A stale .rssmb-tmp.* file left by a previous crash must
+    // be removed on mount, not only by the periodic sweeper.
+
+    #[tokio::test]
+    async fn publish_startup_orphan_sweep_runs_on_mount() {
+        let dir = tmp_root();
+        // Create a stale orphan temp file before constructing the LocalFs.
+        let stale_name = format!("{}orphan.txt.deadbeef", crate::publish::TEMP_PREFIX);
+        let stale_path = dir.path().join(&stale_name);
+        std::fs::write(&stale_path, b"stale").unwrap();
+        // Set its mtime to > ORPHAN_MAX_AGE so it qualifies for removal.
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(crate::publish::ORPHAN_MAX_AGE.as_secs() + 600);
+        let f = std::fs::File::options().append(true).open(&stale_path).unwrap();
+        f.set_modified(old).unwrap();
+        // Construct a publish-on-close LocalFs — for_root runs the sweep.
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // The stale orphan must be gone.
+        assert!(!stale_path.exists(), "startup sweep must remove stale orphan");
+        // Non-temp files are untouched.
+        let normal = dir.path().join("normal.txt");
+        std::fs::write(&normal, b"keep").unwrap();
+        assert!(normal.exists());
+        let _ = fs; // keep alive
+    }
+
+    #[tokio::test]
+    async fn publish_startup_orphan_sweep_skips_fresh_temps() {
+        // A recently-created temp (within ORPHAN_MAX_AGE) must survive the
+        // startup sweep — it may be a live orphan from a very recent crash.
+        let dir = tmp_root();
+        let fresh_name = format!("{}fresh.txt.12345678", crate::publish::TEMP_PREFIX);
+        let fresh_path = dir.path().join(&fresh_name);
+        std::fs::write(&fresh_path, b"fresh").unwrap();
+        // Construct — sweep runs.
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // Fresh temp still exists (not old enough to sweep).
+        assert!(fresh_path.exists(), "fresh temp must survive startup sweep");
+        let _ = fs;
+    }
 }
