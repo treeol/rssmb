@@ -5,6 +5,29 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **CHANGE_NOTIFY no longer hangs or dies with the session (S1, session
+  lifecycle).** Six server fixes, all verified against smbtorture 4.19.5
+  (`smb2.notify` no longer stalls the nightly; `close`, `logoff`,
+  `session-reconnect`, `tdis1` now pass):
+  - CLOSE of a handle cancels only that handle's pending watch and
+    completes it with `STATUS_NOTIFY_CLEANUP` (0x0000010B) per MS-SMB2
+    3.3.5.10/3.3.5.19.2 — previously every watch on the whole tree was
+    silently dropped (exposed by the publish_on_close merge, ceb20a3).
+  - Pre-interim CANCEL (MessageId 0, no AsyncId) cancels the newest
+    pending async op on the session, matching Samba's client behavior.
+  - TREE_DISCONNECT completes pending watches with
+    `STATUS_NOTIFY_CLEANUP`; LOGOFF does the same for the session.
+  - Durable reconnect re-binds pending watches to the new open instead
+    of orphaning them.
+  - Deleting the watched directory completes the watch with
+    `STATUS_DELETE_PENDING` instead of leaving it pending forever.
+  - CLOSE-cleanup no longer self-deadlocks when the closing handle is
+    itself the watched directory.
+
 ## [0.1.5] - 2026-10-21
 
 ### Added
