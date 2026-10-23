@@ -259,7 +259,7 @@ semantics, and config validation.
 ## Testing & conformance
 
 ```sh
-cargo test --workspace          # 546 unit + integration tests
+cargo test --workspace          # 612 unit + integration tests
 tests/live/run.sh               # impacket-based interop (needs Python)
 tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privileged)
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)
