@@ -1,0 +1,21 @@
+# Integration test config: publish_on_close OFF (control baseline).
+listen_addr = "127.0.0.1"
+port = 4450
+min_dialect = "smb21"
+max_dialect = "smb311"
+signing = "desired"
+encryption = "disabled"
+guest_access = true
+health_port = 18080
+max_credits = 1024
+
+[shares.public]
+name = "public"
+comment = "Pub (control, no publish_on_close)"
+path = "/tmp/rssmb-poc/public"
+guest_ok = true
+publish_on_close = false
+
+[[users]]
+username = "alice"
+password = "TestPass123"
