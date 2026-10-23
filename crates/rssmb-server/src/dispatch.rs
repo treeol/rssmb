@@ -1942,8 +1942,7 @@ async fn handle_session_setup(
                             }
                         }
                     }
-                    teardown_previous_session(state, previous_session_id, &identity.username)
-                        .await;
+                    teardown_previous_session(state, previous_session_id, &identity.username).await;
                 }
             }
 
@@ -2114,12 +2113,14 @@ async fn handle_logoff(
     // USER_SESSION_DELETED (MS-SMB2 3.3.5.6; torture connect.c:248 logs
     // off twice and asserts the second logoff fails with this). Checked
     // BEFORE teardown so the first (valid) logoff succeeds.
-    if !conn_state.sessions.read().await.iter().any(|s| s.id == session_id) {
-        return error_response_for(
-            Command::Logoff,
-            NtStatus::UserSessionDeleted,
-            req_header,
-        );
+    if !conn_state
+        .sessions
+        .read()
+        .await
+        .iter()
+        .any(|s| s.id == session_id)
+    {
+        return error_response_for(Command::Logoff, NtStatus::UserSessionDeleted, req_header);
     }
 
     // Remove all opens belonging to this session, closing them via VFS.
@@ -4574,11 +4575,7 @@ async fn handle_read(
             .check_range_lock(fid, entry.open_id, read_req.offset, read_req.length as u64)
             .await
         {
-            return error_response_for(
-                Command::Read,
-                NtStatus::FileLockConflict,
-                &req.header,
-            );
+            return error_response_for(Command::Read, NtStatus::FileLockConflict, &req.header);
         }
         // Break any Write lease/oplock held by another client on this file.
         let (breaks, waiters) = state
@@ -4770,11 +4767,7 @@ async fn handle_write(
             )
             .await
         {
-            return error_response_for(
-                Command::Write,
-                NtStatus::FileLockConflict,
-                &req.header,
-            );
+            return error_response_for(Command::Write, NtStatus::FileLockConflict, &req.header);
         }
         // Break any Read or Write lease/oplock held by another client on this file.
         let (breaks, waiters) = state
@@ -5538,7 +5531,7 @@ async fn handle_set_info(
                                     cancel: cancel_tx,
                                     notify_handle: None,
                                     watched_file_id: None,
-                        lock_open_volatile: None,
+                                    lock_open_volatile: None,
                                 },
                             );
                             // Send interim STATUS_PENDING. Construct manually
@@ -5802,7 +5795,7 @@ async fn handle_change_notify(
                     cancel: cancel_tx,
                     notify_handle: None,
                     watched_file_id: None,
-                        lock_open_volatile: None,
+                    lock_open_volatile: None,
                 },
             );
             let mut response = build_response(
@@ -6204,15 +6197,14 @@ async fn handle_lock(
     // cancel-logoff lock.c:1166 and valid-request lock.c:133 both assert
     // FILE_CLOSED here; most other commands keep INVALID_HANDLE).
     let file_id_volatile = lock_req.file_id.volatile;
-    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile)
-        .await
-    {
-        Ok(e) => e,
-        Err(NtStatus::InvalidHandle) => {
-            return error_response_for(Command::Lock, NtStatus::FileClosed, &req.header)
-        }
-        Err(status) => return error_response_for(Command::Lock, status, &req.header),
-    };
+    let entry =
+        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+            Ok(e) => e,
+            Err(NtStatus::InvalidHandle) => {
+                return error_response_for(Command::Lock, NtStatus::FileClosed, &req.header)
+            }
+            Err(status) => return error_response_for(Command::Lock, status, &req.header),
+        };
 
     // Pipe opens don't support byte-range locks.
     if entry.is_pipe {
@@ -6455,7 +6447,13 @@ async fn handle_lock(
                         // woken watcher whose entry is gone must stay silent
                         // (a second response for the same MessageId is
                         // INVALID_NETWORK_RESPONSE for the client).
-                        if conn_clone.pending_async.lock().await.remove(&message_id).is_none() {
+                        if conn_clone
+                            .pending_async
+                            .lock()
+                            .await
+                            .remove(&message_id)
+                            .is_none()
+                        {
                             return;
                         }
                         // Re-check and apply atomically; a lost race (another
@@ -6498,11 +6496,7 @@ async fn handle_lock(
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;
                 }
-                return error_response_for(
-                    Command::Lock,
-                    NtStatus::LockNotGranted,
-                    &req.header,
-                );
+                return error_response_for(Command::Lock, NtStatus::LockNotGranted, &req.header);
             }
         }
     }
@@ -6866,7 +6860,7 @@ async fn pend_until_breaks(
             cancel: cancel_tx,
             notify_handle: None,
             watched_file_id: None,
-                        lock_open_volatile: None,
+            lock_open_volatile: None,
         },
     );
     let mut pending_hdr = req_header.clone();
@@ -7278,7 +7272,9 @@ async fn lookup_open_for_session(
     // paths). FILE_CLOSED is returned only where asserted:
     // CLOSE of a closed handle (3.3.5.16) and forged persistent halves
     // in LOCK (below).
-    let entry = opens.get(&file_id_volatile).ok_or(NtStatus::InvalidHandle)?;
+    let entry = opens
+        .get(&file_id_volatile)
+        .ok_or(NtStatus::InvalidHandle)?;
     // Validate that the handle belongs to this session.
     if entry.session_id != session_id {
         return Err(NtStatus::InvalidHandle);

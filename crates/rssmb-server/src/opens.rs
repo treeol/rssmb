@@ -828,7 +828,8 @@ impl LockWaiter {
             for lock in list {
                 if lock.open_id == self.open_id {
                     // Same open: only exclusive acquisition conflicts.
-                    if exclusive && lock.exclusive
+                    if exclusive
+                        && lock.exclusive
                         && ranges_overlap(offset, length, lock.offset, lock.length)
                     {
                         return true;
@@ -1372,10 +1373,9 @@ impl OpenTable {
     ) -> Result<(), LockConflict> {
         let mut locks = self.range_locks.write().await;
         if let Some(list) = locks.get_mut(&file_id) {
-            if let Some(pos) = list
-                .iter()
-                .position(|l| l.open_id == owner_open_id && l.offset == offset && l.length == length)
-            {
+            if let Some(pos) = list.iter().position(|l| {
+                l.open_id == owner_open_id && l.offset == offset && l.length == length
+            }) {
                 list.remove(pos);
                 if list.is_empty() {
                     locks.remove(&file_id);
@@ -2829,8 +2829,14 @@ mod tests {
             .acquire_range_lock(fid(1), oid(1), 100, 1, 50, 200, false)
             .await
             .expect("same open can stack shared over own exclusive");
-        table.release_range_lock(fid(1), oid(1), 0, 100).await.unwrap();
-        table.release_range_lock(fid(1), oid(1), 50, 200).await.unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 100)
+            .await
+            .unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 50, 200)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2885,13 +2891,19 @@ mod tests {
             .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
             .await
             .unwrap();
-        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 10)
+            .await
+            .unwrap();
         // One entry still held: another open's exclusive still conflicts.
         table
             .acquire_range_lock(fid(1), oid(2), 200, 1, 0, 10, true)
             .await
             .expect_err("one stacked entry remains");
-        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 10)
+            .await
+            .unwrap();
         let err = table
             .release_range_lock(fid(1), oid(1), 0, 10)
             .await
@@ -2913,7 +2925,10 @@ mod tests {
             .check_range_lock_for_write(fid(1), oid(1), 5, 10)
             .await
             .expect("own exclusive permits own write");
-        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 10)
+            .await
+            .unwrap();
         table
             .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
             .await
@@ -3042,8 +3057,14 @@ mod tests {
             .acquire_range_lock(fid(2), oid(2), 200, 1, 0, 10, true)
             .await
             .expect("other open's exclusive over [0,10) unaffected by 0-byte lock");
-        table.release_range_lock(fid(1), oid(1), 0, 0).await.unwrap();
-        table.release_range_lock(fid(1), oid(1), 0, 0).await.unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 0)
+            .await
+            .unwrap();
+        table
+            .release_range_lock(fid(1), oid(1), 0, 0)
+            .await
+            .unwrap();
         let err = table
             .release_range_lock(fid(1), oid(1), 0, 0)
             .await

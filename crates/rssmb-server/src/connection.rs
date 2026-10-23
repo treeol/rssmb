@@ -1935,7 +1935,7 @@ mod tests {
                 cancel: cancel_tx,
                 notify_handle: None,
                 watched_file_id: None,
-                        lock_open_volatile: None,
+                lock_open_volatile: None,
             },
         );
 
