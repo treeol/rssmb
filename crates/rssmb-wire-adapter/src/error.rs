@@ -58,6 +58,15 @@ pub enum NtStatus {
     /// Range not locked (0xC000007E) — UNLOCK of a byte range the open has
     /// not locked (MS-ERREF §2.3.1; MS-SMB2 3.3.5.14).
     RangeNotLocked,
+    /// Invalid lock range (0xC00001A1) — lock offset+length overflows the
+    /// 64-bit range (MS-ERREF §2.3.1; smbd returns this for >63-bit lock
+    /// requests, torture `valid-request`).
+    InvalidLockRange,
+    /// File closed (0xC0000128) — an operation references a handle that is
+    /// not open (MS-ERREF §2.3.1; MS-SMB2 fails requests on unknown/closed
+    /// handles with this status, e.g. use-after-close in torture
+    /// connect.c:227 / lock.c:133).
+    FileClosed,
     /// Object name invalid (0xC0000033) — invalid path/name
     ObjectNameInvalid,
     /// Sharing violation (0xC0000043)
@@ -123,6 +132,8 @@ impl NtStatus {
             NtStatus::FileLockConflict => 0xC0000054,
             NtStatus::PipeEmpty => 0xC00000D9,
             NtStatus::RangeNotLocked => 0xC000007E,
+            NtStatus::InvalidLockRange => 0xC00001A1,
+            NtStatus::FileClosed => 0xC0000128,
             NtStatus::ObjectNameInvalid => 0xC0000033,
             NtStatus::SharingViolation => 0xC0000043,
             NtStatus::FileIsADirectory => 0xC00000BA,
@@ -186,6 +197,8 @@ impl NtStatus {
             0xC0000054 => NtStatus::FileLockConflict,
             0xC00000D9 => NtStatus::PipeEmpty,
             0xC000007E => NtStatus::RangeNotLocked,
+            0xC00001A1 => NtStatus::InvalidLockRange,
+            0xC0000128 => NtStatus::FileClosed,
             0xC05D0000 => NtStatus::SmbNoPreauthIntegrityHashOverlap,
             _ => NtStatus::Other(val),
         }
@@ -228,6 +241,9 @@ mod tests {
             NtStatus::LockNotGranted,
             NtStatus::FileLockConflict,
             NtStatus::PipeEmpty,
+            NtStatus::RangeNotLocked,
+            NtStatus::InvalidLockRange,
+            NtStatus::FileClosed,
         ];
         for code in codes {
             let raw = code.to_u32();

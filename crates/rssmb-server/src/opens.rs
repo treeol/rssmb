@@ -1181,9 +1181,11 @@ impl OpenTable {
         length: u64,
         exclusive: bool,
     ) -> Result<(), LockConflict> {
-        if length == 0 {
-            return Err(LockConflict::ZeroLength);
-        }
+        // Zero-length locks are valid stacked entries (torture `lock`
+        // "Trying 0/0 lock", `zerobytelength`; smbd grants them). The
+        // u128 overlap math makes [o, o) conflict with nothing, so a
+        // 0-length entry only ever conflicts with an identical 0-length
+        // exclusive re-acquire — matching smbd.
         let mut locks = self.range_locks.write().await;
         if let Some(list) = locks.get(&file_id) {
             for lock in list {
@@ -2873,13 +2875,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_zero_length_rejected() {
+    async fn lock_zero_length_is_valid_stacked_entry() {
+        // K4: 0-byte locks are valid (torture `lock` 0/0, `zerobytelength`);
+        // they stack and unlock like any entry.
         let table = OpenTable::new();
-        let err = table
+        table
             .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 0, true)
             .await
-            .expect_err("zero-length lock should be rejected");
-        assert!(matches!(err, LockConflict::ZeroLength));
+            .expect("zero-length exclusive lock is valid");
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 0, false)
+            .await
+            .expect("zero-length shared stacks over own exclusive");
+        // A 0-length range never conflicts with a positive-length range.
+        table
+            .acquire_range_lock(fid(2), oid(2), 200, 1, 0, 10, true)
+            .await
+            .expect("other open's exclusive over [0,10) unaffected by 0-byte lock");
+        table.release_range_lock(fid(1), oid(1), 0, 0).await.unwrap();
+        table.release_range_lock(fid(1), oid(1), 0, 0).await.unwrap();
+        let err = table
+            .release_range_lock(fid(1), oid(1), 0, 0)
+            .await
+            .expect_err("third unlock of the stacked 0-byte entries must miss");
+        assert!(matches!(err, LockConflict::RangeNotLocked));
     }
 
     #[tokio::test]
@@ -3501,21 +3520,45 @@ mod tests {
             len2 in 1u64..=1024,
         ) {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            let conflict: Option<String> = rt.block_on(async {
+            let rt_result: Result<(), String> = rt.block_on(async {
                 let table = OpenTable::new();
-                // Zero-length locks always return Err(ZeroLength) and are
-                // never stored — so a subsequent lock should never see them.
-                let _ = table
+                // A zero-length exclusive lock behaves like any stacked
+                // entry: positional intersection over u128 means it can
+                // conflict only with an identical 0-length exclusive
+                // re-acquire — never with a positive-length range
+                // (torture unlock "stacked 0-byte locks" asserts a 0-byte
+                // lock at 10 blocks another open's exclusive over [5,15),
+                // which the u128 math delivers because a 0-length range
+                // [10,10) intersects [5,15) positionally).
+                table
                     .acquire_range_lock(fid(1), oid(1), 100, 1, offset1, 0, true)
-                    .await;
-                match table.acquire_range_lock(fid(1), oid(2), 200, 1, offset2, len2, true).await {
-                    Ok(()) => None,
-                    Err(e) => Some(format!("zero-length lock blocked other: {:?}", e)),
+                    .await
+                    .expect("zero-length exclusive lock is valid");
+                match table
+                    .acquire_range_lock(fid(1), oid(2), 200, 1, offset2, len2, true)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // The only legal conflict here is positional: a
+                        // 0-byte lock at offset1 inside [offset2, offset2+len2)
+                        // intersecting — smbd blocks that too. Accept only
+                        // RangeConflict.
+                        if offset2 <= offset1 && offset1 <= offset2 + len2 {
+                            match e {
+                                LockConflict::RangeConflict { .. } => Ok(()),
+                                other => Err(format!("unexpected conflict type: {:?}", other)),
+                            }
+                        } else {
+                            Err(format!(
+                                "zero-length lock at {} blocked disjoint [{}, {}+{}): {:?}",
+                                offset1, offset2, offset2, len2, e
+                            ))
+                        }
+                    }
                 }
             });
-            if let Some(msg) = conflict {
-                prop_assert!(false, "{}", msg);
-            }
+            prop_assert!(rt_result.is_ok(), "{:?}", rt_result.err());
         }
 
         #[test]

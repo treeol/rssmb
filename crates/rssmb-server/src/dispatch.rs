@@ -4358,7 +4358,10 @@ async fn handle_close(
                 file_id = file_id_volatile,
                 "close: handle not found"
             );
-            error_response_for(Command::Close, NtStatus::InvalidHandle, &req.header)
+            // Close of an unknown/already-closed handle is FILE_CLOSED
+            // (MS-SMB2 3.3.5.16: fail with STATUS_FILE_CLOSED; torture
+            // connect.c:227 asserts exactly this on double-close).
+            error_response_for(Command::Close, NtStatus::FileClosed, &req.header)
         }
     }
 }
@@ -5988,8 +5991,20 @@ async fn handle_lock(
         _ => return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header),
     };
 
+    // lock_count == 0 is INVALID_PARAMETER (torture `valid-request`,
+    // MS-SMB2 2.2.21: LockCount must be at least 1).
+    if lock_req.locks.is_empty() {
+        return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+    }
+
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
+
+    // LOCK-specific: validate the persistent half of the FileId (forged
+    // persistent → FILE_CLOSED, torture valid-request lock.c:133).
+    if let Err(status) = check_lock_file_id_persistent(conn_state, &lock_req.file_id).await {
+        return error_response_for(Command::Lock, status, &req.header);
+    }
 
     // Look up the open handle, validating session/tree ownership.
     let file_id_volatile = lock_req.file_id.volatile;
@@ -6010,68 +6025,126 @@ async fn handle_lock(
         None => return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header),
     };
 
-    // Process each lock element. If any element fails, we roll back all
-    // previously acquired locks in this request (all-or-nothing per
-    // MS-SMB2 3.3.5.14: if any lock cannot be granted, the request fails
-    // and no locks from this request are applied).
+    // Process the lock elements exactly like smbd (source3/smbd/smb2_lock.c,
+    // verified against torture valid-request/unlock/multiple-unlock):
+    //
+    // 1. First-element flags switch (pre-loop):
+    //    - SHARED or EXCLUSIVE alone (no FAIL_IMMEDIATELY) with >1 element
+    //      → INVALID_PARAMETER; alone it is a BLOCKING lock (K5 pends on
+    //      conflict; a conflict-free blocking lock grants immediately).
+    //    - SHARED|FI, EXCLUSIVE|FI → normal immediate locks.
+    //    - UNLOCK → the whole request is an unlock request (only the first
+    //      element may carry the UNLOCK bit, MS-SMB2 3.3.5.14).
+    //    - anything else (0, type bit | UNLOCK, stray bits) →
+    //      INVALID_PARAMETER before any state changes.
+    // 2. Non-unlock requests with >1 element: every element must carry
+    //    FAIL_IMMEDIATELY (MS-SMB2 3.3.5.14.2 SHOULD) → INVALID_PARAMETER.
+    // 3. Unlock requests: ALL unlock elements are processed first (applied
+    //    unlocks stay applied); the first missing range fails the request
+    //    with RANGE_NOT_LOCKED (deferred-invalid elements lose to a real
+    //    unlock miss); invalid (type-bit/unknown) elements then fail with
+    //    INVALID_PARAMETER (MS-SMB2 3.3.5.14.1, torture multiple-unlock
+    //    Test4/Test10).
     use rssmb_proto::lock::lock_flags;
+
+    let elements = &lock_req.locks;
+    let first_flags = elements[0].flags;
+    let isunlock = first_flags == lock_flags::UNLOCK;
+
+    match first_flags {
+        lock_flags::SHARED | lock_flags::EXCLUSIVE => {
+            if elements.len() > 1 {
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            }
+        }
+        f if f == lock_flags::SHARED | lock_flags::FAIL_IMMEDIATELY
+            || f == lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY =>
+        {
+            // SHARED|FI or EXCLUSIVE|FI — normal immediate lock.
+        }
+        lock_flags::UNLOCK => {}
+        _ => {
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+        }
+    }
+
+    if !isunlock && elements.len() > 1 {
+        for el in elements {
+            if el.flags & lock_flags::FAIL_IMMEDIATELY == 0 {
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            }
+        }
+    }
 
     let mut acquired: Vec<(u64, u64, bool)> = Vec::new();
 
-    for element in &lock_req.locks {
+    if isunlock {
+        let mut saw_invalid = false;
+        for element in elements {
+            if element.flags != lock_flags::UNLOCK {
+                // Type bit | UNLOCK or unknown flags: deferred error — all
+                // valid unlock elements are processed first.
+                saw_invalid = true;
+                continue;
+            }
+            if let Err(_miss) = state
+                .open_table
+                .release_range_lock(file_id, entry.open_id, element.offset, element.length)
+                .await
+            {
+                return error_response_for(Command::Lock, NtStatus::RangeNotLocked, &req.header);
+            }
+        }
+        if saw_invalid {
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+        }
+        return build_lock_ok(&req);
+    }
+
+    for element in elements {
         let flags = element.flags;
         let offset = element.offset;
         let length = element.length;
+        let exclusive = flags & lock_flags::EXCLUSIVE != 0;
 
-        // UNLOCK flag: release a previously held lock. A range this open
-        // has not locked is NT_STATUS_RANGE_NOT_LOCKED (0xC000007E) — and
-        // when it happens mid-request, elements already processed in this
-        // request are rolled back per the all-or-nothing rule (MS-SMB2
-        // 3.3.5.14, torture `context`/`multiple-unlock`).
-        if flags & lock_flags::UNLOCK != 0 {
-            if let Err(_miss) = state
-                .open_table
-                .release_range_lock(file_id, entry.open_id, offset, length)
-                .await
-            {
+        // Per-element validation (smbd's second switch): a non-unlock
+        // request accepts only SHARED, EXCLUSIVE, SHARED|FI or
+        // EXCLUSIVE|FI — anything else (0, type|FI mixtures like
+        // SHARED-only on a later element, UNLOCK, unknown bits) is
+        // INVALID_PARAMETER (torture valid-request flag permutations).
+        match flags {
+            lock_flags::SHARED | lock_flags::EXCLUSIVE => {}
+            f if f == lock_flags::SHARED | lock_flags::FAIL_IMMEDIATELY
+                || f == lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY => {}
+            _ => {
                 for (o, l, _) in &acquired {
                     let _ = state
                         .open_table
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;
                 }
-                return error_response_for(Command::Lock, NtStatus::RangeNotLocked, &req.header);
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
             }
-            continue;
         }
 
-        // Validate flags: must be SHARED or EXCLUSIVE (not both).
-        let exclusive = flags & lock_flags::EXCLUSIVE != 0;
-        let shared = flags & lock_flags::SHARED != 0;
-        if (exclusive && shared) || (!exclusive && !shared) {
-            // Invalid flags combination.
-            // Roll back any locks acquired so far.
+        // >63-bit lock requests (offset+length overflows u64) are
+        // NT_STATUS_INVALID_LOCK_RANGE (0xC00001A1; torture valid-request
+        // ">63-bit lock requests").
+        if length > 0 && offset.checked_add(length).is_none() {
             for (o, l, _) in &acquired {
                 let _ = state
                     .open_table
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
             }
-            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            return error_response_for(Command::Lock, NtStatus::InvalidLockRange, &req.header);
         }
 
-        // Zero-length ranges are invalid for locking.
-        if length == 0 {
-            for (o, l, _) in &acquired {
-                let _ = state
-                    .open_table
-                    .release_range_lock(file_id, entry.open_id, *o, *l)
-                    .await;
-            }
-            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
-        }
-
-        // Attempt to acquire the lock.
+        // Zero-length locks are VALID entries (torture `lock` "Trying 0/0
+        // lock" and `zerobytelength` — MS-SMB2 2.2.21 allows Length 0;
+        // smbd treats them like any other stacked entry). The u128 overlap
+        // math makes a 0-length range conflict with nothing, and only an
+        // exact (offset, 0) unlock removes it.
         match state
             .open_table
             .acquire_range_lock(
@@ -6096,8 +6169,9 @@ async fn handle_lock(
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;
                 }
-                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED; blocking locks are
-                // not supported yet, so we always return LOCK_NOT_GRANTED.
+                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED. Blocking locks (no
+                // FAIL_IMMEDIATELY) will pend in K5; for now they also
+                // fail immediately with LOCK_NOT_GRANTED.
                 return error_response_for(
                     Command::Lock,
                     NtStatus::LockNotGranted,
@@ -6107,10 +6181,6 @@ async fn handle_lock(
         }
     }
 
-    let response = build_response(
-        &req.header,
-        ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
-    );
     if !acquired.is_empty() {
         let (breaks, waiters) = state
             .open_table
@@ -6119,7 +6189,15 @@ async fn handle_lock(
         send_break_notifications(&breaks).await;
         state.open_table.arm_break_timers(&waiters);
     }
-    FramedResponse::Plain(response)
+
+    fn build_lock_ok(req: &rssmb_proto::plain::PlainRequest) -> FramedResponse {
+        FramedResponse::Plain(build_response(
+            &req.header,
+            ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
+        ))
+    }
+
+    build_lock_ok(&req)
 }
 
 /// Encode and send unsolicited SMB2 OPLOCK_BREAK / LEASE_BREAK notifications
@@ -6858,9 +6936,13 @@ async fn lookup_open_for_session(
 ) -> Result<OpenEntry, NtStatus> {
     let opens_ref = conn_state.opens_ref();
     let opens = opens_ref.read().await;
-    let entry = opens
-        .get(&file_id_volatile)
-        .ok_or(NtStatus::InvalidHandle)?;
+    // Note: the generic missing-handle status stays InvalidHandle —
+    // blanket FILE_CLOSED regressed smb2.dir/getinfo/setinfo (their
+    // torture suites expect different statuses for their not-found
+    // paths). FILE_CLOSED is returned only where asserted:
+    // CLOSE of a closed handle (3.3.5.16) and forged persistent halves
+    // in LOCK (below).
+    let entry = opens.get(&file_id_volatile).ok_or(NtStatus::InvalidHandle)?;
     // Validate that the handle belongs to this session.
     if entry.session_id != session_id {
         return Err(NtStatus::InvalidHandle);
@@ -6870,6 +6952,24 @@ async fn lookup_open_for_session(
         return Err(NtStatus::InvalidHandle);
     }
     Ok(entry.clone())
+}
+
+/// LOCK-specific handle check: valid-request corrupts the PERSISTENT half
+/// of the FileId (handle.data[0]) and asserts NT_STATUS_FILE_CLOSED
+/// (lock.c:133). We key opens on the volatile half only, so the forged
+/// id collides with a live open; detect it by re-deriving the expected
+/// persistent value from the connection's id allocation.
+async fn check_lock_file_id_persistent(
+    conn_state: &ConnState,
+    file_id: &rssmb_proto::create::FileId,
+) -> Result<(), NtStatus> {
+    let expected = conn_state
+        .persistent_base_val()
+        .wrapping_add(file_id.volatile);
+    if file_id.persistent != expected {
+        return Err(NtStatus::FileClosed);
+    }
+    Ok(())
 }
 
 /// Build an error response carrying the request's header fields so the
@@ -7637,8 +7737,9 @@ mod tests {
         // GVFS sends CLOSE with flags=0 (no POSTQUERY_ATTRIB).
         // Before the fix, smb-msg asserted flags==POSTQUERY and the request
         // was rejected, causing the client to hang. This test verifies that
-        // a CLOSE with flags=0 on a non-existent handle returns InvalidHandle
-        // (i.e. the request parsed successfully; the failure is just no handle).
+        // a CLOSE with flags=0 on a non-existent handle returns FileClosed
+        // (MS-SMB2 3.3.5.16: close of a handle that is not open is
+        // STATUS_FILE_CLOSED; the request itself parsed fine).
         let state = make_test_state();
         let conn = make_conn_state();
         establish_negotiation(&state, &conn).await;
@@ -7672,15 +7773,16 @@ mod tests {
         let resp = handle_message(&state, &conn, framed, &[], None).await;
         let resp = resp.expect("CLOSE should produce a response");
         match resp {
-            // No handle → InvalidHandle is correct; the important thing is
-            // that we got here at all (the request parsed).
+            // No handle → FileClosed is correct (MS-SMB2 3.3.5.16); the
+            // important thing is that we got here at all (the request
+            // parsed).
             FramedResponse::Error {
                 command, status, ..
             } => {
                 assert_eq!(command, Command::Close);
-                assert_eq!(status, NtStatus::InvalidHandle);
+                assert_eq!(status, NtStatus::FileClosed);
             }
-            other => panic!("expected Error(InvalidHandle), got {:?}", other),
+            other => panic!("expected Error(FileClosed), got {:?}", other),
         }
     }
 
@@ -7730,7 +7832,7 @@ mod tests {
                     "propagated error lost the effective session"
                 );
                 assert_eq!(ps[1].header.tree_id, Some(7));
-                assert_eq!(ps[1].header.status, NtStatus::InvalidHandle.to_u32());
+                assert_eq!(ps[1].header.status, NtStatus::FileClosed.to_u32());
             }
             other => panic!("expected Compound, got {:?}", other),
         }
