@@ -3740,8 +3740,8 @@ mod tests {
             let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
             rt.block_on(async {
                 let table = OpenTable::new();
-                table.release_range_lock(fid(1), oid(1), offset, len).await;
-                table.release_range_lock(fid(1), oid(1), offset, len).await;
+                let _ = table.release_range_lock(fid(1), oid(1), offset, len).await;
+                let _ = table.release_range_lock(fid(1), oid(1), offset, len).await;
             });
         }
     }
