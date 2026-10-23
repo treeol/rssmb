@@ -22,6 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share mount (not only from the periodic sweeper), and (c) fresh temps
   survive the startup sweep.
 
+### Fixed
+
+- **`publish_on_close`: abort orphaning data on attach rollback.** When
+  an attached handle (a second CREATE on a pending name) rolled back to
+  zero open_count via `abort()`, the temp file — carrying another
+  handle's written data — was orphaned (entry removed, temp left on
+  disk with no pending entry to publish it). `abort()` now returns
+  `(temp, delete_on_close)` — the same shape as `close()` — and the
+  `rollback_on_err` macro publishes the temp (rename → final) instead
+  of orphaning it. Only a freshly-created empty temp (`created_here`)
+  or a `delete_on_close` temp is unlinked.
+- **`publish_on_close`: rename + take_destination not atomic.** The
+  three-step `rename → take_destination → rename` dance held the
+  table-level write lock three separate times, leaving a window where
+  both source and destination were absent from the map. Replaced with
+  `rename_with_replace()` — one method, one write lock, one atomic
+  table-level operation that does the move and collision handling
+  (including discarding a displaced destination) in a single lock hold.
+
 ### Changed
 
 - **`multichannel` default flipped to `false`.** SMB 3.x multichannel is

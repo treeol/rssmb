@@ -9,3 +9,6 @@
 /tmp/
 /fuzz/Cargo.lock
 /fuzz/target/
+.target/
+.cargo/
+.rustup/
