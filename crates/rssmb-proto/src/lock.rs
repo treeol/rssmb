@@ -20,9 +20,10 @@ pub struct LockRequest {
     #[bw(try_calc(u16::try_from(locks.len())))]
     #[br(temp)]
     lock_count: u16,
-    #[bw(calc = 0)]
-    #[br(temp)]
-    lock_sequence: u32,
+    /// LockSequence (MS-SMB2 2.2.21): bucket number in the high bits
+    /// (sequence >> 4, buckets 1..=64 valid), sequence value in the low
+    /// nibble. The server uses it to detect replayed lock requests.
+    pub lock_sequence: u32,
     /// The file handle to lock.
     pub file_id: FileId,
     /// Array of LOCK_ELEMENT structures (each 24 bytes).

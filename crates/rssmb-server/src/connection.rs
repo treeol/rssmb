@@ -1922,6 +1922,7 @@ mod tests {
                 pipe_state: None,
                 durable_guid: None,
                 durable_persistent_id: None,
+                lock_sequence_array: Default::default(),
             },
         );
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();

@@ -65,6 +65,13 @@ pub struct OpenEntry {
     /// persistent id in the DurableTable's v1 side table. `None` for
     /// non-durable and v2-durable opens.
     pub durable_persistent_id: Option<u64>,
+    /// LockSequence replay-detection array (MS-SMB2 3.3.5.14; smbd's
+    /// fsp->op->global->lock_sequence_array): 64 buckets, each storing the
+    /// last successfully processed sequence value (low nibble), 0xFF =
+    /// invalid/never-set. Enabled for ALL opens when the server
+    /// advertises SMB2_CAP_MULTI_CHANNEL (which we do) or the open is
+    /// durable — same rule smbd implements from the spec.
+    pub lock_sequence_array: Arc<std::sync::Mutex<[u8; 64]>>,
 }
 
 /// Per-open directory enumeration cursor (MS-SMB2 3.3.5.18).
@@ -3340,6 +3347,7 @@ async fn handle_create(
                 } else {
                     Some(file_id.persistent)
                 },
+                lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
             },
         );
 
@@ -3553,6 +3561,7 @@ async fn handle_create(
                 ))),
                 durable_guid: None,
                 durable_persistent_id: None,
+                lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
             },
         );
         let create_response = rssmb_proto::create::CreateResponse {
@@ -4023,6 +4032,7 @@ async fn handle_create(
                     pipe_state: None,
                     durable_guid,
                     durable_persistent_id,
+                    lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
                 },
             );
 
@@ -5858,6 +5868,7 @@ async fn handle_ioctl(
     const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
     const FSCTL_DFS_GET_REFERRALS_EX: u32 = 0x0006_01B0;
     const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
+    const FSCTL_LMR_REQ_RESILIENCY: u32 = 0x0014_01F4;
     const FSCTL_QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
     const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
     const STATUS_NOT_FOUND: u32 = 0xC000_0225;
@@ -6082,9 +6093,42 @@ async fn handle_ioctl(
                 }
             }
         }
+        FSCTL_LMR_REQ_RESILIENCY => {
+            // MS-SMB2 3.3.5.15.15: client asks the server to make the open
+            // resilient (min 1 s timeout in the 8-byte input). We have no
+            // durable-handle wipe on connection loss for plain opens, so
+            // this is a validated no-op: require a live file handle and
+            // reply OK (torture replay_broken_windows asserts OK at
+            // lock.c:2992; the old fall-through returned
+            // INVALID_DEVICE_REQUEST).
+            let file_id_volatile = io.file_id.volatile;
+            let session_id = req.header.session_id;
+            let tree_id = req.header.tree_id.unwrap_or(0);
+            if let Err(status) =
+                lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await
+            {
+                return error_response_for(Command::Ioctl, status, &req.header);
+            }
+            NtStatus::Success
+        }
         _ => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
     };
     error_response_for(Command::Ioctl, status, &req.header)
+}
+
+/// Re-arm the LockSequence bucket with the incoming value after a request
+/// completed successfully (smbd stores `state->lock_sequence_value` in the
+/// cleanup fn on success only).
+fn rearm_lock_sequence(
+    seq_element: &Option<Arc<std::sync::Mutex<[u8; 64]>>>,
+    seq_bucket: usize,
+    seq_value: u8,
+) {
+    if let Some(arr) = seq_element {
+        if (1..=64).contains(&seq_bucket) {
+            arr.lock().unwrap()[seq_bucket - 1] = seq_value;
+        }
+    }
 }
 
 /// LOCK — acquire or release byte-range locks (MS-SMB2 3.3.5.14).
@@ -6122,6 +6166,18 @@ async fn handle_lock(
         return error_response_for(Command::Lock, status, &req.header);
     }
 
+    // LockSequence replay detection (MS-SMB2 3.3.5.14; smbd
+    // smbd_smb2_lock_send): the server advertises MULTI_CHANNEL, so
+    // checking is enabled for all opens (spec SHOULD; also enabled for
+    // durable handles). Bucket = sequence >> 4 (only 1..=64 valid);
+    // value = sequence & 0xF. A replayed (bucket == stored value) request
+    // is ignored: the request returns the ORIGINAL result — replayed
+    // success is succeeded silently again, replayed failure is also
+    // suppressed, which is what the torture replay_* subtests assert.
+    let lock_sequence = lock_req.lock_sequence;
+    let seq_bucket = (lock_sequence >> 4) as usize;
+    let seq_value = (lock_sequence & 0xF) as u8;
+
     // Look up the open handle, validating session/tree ownership. A handle
     // that is gone (closed/tdis/logoff) is FILE_CLOSED for LOCK (torture
     // cancel-logoff lock.c:1166 and valid-request lock.c:133 both assert
@@ -6147,6 +6203,28 @@ async fn handle_lock(
         Some(fid) => fid,
         None => return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header),
     };
+
+    // LockSequence check (needs the open; see comment above). smbd runs
+    // this BEFORE parsing element flags — a replayed request short-circuits
+    // to OK regardless of its content.
+    let seq_element: Option<Arc<std::sync::Mutex<[u8; 64]>>> = if (1..=64).contains(&seq_bucket) {
+        Some(entry.lock_sequence_array.clone())
+    } else {
+        None
+    };
+    if let Some(arr) = &seq_element {
+        let mut a = arr.lock().unwrap();
+        let stored = &mut a[seq_bucket - 1];
+        if *stored == seq_value {
+            // Replay of an already-successful request: ignore completely
+            // (return OK, touch nothing) — smbd tevent_req_done path.
+            return build_lock_ok(&req);
+        }
+        // Not a replay: invalidate the bucket while processing; it is
+        // re-armed with the incoming value only on success (matching
+        // smbd's cleanup fn).
+        *stored = 0xFF;
+    }
 
     // Process the lock elements exactly like smbd (source3/smbd/smb2_lock.c,
     // verified against torture valid-request/unlock/multiple-unlock):
@@ -6221,6 +6299,7 @@ async fn handle_lock(
         if saw_invalid {
             return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
         }
+        rearm_lock_sequence(&seq_element, seq_bucket, seq_value);
         return build_lock_ok(&req);
     }
 
@@ -6416,6 +6495,7 @@ async fn handle_lock(
         state.open_table.arm_break_timers(&waiters);
     }
 
+    rearm_lock_sequence(&seq_element, seq_bucket, seq_value);
     fn build_lock_ok(req: &rssmb_proto::plain::PlainRequest) -> FramedResponse {
         FramedResponse::Plain(build_response(
             &req.header,
