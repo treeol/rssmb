@@ -10,7 +10,6 @@
 //! and trailing-data inclusion (Mashūra findings 1 and 3).
 
 /// SPNEGO OID: 1.3.6.1.5.5.2
-#[allow(dead_code)]
 const SPNEGO_OID: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
 /// NTLMSSP OID: 1.3.6.1.4.1.311.2.2.10
