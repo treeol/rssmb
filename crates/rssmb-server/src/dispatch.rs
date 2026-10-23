@@ -6023,12 +6023,25 @@ async fn handle_lock(
         let offset = element.offset;
         let length = element.length;
 
-        // UNLOCK flag: release a previously held lock.
+        // UNLOCK flag: release a previously held lock. A range this open
+        // has not locked is NT_STATUS_RANGE_NOT_LOCKED (0xC000007E) — and
+        // when it happens mid-request, elements already processed in this
+        // request are rolled back per the all-or-nothing rule (MS-SMB2
+        // 3.3.5.14, torture `context`/`multiple-unlock`).
         if flags & lock_flags::UNLOCK != 0 {
-            state
+            if let Err(_miss) = state
                 .open_table
                 .release_range_lock(file_id, entry.open_id, offset, length)
-                .await;
+                .await
+            {
+                for (o, l, _) in &acquired {
+                    let _ = state
+                        .open_table
+                        .release_range_lock(file_id, entry.open_id, *o, *l)
+                        .await;
+                }
+                return error_response_for(Command::Lock, NtStatus::RangeNotLocked, &req.header);
+            }
             continue;
         }
 
@@ -6039,7 +6052,7 @@ async fn handle_lock(
             // Invalid flags combination.
             // Roll back any locks acquired so far.
             for (o, l, _) in &acquired {
-                state
+                let _ = state
                     .open_table
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
@@ -6050,7 +6063,7 @@ async fn handle_lock(
         // Zero-length ranges are invalid for locking.
         if length == 0 {
             for (o, l, _) in &acquired {
-                state
+                let _ = state
                     .open_table
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
@@ -6078,7 +6091,7 @@ async fn handle_lock(
             Err(_conflict) => {
                 // Lock conflict — roll back all locks acquired so far.
                 for (o, l, _) in &acquired {
-                    state
+                    let _ = state
                         .open_table
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;

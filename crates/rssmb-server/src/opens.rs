@@ -666,6 +666,10 @@ pub enum LockConflict {
     },
     #[error("invalid lock range: zero length")]
     ZeroLength,
+    /// UNLOCK referenced a range this open has not locked (MS-SMB2 3.3.5.14
+    /// — NT_STATUS_RANGE_NOT_LOCKED, 0xC000007E).
+    #[error("unlock: range is not locked")]
+    RangeNotLocked,
 }
 
 /// Check whether two byte ranges `[o1, o1+l1)` and `[o2, o2+l2)` overlap.
@@ -1106,6 +1110,13 @@ impl OpenTable {
     /// with any lock held by a different open. A write conflicts with ANY
     /// overlapping lock (shared or exclusive) held by another open,
     /// per MS-SMB2 mandatory locking semantics.
+    ///
+    /// Same-open semantics (Samba smbd, verified by torture `rw-shared` /
+    /// `rw-exclusive`): the open's own EXCLUSIVE locks permit its own
+    /// writes, but its own SHARED locks still conflict — requiring the
+    /// write to go through the lock/unlock protocol is the point of a
+    /// shared lock (`rw-shared` asserts write-through-h1 fails with
+    /// FILE_LOCK_CONFLICT while h1 holds the shared lock).
     #[instrument(skip(self, file_id))]
     pub async fn check_range_lock_for_write(
         &self,
@@ -1120,13 +1131,15 @@ impl OpenTable {
         let locks = self.range_locks.read().await;
         if let Some(list) = locks.get(&file_id) {
             for lock in list {
-                if lock.open_id == owner_open_id {
+                if lock.open_id == owner_open_id && lock.exclusive {
+                    // Own exclusive lock: the holder's own writes are fine.
                     continue;
                 }
                 if !ranges_overlap(offset, length, lock.offset, lock.length) {
                     continue;
                 }
-                // Any overlapping lock by another open blocks writes.
+                // Any other overlapping lock (other open, or own shared)
+                // blocks writes.
                 return Err(LockConflict::RangeConflict {
                     file_id,
                     offset: lock.offset,
@@ -1150,6 +1163,12 @@ impl OpenTable {
     /// For an exclusive lock, any overlapping lock by a different open
     /// (even shared) conflicts. For a shared lock, only an overlapping
     /// exclusive lock by a different open conflicts.
+    ///
+    /// Same-open semantics (Samba smbd, verified by torture `stacking` /
+    /// `auto_unlock`): a new EXCLUSIVE lock conflicts with ANY overlapping
+    /// lock held by the same open (re-acquiring exclusive over an own
+    /// exclusive or shared lock → LOCK_NOT_GRANTED — no auto-unlock), while
+    /// a new SHARED lock stacks freely over the open's own locks.
     #[instrument(skip(self, file_id, owner_open_id))]
     #[allow(clippy::too_many_arguments)]
     pub async fn acquire_range_lock(
@@ -1169,6 +1188,17 @@ impl OpenTable {
         if let Some(list) = locks.get(&file_id) {
             for lock in list {
                 if lock.open_id == owner_open_id {
+                    // Same open: exclusive acquisition conflicts with any
+                    // overlapping own lock; shared stacks over own locks.
+                    if exclusive && ranges_overlap(offset, length, lock.offset, lock.length) {
+                        return Err(LockConflict::RangeConflict {
+                            file_id,
+                            offset: lock.offset,
+                            length: lock.length,
+                            open_id: lock.open_id,
+                            session_id: lock.session_id,
+                        });
+                    }
                     continue;
                 }
                 if !ranges_overlap(offset, length, lock.offset, lock.length) {
@@ -1198,10 +1228,15 @@ impl OpenTable {
         Ok(())
     }
 
-    /// Release a byte-range lock on `file_id` for the open identified by
+    /// Release ONE byte-range lock on `file_id` for the open identified by
     /// `owner_open_id`. Only a lock with the exact same `(offset, length)`
-    /// is removed. If no matching lock is found, this is a no-op (MS-SMB2
-    /// allows unlocking a non-held range without error).
+    /// is removed; when several identical entries are held (Samba smbd
+    /// treats locks as a stack — torture `stacking` unlocks one at a time
+    /// and expects the extra unlock to fail with RANGE_NOT_LOCKED), exactly
+    /// one is removed. Returns `Err(RangeNotLocked)` when no matching entry
+    /// exists (a no-op unlock of a never-held range stays silently OK per
+    /// MS-SMB2 3.3.5.14; the error is only for callers that need the
+    /// missing-entry signal).
     #[instrument(skip(self, file_id, owner_open_id))]
     pub async fn release_range_lock(
         &self,
@@ -1209,16 +1244,21 @@ impl OpenTable {
         owner_open_id: OpenId,
         offset: u64,
         length: u64,
-    ) {
+    ) -> Result<(), LockConflict> {
         let mut locks = self.range_locks.write().await;
         if let Some(list) = locks.get_mut(&file_id) {
-            list.retain(|l| {
-                !(l.open_id == owner_open_id && l.offset == offset && l.length == length)
-            });
-            if list.is_empty() {
-                locks.remove(&file_id);
+            if let Some(pos) = list
+                .iter()
+                .position(|l| l.open_id == owner_open_id && l.offset == offset && l.length == length)
+            {
+                list.remove(pos);
+                if list.is_empty() {
+                    locks.remove(&file_id);
+                }
+                return Ok(());
             }
         }
+        Err(LockConflict::RangeNotLocked)
     }
 
     /// Release all byte-range locks held by `owner_open_id` on any file.
@@ -2630,13 +2670,107 @@ mod tests {
             .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 100, true)
             .await
             .expect("exclusive lock should succeed");
-        // Same open can re-lock overlapping range (upgrade).
+        // Shared stacks over the open's own exclusive lock (K2: torture
+        // `stacking` — "stacking a shared on top of an exclusive lock
+        // succeeds").
         table
-            .acquire_range_lock(fid(1), oid(1), 100, 1, 50, 200, true)
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 50, 200, false)
             .await
-            .expect("same open can lock overlapping range");
-        table.release_range_lock(fid(1), oid(1), 0, 100).await;
-        table.release_range_lock(fid(1), oid(1), 50, 200).await;
+            .expect("same open can stack shared over own exclusive");
+        table.release_range_lock(fid(1), oid(1), 0, 100).await.unwrap();
+        table.release_range_lock(fid(1), oid(1), 50, 200).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lock_same_open_exclusive_over_own_lock_conflicts() {
+        // K2: re-acquiring an exclusive lock over an overlapping own lock
+        // (exclusive or shared) fails — no auto-unlock (torture
+        // `auto_unlock`: repeated identical exclusive lock →
+        // LOCK_NOT_GRANTED).
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, true)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, true)
+            .await
+            .expect_err("exclusive over own exclusive must conflict");
+        // Sanity: shared stacks over the own exclusive lock (torture
+        // `stacking`), and stacking does not grant exclusive rights.
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
+            .await
+            .expect("shared stacks over own exclusive");
+        // Exclusive over the same range (now also covered by own shared)
+        // still conflicts.
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, true)
+            .await
+            .expect_err("exclusive over own shared must conflict");
+        // Disjoint own shared lock, then exclusive over it: conflict.
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 20, 10, false)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 20, 10, true)
+            .await
+            .expect_err("exclusive over own shared (disjoint lock) must conflict");
+    }
+
+    #[tokio::test]
+    async fn lock_unlock_removes_one_entry_and_miss_is_error() {
+        // K2: locks stack — two identical locks need two unlocks, and the
+        // third unlock reports RangeNotLocked (torture `stacking`: the 4th
+        // unlock after 3 locks → RANGE_NOT_LOCKED).
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
+            .await
+            .unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
+            .await
+            .unwrap();
+        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        // One entry still held: another open's exclusive still conflicts.
+        table
+            .acquire_range_lock(fid(1), oid(2), 200, 1, 0, 10, true)
+            .await
+            .expect_err("one stacked entry remains");
+        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        let err = table
+            .release_range_lock(fid(1), oid(1), 0, 10)
+            .await
+            .expect_err("unlock of a now-unheld range must report miss");
+        assert!(matches!(err, LockConflict::RangeNotLocked));
+    }
+
+    #[tokio::test]
+    async fn lock_write_own_exclusive_ok_own_shared_conflicts() {
+        // K2: the open's own exclusive lock permits its own writes, but its
+        // own shared lock still conflicts (torture `rw-exclusive` /
+        // `rw-shared` write_h1 expectations).
+        let table = OpenTable::new();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, true)
+            .await
+            .unwrap();
+        table
+            .check_range_lock_for_write(fid(1), oid(1), 5, 10)
+            .await
+            .expect("own exclusive permits own write");
+        table.release_range_lock(fid(1), oid(1), 0, 10).await.unwrap();
+        table
+            .acquire_range_lock(fid(1), oid(1), 100, 1, 0, 10, false)
+            .await
+            .unwrap();
+        let err = table
+            .check_range_lock_for_write(fid(1), oid(1), 5, 10)
+            .await
+            .expect_err("own shared lock must block own write");
+        assert!(matches!(err, LockConflict::RangeConflict { .. }));
     }
 
     #[tokio::test]
@@ -2654,7 +2788,9 @@ mod tests {
             LockConflict::RangeConflict { open_id, .. } => {
                 assert_eq!(open_id, oid(1));
             }
-            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+            LockConflict::ZeroLength | LockConflict::RangeNotLocked => {
+                panic!("expected RangeConflict, got {:?}", err)
+            }
         }
     }
 
@@ -2702,7 +2838,9 @@ mod tests {
                 // The conflict could be with either existing lock (oid 1 or oid 2).
                 assert!(open_id == oid(1) || open_id == oid(2));
             }
-            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+            LockConflict::ZeroLength | LockConflict::RangeNotLocked => {
+                panic!("expected RangeConflict, got {:?}", err)
+            }
         }
     }
 
@@ -2719,15 +2857,19 @@ mod tests {
             .expect_err("shared lock should conflict with existing exclusive");
         match err {
             LockConflict::RangeConflict { open_id, .. } => assert_eq!(open_id, oid(1)),
-            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+            LockConflict::ZeroLength | LockConflict::RangeNotLocked => {
+                panic!("expected RangeConflict, got {:?}", err)
+            }
         }
     }
 
     #[tokio::test]
     async fn lock_release_nonexistent_is_noop() {
         let table = OpenTable::new();
-        // Releasing a lock that doesn't exist should not panic.
-        table.release_range_lock(fid(1), oid(1), 0, 100).await;
+        // Releasing a lock that doesn't exist should not panic; via the
+        // SMB2 UNLOCK path the miss maps to RANGE_NOT_LOCKED, the raw API
+        // just reports it.
+        let _ = table.release_range_lock(fid(1), oid(1), 0, 100).await;
     }
 
     #[tokio::test]
@@ -2778,7 +2920,9 @@ mod tests {
             .expect_err("write should conflict with shared lock by other open");
         match err {
             LockConflict::RangeConflict { open_id, .. } => assert_eq!(open_id, oid(1)),
-            LockConflict::ZeroLength => panic!("expected RangeConflict, got ZeroLength"),
+            LockConflict::ZeroLength | LockConflict::RangeNotLocked => {
+                panic!("expected RangeConflict, got {:?}", err)
+            }
         }
     }
 

@@ -55,6 +55,9 @@ pub enum NtStatus {
     /// Named pipe empty (0xC00000D9) — read on a pipe with no data
     /// available (MS-ERREF §2.3.1). 0xC0000050 is STATUS_EA_TOO_LARGE.
     PipeEmpty,
+    /// Range not locked (0xC000007E) — UNLOCK of a byte range the open has
+    /// not locked (MS-ERREF §2.3.1; MS-SMB2 3.3.5.14).
+    RangeNotLocked,
     /// Object name invalid (0xC0000033) — invalid path/name
     ObjectNameInvalid,
     /// Sharing violation (0xC0000043)
@@ -119,6 +122,7 @@ impl NtStatus {
             NtStatus::LockNotGranted => 0xC0000055,
             NtStatus::FileLockConflict => 0xC0000054,
             NtStatus::PipeEmpty => 0xC00000D9,
+            NtStatus::RangeNotLocked => 0xC000007E,
             NtStatus::ObjectNameInvalid => 0xC0000033,
             NtStatus::SharingViolation => 0xC0000043,
             NtStatus::FileIsADirectory => 0xC00000BA,
@@ -181,6 +185,7 @@ impl NtStatus {
             0xC0000055 => NtStatus::LockNotGranted,
             0xC0000054 => NtStatus::FileLockConflict,
             0xC00000D9 => NtStatus::PipeEmpty,
+            0xC000007E => NtStatus::RangeNotLocked,
             0xC05D0000 => NtStatus::SmbNoPreauthIntegrityHashOverlap,
             _ => NtStatus::Other(val),
         }
