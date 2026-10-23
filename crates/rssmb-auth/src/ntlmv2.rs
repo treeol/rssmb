@@ -256,6 +256,36 @@ pub fn has_timestamp(nt_response: &[u8]) -> bool {
     }
 }
 
+/// Extract the MsvAvTimestamp value as a Windows FILETIME (100ns ticks
+/// since 1601-01-01). Returns None if the AV pair is absent or not 8
+/// bytes (MS-NLMP 2.2.2.7).
+pub fn get_timestamp(nt_response: &[u8]) -> Option<u64> {
+    match find_av_pair(nt_response, MSV_AV_TIMESTAMP) {
+        Some(v) if v.len() == 8 => Some(u64::from_le_bytes(v[..8].try_into().unwrap())),
+        _ => None,
+    }
+}
+
+/// Convert a Windows FILETIME (100ns since 1601-01-01) to Unix epoch
+/// seconds. (11644473600 = seconds between 1601-01-01 and 1970-01-01.)
+pub fn filetime_to_unix_secs(ft: u64) -> i64 {
+    (ft / 10_000_000) as i64 - 11_644_473_600
+}
+
+/// Check whether the MsvAvTimestamp in the NTLMv2 blob is within
+/// `max_skew_secs` of `now_unix_secs`. Returns true if the timestamp
+/// is present and fresh, false if absent or stale.
+pub fn is_timestamp_fresh(nt_response: &[u8], now_unix_secs: i64, max_skew_secs: u64) -> bool {
+    match get_timestamp(nt_response) {
+        Some(ft) => {
+            let ts = filetime_to_unix_secs(ft);
+            let diff = (ts - now_unix_secs).abs();
+            diff <= max_skew_secs as i64
+        }
+        None => false,
+    }
+}
+
 /// Verify the AUTHENTICATE message MIC (MS-NLMP 3.2.5.1.2).
 ///
 /// The MIC is at offset 72 in the AUTHENTICATE message. It is computed as
@@ -630,6 +660,87 @@ mod tests {
         nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
         nt_response.extend_from_slice(&0u16.to_le_bytes());
         assert!(!has_timestamp(&nt_response));
+    }
+
+    #[test]
+    fn get_timestamp_extracts_filetime() {
+        let auth = make_authenticate_with_mic(&[0x42u8; 16], b"neg", b"chal", "user", "DOM", true);
+        let nt_len = u16::from_le_bytes([auth[20], auth[21]]) as usize;
+        let nt_off = u32::from_le_bytes([auth[24], auth[25], auth[26], auth[27]]) as usize;
+        let nt_response = &auth[nt_off..nt_off + nt_len];
+        // make_authenticate_with_mic uses a zero timestamp (0x00)
+        assert_eq!(get_timestamp(nt_response), Some(0));
+    }
+
+    #[test]
+    fn is_timestamp_fresh_current() {
+        // Build an NTLMv2 blob with a real timestamp
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let now_filetime = (now_unix + 11_644_473_600) as u64 * 10_000_000;
+
+        let mut nt_response = vec![0u8; 44]; // 16 NTProofStr + 28 blob header
+                                             // MsvAvTimestamp with the current time
+        nt_response.extend_from_slice(&MSV_AV_TIMESTAMP.to_le_bytes());
+        nt_response.extend_from_slice(&8u16.to_le_bytes());
+        nt_response.extend_from_slice(&now_filetime.to_le_bytes());
+        // EOL
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+
+        assert!(is_timestamp_fresh(&nt_response, now_unix, 600));
+    }
+
+    #[test]
+    fn is_timestamp_fresh_stale_rejected() {
+        // A timestamp 24h ago should be rejected with a 10min window
+        let now_unix = 1_700_000_000i64;
+        let stale_unix = now_unix - 86400; // 24h ago
+        let stale_filetime = (stale_unix + 11_644_473_600) as u64 * 10_000_000;
+
+        let mut nt_response = vec![0u8; 44];
+        nt_response.extend_from_slice(&MSV_AV_TIMESTAMP.to_le_bytes());
+        nt_response.extend_from_slice(&8u16.to_le_bytes());
+        nt_response.extend_from_slice(&stale_filetime.to_le_bytes());
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+
+        assert!(!is_timestamp_fresh(&nt_response, now_unix, 600));
+    }
+
+    #[test]
+    fn is_timestamp_fresh_within_skew() {
+        // 5 min ago should pass with 10min window
+        let now_unix = 1_700_000_000i64;
+        let ts_unix = now_unix - 300;
+        let ts_filetime = (ts_unix + 11_644_473_600) as u64 * 10_000_000;
+
+        let mut nt_response = vec![0u8; 44];
+        nt_response.extend_from_slice(&MSV_AV_TIMESTAMP.to_le_bytes());
+        nt_response.extend_from_slice(&8u16.to_le_bytes());
+        nt_response.extend_from_slice(&ts_filetime.to_le_bytes());
+        nt_response.extend_from_slice(&MSV_AV_EOL.to_le_bytes());
+        nt_response.extend_from_slice(&0u16.to_le_bytes());
+
+        assert!(is_timestamp_fresh(&nt_response, now_unix, 600));
+    }
+
+    #[test]
+    fn is_timestamp_fresh_absent() {
+        let nt_response = vec![0u8; 44]; // no timestamp AV pair
+        assert!(!is_timestamp_fresh(&nt_response, 1_700_000_000, 600));
+    }
+
+    #[test]
+    fn filetime_to_unix_conversion() {
+        // Unix epoch (1970-01-01) = 11644473600 * 10^7 in FILETIME
+        assert_eq!(filetime_to_unix_secs(11_644_473_600 * 10_000_000), 0);
+        // A known time: 2024-01-01T00:00:00Z = 1704067200 Unix
+        // = (1704067200 + 11644473600) * 10^7
+        let ft = (1_704_067_200i64 + 11_644_473_600) as u64 * 10_000_000;
+        assert_eq!(filetime_to_unix_secs(ft), 1_704_067_200);
     }
 
     #[test]

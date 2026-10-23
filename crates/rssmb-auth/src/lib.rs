@@ -198,6 +198,8 @@ pub struct NtlmAuthProvider {
     guest_access: bool,
     /// Whether to require MsvAvTimestamp in the NTLMv2 blob (anti-replay).
     require_timestamp: bool,
+    /// Maximum clock skew (seconds) for timestamp freshness checks.
+    max_clock_skew_secs: u64,
 }
 
 impl NtlmAuthProvider {
@@ -208,6 +210,7 @@ impl NtlmAuthProvider {
             identities: Arc::new(store.to_identity_store()),
             guest_access: false,
             require_timestamp: false,
+            max_clock_skew_secs: 0,
         }
     }
 
@@ -219,6 +222,7 @@ impl NtlmAuthProvider {
             identities: Arc::new(store),
             guest_access: false,
             require_timestamp: false,
+            max_clock_skew_secs: 0,
         }
     }
 
@@ -231,6 +235,7 @@ impl NtlmAuthProvider {
             identities: Arc::new(store),
             guest_access,
             require_timestamp: false,
+            max_clock_skew_secs: 0,
         }
     }
 
@@ -239,6 +244,7 @@ impl NtlmAuthProvider {
             identities,
             guest_access,
             require_timestamp: false,
+            max_clock_skew_secs: 0,
         }
     }
 
@@ -246,11 +252,13 @@ impl NtlmAuthProvider {
         identities: Arc<IdentityStore>,
         guest_access: bool,
         require_timestamp: bool,
+        max_clock_skew_secs: u64,
     ) -> Self {
         Self {
             identities,
             guest_access,
             require_timestamp,
+            max_clock_skew_secs,
         }
     }
 }
@@ -522,15 +530,34 @@ impl AuthProvider for NtlmAuthProvider {
                 tracing::debug!("AUTHENTICATE MIC verified successfully");
             }
 
-            // Anti-replay: require MsvAvTimestamp in the NTLMv2 blob.
-            // This is a presence check — it requires that the client include
-            // a timestamp in the blob, making replay of a captured
-            // AUTHENTICATE observable by comparison with the challenge time.
-            if self.require_timestamp && !ntlmv2::has_timestamp(&fields.nt_response) {
-                tracing::warn!(
-                    "NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)"
-                );
-                return Err(AuthError::LogonFailure("missing NTLMv2 timestamp".into()));
+            // Anti-replay: require MsvAvTimestamp in the NTLMv2 blob and
+            // optionally check freshness (within ntlm_max_clock_skew_secs of
+            // the server's clock). When the skew window is 0, only presence
+            // is checked (the previous behavior); a positive window rejects
+            // stale timestamps as replay attempts.
+            if self.require_timestamp {
+                if !ntlmv2::has_timestamp(&fields.nt_response) {
+                    tracing::warn!(
+                        "NTLMv2 blob missing MsvAvTimestamp — rejecting (require_timestamp)"
+                    );
+                    return Err(AuthError::LogonFailure("missing NTLMv2 timestamp".into()));
+                }
+                if self.max_clock_skew_secs > 0
+                    && !ntlmv2::is_timestamp_fresh(
+                        &fields.nt_response,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                        self.max_clock_skew_secs,
+                    )
+                {
+                    tracing::warn!(
+                        "NTLMv2 timestamp outside ±{}s clock skew — rejecting (stale)",
+                        self.max_clock_skew_secs
+                    );
+                    return Err(AuthError::LogonFailure("stale NTLMv2 timestamp".into()));
+                }
             }
 
             // All checks passed — commit state.

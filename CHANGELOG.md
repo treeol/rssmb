@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the server config to re-enable. The server still honors the capability
   when explicitly enabled.
 
+### Security
+
+- **NTLMv2 timestamp freshness window (`ntlm_max_clock_skew_secs`,
+  default 600).** When `ntlm_require_timestamp` is true, the MsvAvTimestamp
+  in the AUTHENTICATE message is now checked for freshness (±10 min by
+  default) against the server clock, not just presence. A stale timestamp
+  is rejected as a replay attempt. Set `0` for the old presence-only
+  behavior.
+
 ## [0.1.6] - 2026-10-23
 
 ### Added

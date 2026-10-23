@@ -107,6 +107,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub ntlm_require_timestamp: bool,
 
+    /// Maximum acceptable clock skew (in seconds) between the client's
+    /// MsvAvTimestamp and the server's clock when `ntlm_require_timestamp`
+    /// is true. A timestamp outside this window is rejected as stale
+    /// (replay protection). Default: 600 (10 min). 0 = no freshness check
+    /// (presence-only, the previous behavior).
+    #[serde(default = "default_ntlm_max_clock_skew_secs")]
+    pub ntlm_max_clock_skew_secs: u64,
+
     /// Durable handle timeout in seconds. When a client opens a file with a
     /// DH2Q (durable handle v2) create context and the connection drops, the
     /// server keeps the open alive for this many seconds so the client can
@@ -247,6 +255,9 @@ fn default_auth_max_failures_per_conn() -> u32 {
 }
 fn default_durable_timeout_secs() -> u64 {
     900
+}
+fn default_ntlm_max_clock_skew_secs() -> u64 {
+    600
 }
 fn default_shutdown_grace_secs() -> u64 {
     10
@@ -667,6 +678,7 @@ impl ServerConfig {
             auth_cooldown_secs: 60,
             auth_max_failures_per_conn: 10,
             ntlm_require_timestamp: false,
+            ntlm_max_clock_skew_secs: 600,
             durable_timeout_secs: 900,
             leases: true,
             multichannel: false,
