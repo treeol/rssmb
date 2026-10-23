@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`multichannel` default flipped to `false`.** SMB 3.x multichannel is
+  now off by default until binding hardening lands; set `multichannel = true`
+  in the server config to re-enable. The server still honors the capability
+  when explicitly enabled.
+
 ## [0.1.6] - 2026-10-23
 
 ### Added
