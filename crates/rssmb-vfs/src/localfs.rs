@@ -2825,7 +2825,11 @@ mod tests {
         // does when evicting an expired entry). The temp must publish.
         let dir = tmp_root();
         let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
-        let open = fs.create("", "durable.txt", &write_args()).await.unwrap().open;
+        let open = fs
+            .create("", "durable.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
         fs.write_at(open, 0, b"durable-payload").await.unwrap();
         // While pending: only temp on disk.
         assert!(!dir.path().join("durable.txt").exists());
@@ -2858,7 +2862,7 @@ mod tests {
         // is still valid in the LocalFs opens map.
         // Reconnect on B: a new LocalFs for the same share root shares
         // the pending registry entry.
-        let fs_b = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let _fs_b = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
         // The pending entry is still in the registry (shared by root path).
         // Close via fs_b (the reconnected Vfs). But the open_id was minted
         // by fs_a — fs_b doesn't know it. In the durable table, the entry
@@ -2888,12 +2892,18 @@ mod tests {
         // Set its mtime to > ORPHAN_MAX_AGE so it qualifies for removal.
         let old = std::time::SystemTime::now()
             - std::time::Duration::from_secs(crate::publish::ORPHAN_MAX_AGE.as_secs() + 600);
-        let f = std::fs::File::options().append(true).open(&stale_path).unwrap();
+        let f = std::fs::File::options()
+            .append(true)
+            .open(&stale_path)
+            .unwrap();
         f.set_modified(old).unwrap();
         // Construct a publish-on-close LocalFs — for_root runs the sweep.
         let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
         // The stale orphan must be gone.
-        assert!(!stale_path.exists(), "startup sweep must remove stale orphan");
+        assert!(
+            !stale_path.exists(),
+            "startup sweep must remove stale orphan"
+        );
         // Non-temp files are untouched.
         let normal = dir.path().join("normal.txt");
         std::fs::write(&normal, b"keep").unwrap();

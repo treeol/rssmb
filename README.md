@@ -234,7 +234,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `valid_users` | Restrict to named users (empty = all authenticated) |
 | `read_users` | Restrict read access (empty = all `valid_users`) |
 | `write_users` | Restrict write access (empty = all `valid_users`) |
-| `publish_on_close` | Write new files under a hidden `.rssmb-tmp.*` name and atomically rename to the final name on the last close (default `false`). SMB clients always see the final name; host-side watchers/backups never observe a pre-sized file with no data. |
+| `publish_on_close` | Write new files under a hidden `.rssmb-tmp.*` name and atomically rename to the final name on the last close (default `false`). SMB clients always see the final name; host-side watchers/backups never observe a pre-sized file with no data. CHANGE_NOTIFY directory watches map temp events to the client-visible final name so no temp name ever surfaces. |
 
 ### Users (`[[users]]`)
 
