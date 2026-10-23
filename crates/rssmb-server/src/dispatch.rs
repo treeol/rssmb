@@ -410,8 +410,14 @@ pub struct AsyncOp {
     /// Sender to deliver the completion response to the write task.
     pub cancel: tokio::sync::oneshot::Sender<()>,
     /// Optional directory watch handle for CHANGE_NOTIFY. Dropping this
-    /// stops the background watcher task.
+    /// closes only the op's own watch — it must NOT be used to stop
+    /// unrelated pending notifies.
     pub notify_handle: Option<crate::notify::NotifyHandle>,
+    /// The volatile id of the watched directory handle (CHANGE_NOTIFY
+    /// only). CLOSE of THIS handle completes the notify with
+    /// STATUS_NOTIFY_CLEANUP; CLOSE of any other handle on the tree must
+    /// leave the notify pending.
+    pub watched_file_id: Option<u64>,
 }
 
 /// A tree connection entry tracking the owning session and VFS backend.
@@ -1903,7 +1909,30 @@ async fn handle_session_setup(
                     "session_setup complete — PreviousSessionId check"
                 );
                 if previous_session_id != 0 && previous_session_id != session_id {
-                    teardown_previous_session(state, previous_session_id, &identity.username).await;
+                    // Complete the old session's pending CHANGE_NOTIFY ops
+                    // with NOTIFY_CLEANUP before tearing it down — the
+                    // client is blocked in smb2_notify_recv and expects the
+                    // async completion (smb2.notify session-reconnect).
+                    {
+                        let mut pending = conn_state.pending_async.lock().await;
+                        let keys: Vec<u64> = pending
+                            .iter()
+                            .filter(|(_, op)| {
+                                op.command == Command::ChangeNotify
+                                    && op.session_id == previous_session_id
+                            })
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for key in keys {
+                            if let Some(op) = pending.remove(&key) {
+                                drop(pending);
+                                send_notify_cleanup(conn_state, key, op).await;
+                                pending = conn_state.pending_async.lock().await;
+                            }
+                        }
+                    }
+                    teardown_previous_session(state, previous_session_id, &identity.username)
+                        .await;
                 }
             }
 
@@ -2161,7 +2190,10 @@ async fn handle_logoff(
         st.retiring = true;
     }
 
-    // Cancel any pending async ops for this session.
+    // Cancel any pending async ops for this session. CHANGE_NOTIFY ops
+    // get the async STATUS_NOTIFY_CLEANUP completion (MS-SMB2: logoff
+    // ends the watches and notifies the client) — silently dropping them
+    // left smb2.notify logoff waiting forever.
     {
         let mut pending = conn_state.pending_async.lock().await;
         let to_remove: Vec<u64> = pending
@@ -2171,9 +2203,15 @@ async fn handle_logoff(
             .collect();
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
-                let _ = op.cancel.send(());
-                if let Some(handle) = op.notify_handle {
-                    handle.cancel();
+                if op.command == Command::ChangeNotify {
+                    drop(pending);
+                    send_notify_cleanup(conn_state, key, op).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else {
+                    let _ = op.cancel.send(());
+                    if let Some(handle) = op.notify_handle {
+                        handle.cancel();
+                    }
                 }
             }
         }
@@ -2566,7 +2604,10 @@ async fn handle_tree_disconnect(
     // Remove the tree from the connection tree table.
     conn_state.trees_ref().write().await.remove(&tree_id);
 
-    // Cancel any pending async ops for this tree.
+    // Cancel any pending async ops for this tree. CHANGE_NOTIFY ops get
+    // the async STATUS_NOTIFY_CLEANUP completion (MS-SMB2 3.3.5.10: tree
+    // disconnect ends the watch and notifies the client) — silently
+    // dropping them left smb2.notify tdis/tdis1 waiting forever.
     {
         let mut pending = conn_state.pending_async.lock().await;
         let to_remove: Vec<u64> = pending
@@ -2576,9 +2617,15 @@ async fn handle_tree_disconnect(
             .collect();
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
-                let _ = op.cancel.send(());
-                if let Some(handle) = op.notify_handle {
-                    handle.cancel();
+                if op.command == Command::ChangeNotify {
+                    drop(pending);
+                    send_notify_cleanup(conn_state, key, op).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else {
+                    let _ = op.cancel.send(());
+                    if let Some(handle) = op.notify_handle {
+                        handle.cancel();
+                    }
                 }
             }
         }
@@ -4250,26 +4297,38 @@ async fn handle_close(
                 }
             }
 
-            // Complete any pending CHANGE_NOTIFY for this tree with
-            // STATUS_NOTIFY_CLEANUP (MS-SMB2 3.3.5.10). Cancel the
-            // directory watcher and remove from pending_async.
+            // Complete any pending CHANGE_NOTIFY whose WATCHED HANDLE is
+            // the one being closed with STATUS_NOTIFY_CLEANUP
+            // (MS-SMB2 3.3.5.10: closes the watch and notifies the client
+            // via an async completion). Other pending CHANGE_NOTIFY ops on
+            // this tree watch DIFFERENT handles and must stay pending —
+            // cancelling them tree-wide hung smb2.notify's valid-req
+            // (setup-file CLOSE killed the unrelated root-dir watch).
             {
                 let mut pending = conn_state.pending_async.lock().await;
-                let to_remove: Vec<u64> = pending
+                let closed_volatile = file_id_volatile;
+                let cleanup_keys: Vec<u64> = pending
                     .iter()
-                    // Only CHANGE_NOTIFY is tied to a handle being closed;
-                    // other async ops (deferred CREATE / rename awaiting a
-                    // lease-break ack) must survive unrelated CLOSEs.
-                    .filter(|(_, op)| op.tree_id == tree_id && op.command == Command::ChangeNotify)
+                    .filter(|(_, op)| {
+                        op.command == Command::ChangeNotify
+                            && op.tree_id == tree_id
+                            && op.watched_file_id == Some(closed_volatile)
+                    })
                     .map(|(k, _)| *k)
                     .collect();
-                for key in to_remove {
+                for key in cleanup_keys {
                     if let Some(op) = pending.remove(&key) {
-                        let _ = op.cancel.send(());
-                        // Cancel the notify watcher if present.
-                        if let Some(handle) = op.notify_handle {
-                            handle.cancel();
-                        }
+                        // Guard must be released first — send_notify_cleanup
+                        // awaits, and re-locking below while the old guard
+                        // is still held would self-deadlock the connection
+                        // task (Rust drops the old binding only AFTER the
+                        // RHS completes).
+                        drop(pending);
+                        // Stops the watcher, then sends the async
+                        // NOTIFY_CLEANUP completion.
+                        send_notify_cleanup(conn_state, key, op).await;
+                        // Re-acquire for any remaining keys.
+                        pending = conn_state.pending_async.lock().await;
                     }
                 }
             }
@@ -5332,6 +5391,7 @@ async fn handle_set_info(
                                     tree_id,
                                     cancel: cancel_tx,
                                     notify_handle: None,
+                                    watched_file_id: None,
                                 },
                             );
                             // Send interim STATUS_PENDING. Construct manually
@@ -5594,6 +5654,7 @@ async fn handle_change_notify(
                     tree_id,
                     cancel: cancel_tx,
                     notify_handle: None,
+                    watched_file_id: None,
                 },
             );
             let mut response = build_response(
@@ -5639,6 +5700,7 @@ async fn handle_change_notify(
             tree_id,
             cancel: cancel_tx,
             notify_handle: Some(notify_handle),
+            watched_file_id: Some(file_id_volatile),
         },
     );
     drop(pending_guard);
@@ -6209,6 +6271,47 @@ async fn handle_oplock_break(
     }
 }
 
+/// Complete a removed CHANGE_NOTIFY async op with STATUS_NOTIFY_CLEANUP
+/// (0x0000010B, empty buffer) — MS-SMB2 3.3.5.10/3.3.5.19.2: closing the
+/// watched handle or tree-disconnect ends the watch and notifies the
+/// client with an async completion. The watcher is stopped first so no
+/// second completion can race.
+async fn send_notify_cleanup(conn_state: &ConnState, key: u64, op: AsyncOp) {
+    let _ = op.cancel.send(());
+    if let Some(handle) = op.notify_handle {
+        handle.cancel();
+    }
+    let mut header = Header {
+        credit_charge: 0,
+        status: 0x0000_010B,
+        command: Command::ChangeNotify,
+        credit_request: 0,
+        flags: HeaderFlags::new().with_server_to_redir(true),
+        next_command: 0,
+        message_id: key,
+        tree_id: Some(op.tree_id),
+        async_id: None,
+        session_id: op.session_id,
+        signature: 0,
+    };
+    header.to_async(key);
+    let resp = FramedResponse::Plain(PlainResponse {
+        header,
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+    });
+    // Out-of-band completion: sign when the session requires signing
+    // (same rule as handle_cancel: the client signs requests when signing
+    // is required, so the request's signed flag and `required` agree).
+    let signed = conn_state
+        .signing_ref()
+        .read()
+        .unwrap()
+        .get(&op.session_id)
+        .map(|st| st.required)
+        .unwrap_or(false);
+    send_unsolicited(conn_state, &resp, signed).await;
+}
+
 /// CANCEL — cancel a pending async operation (MS-SMB2 3.3.5.16).
 ///
 /// CANCEL itself never gets a response. The cancelled operation is completed
@@ -6227,19 +6330,64 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
         }
     };
     let Some(op) = removed else {
+        // MS-SMB2 pre-interim CANCEL: Samba's client sends the CANCEL
+        // immediately after smb2_notify_send, before the STATUS_PENDING
+        // interim arrives (smbXcli_base.c smb2cli_req_cancel: MessageId=0,
+        // AsyncId=0, no ASYNC flag). smbd answers this by cancelling the
+        // session's most recent pending async op — do the same: the
+        // highest message_id (client mids are monotonic per session).
+        if target == 0 && req_header.session_id != 0 {
+            let candidates: Vec<u64> = {
+                let pending = conn_state.pending_async.lock().await;
+                pending
+                    .iter()
+                    .filter(|(_, op)| op.session_id == req_header.session_id)
+                    .map(|(k, _)| *k)
+                    .collect()
+            };
+            if let Some(newest) = candidates.into_iter().max() {
+                let removed = {
+                    let mut pending = conn_state.pending_async.lock().await;
+                    match pending.get(&newest) {
+                        Some(op) if op.session_id == req_header.session_id => {
+                            pending.remove(&newest)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(op) = removed {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        newest, "cancel: pre-interim CANCEL (mid=0) — cancelled newest pending op"
+                    );
+                    return Some(finish_cancel(conn_state, op, newest, req_header).await);
+                }
+            }
+        }
         debug!(
             conn_id = conn_state.conn_id,
             target, "cancel: no matching pending op"
         );
         return None;
     };
+    Some(finish_cancel(conn_state, op, target, req_header).await)
+}
+
+/// Fire the cancel signal, stop any watcher, and send the STATUS_CANCELLED
+/// async completion for a removed pending op. Shared by the exact-match and
+/// pre-interim (mid=0) CANCEL paths.
+async fn finish_cancel(
+    conn_state: &ConnState,
+    op: AsyncOp,
+    target: u64,
+    req_header: &Header,
+) -> FramedResponse {
     let _ = op.cancel.send(());
     // Cancel the notify watcher if present.
     if let Some(handle) = op.notify_handle {
         handle.cancel();
     }
     debug!(conn_id = conn_state.conn_id, target, "cancelled async op");
-
     let mut header = Header {
         credit_charge: 0,
         status: NtStatus::Other(0xC000_0120).to_u32(), // STATUS_CANCELLED
@@ -6261,7 +6409,7 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
     // Out-of-band responses must be signed like any other (the CANCEL itself
     // was signed if the session requires it — verified before dispatch).
     send_unsolicited(conn_state, &resp, req_header.flags.signed()).await;
-    None
+    resp
 }
 
 /// Encode, sign (per session signing state) and enqueue a response that is
@@ -6293,6 +6441,7 @@ async fn pend_until_breaks(
             tree_id: req_header.tree_id.unwrap_or(0),
             cancel: cancel_tx,
             notify_handle: None,
+            watched_file_id: None,
         },
     );
     let mut pending_hdr = req_header.clone();

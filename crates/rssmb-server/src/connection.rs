@@ -1933,6 +1933,7 @@ mod tests {
                 tree_id: 3,
                 cancel: cancel_tx,
                 notify_handle: None,
+                watched_file_id: None,
             },
         );
 

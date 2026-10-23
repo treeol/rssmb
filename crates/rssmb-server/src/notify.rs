@@ -313,7 +313,51 @@ pub fn start_watch(
                                     .collect();
 
                                 if entries.is_empty() {
-                                    continue;
+                                    // Empty relative name = the event is about
+                                    // the watched directory itself. If it was
+                                    // removed, complete the pending notify with
+                                    // STATUS_DELETE_PENDING (MS-SMB2: the watched
+                                    // dir was deleted) — dropping the event left
+                                    // smb2.notify rmdir1 blocked forever.
+                                    let watched_dir_removed = notify_event
+                                        .paths
+                                        .iter()
+                                        .any(|p| p.as_path() == dir_path)
+                                        && matches!(notify_event.kind, EventKind::Remove(_));
+                                    if watched_dir_removed
+                                        && pending_async.lock().await.remove(&message_id).is_some()
+                                    {
+                                        let header = rssmb_proto::header::Header {
+                                            credit_charge: 0,
+                                            status: 0xC000_0056, // STATUS_DELETE_PENDING
+                                            command: rssmb_proto::header::Command::ChangeNotify,
+                                            credit_request: 0,
+                                            flags: rssmb_proto::header::HeaderFlags::new()
+                                                .with_server_to_redir(true)
+                                                .with_async_command(true),
+                                            next_command: 0,
+                                            message_id,
+                                            tree_id: Some(tree_id),
+                                            async_id: Some(message_id),
+                                            session_id,
+                                            signature: 0,
+                                        };
+                                        let resp = build_response(
+                                            &header,
+                                            ResponseContent::ChangeNotify(
+                                                rssmb_proto::notify::ChangeNotifyResponse {
+                                                    buffer: Default::default(),
+                                                },
+                                            ),
+                                        );
+                                        send_unsolicited(
+                                            &conn_state_clone,
+                                            &FramedResponse::Plain(resp),
+                                            true,
+                                        )
+                                        .await;
+                                    }
+                                    break;
                                 }
 
                                 // Atomically claim completion from pending_async
