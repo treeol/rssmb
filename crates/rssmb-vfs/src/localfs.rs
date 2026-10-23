@@ -2970,11 +2970,7 @@ mod tests {
         // alive until the rename succeeds.
         let dir = tmp_root();
         let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
-        let a = fs
-            .create("", "race.txt", &write_args())
-            .await
-            .unwrap()
-            .open;
+        let a = fs.create("", "race.txt", &write_args()).await.unwrap().open;
         fs.write_at(a, 0, b"race-data").await.unwrap();
 
         // Attach a second handle (increments count to 2).

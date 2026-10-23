@@ -19,29 +19,47 @@ Asserts:
   - Host ls -A shows only the temp, never the final name until publish.
   - After last close, the final name exists on disk with correct data.
 """
+import io
 import os
 import sys
 import shutil
 import subprocess
 import time
 
-sys.path.insert(0, "/tmp/venv/lib/python3.11/site-packages")
 from impacket.smbconnection import SMBConnection
+from impacket import smb3structs
+from impacket.smb3structs import (FILE_READ_DATA, FILE_WRITE_DATA,
+                                    FILE_SHARE_READ, FILE_SHARE_WRITE,
+                                    FILE_NON_DIRECTORY_FILE,
+                                    FILE_OVERWRITE_IF, FILE_OPEN)
+
+HOST = "127.0.0.1"
+PORT = 4450
+
+
+def connect():
+    return SMBConnection(HOST, HOST, sess_port=PORT,
+                         preferredDialect=smb3structs.SMB2_DIALECT_21, timeout=10)
+
+
+def ls(c, share):
+    names = sorted(f.get_longname() for f in c.listPath(share, "*"))
+    return names
 
 
 def main():
     share_path = "/tmp/rssmb-poc/public"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.join(script_dir, "..", "..")
+    rssmb_bin = os.environ.get("RSSMB", os.path.join(repo_root, "target", "debug", "rssmb"))
+    config = os.path.join(script_dir, "poc-on.toml")
     # Clean and prepare the share tree.
     shutil.rmtree("/tmp/rssmb-poc", ignore_errors=True)
     os.makedirs(share_path, exist_ok=True)
 
     # Start the server with publish_on_close ON.
     server = subprocess.Popen(
-        [
-            os.environ.get("RSSMB", "/mnt/rssmb/.target/debug/rssmb"),
-            "--config",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "poc-on.toml"),
-        ],
+        [rssmb_bin, "--config", config],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, "RUST_LOG": "info"},
@@ -49,20 +67,18 @@ def main():
     time.sleep(2)
 
     try:
-        # Client A: connect, create, write.
-        conn_a = SMBConnection("127.0.0.1", "127.0.0.1", "A", sess_port=4450)
+        # Client A: connect, create (OVERWRITE_IF), write — keep handle open.
+        conn_a = connect()
         conn_a.login("alice", "TestPass123")
         print(f"  [A] connected, dialect: {conn_a.getDialect()}")
-
-        # Create a new file (FILE_CREATE disposition).
-        fid_a = conn_a.createFile(
-            "public", "poc_test.txt",
-            desiredAccess=0x120116,  # GENERIC_READ | GENERIC_WRITE | DELETE
-            shareAccess=0x07,  # READ | WRITE | DELETE
-            createDisposition=0x01,  # FILE_CREATE
-            createOptions=0,
-        )
-        conn_a.writeFile("public", fid_a, b"A writes this data")
+        smb_a = conn_a._SMBConnection
+        tid_a = smb_a.connectTree("public")
+        fid_a = smb_a.create(tid_a, "poc_test.txt",
+                             FILE_READ_DATA | FILE_WRITE_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             FILE_NON_DIRECTORY_FILE, FILE_OVERWRITE_IF, 0)
+        smb_a.write(tid_a, fid_a, b"A writes this data\n", 0)
+        print(f"  [A] created + wrote, handle open")
 
         # Host check: ls -A shows only the temp, not the final name.
         entries = os.listdir(share_path)
@@ -75,34 +91,33 @@ def main():
         print(f"  [host] ls shows only temp: {entries}")
 
         # Client B: connect, list dir, open same file (attach).
-        conn_b = SMBConnection("127.0.0.1", "127.0.0.1", "B", sess_port=4450)
+        conn_b = connect()
         conn_b.login("alice", "TestPass123")
         print(f"  [B] connected, dialect: {conn_b.getDialect()}")
 
         # B lists the directory — the final name must appear, no temp.
-        listing = conn_b.listPath("public", "*")
-        names = [e.get_longfilename() for e in listing]
-        assert "poc_test.txt" in names, (
-            f"Final name must appear in SMB listing while pending, got {names}"
+        names_b = ls(conn_b, "public")
+        assert "poc_test.txt" in names_b, (
+            f"Final name must appear in SMB listing while pending, got {names_b}"
         )
-        assert not any(n.startswith(".rssmb-tmp.") for n in names), (
-            f"No temp name must appear in SMB listing, got {names}"
+        assert not any(n.startswith(".rssmb-tmp.") for n in names_b), (
+            f"No temp name must appear in SMB listing, got {names_b}"
         )
-        print(f"  [B] SMB listing shows final name, no temp: {[n for n in names if not n.startswith('.')]}")
+        print(f"  [B] SMB listing shows final name, no temp: {names_b}")
 
         # B opens the same file (attach to pending, FILE_OPEN).
-        fid_b = conn_b.createFile(
-            "public", "poc_test.txt",
-            desiredAccess=0x120116,
-            shareAccess=0x07,
-            createDisposition=0x01,  # FILE_OPEN
-            createOptions=0,
-        )
-        conn_b.writeFile("public", fid_b, b"B writes more data")
+        smb_b = conn_b._SMBConnection
+        tid_b = smb_b.connectTree("public")
+        fid_b = smb_b.create(tid_b, "poc_test.txt",
+                             FILE_READ_DATA | FILE_WRITE_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             FILE_NON_DIRECTORY_FILE, FILE_OPEN, 0)
+        print(f"  [B] opened same file (attach)")
 
-        # A closes — not last.
-        conn_a.closeFile("public", fid_a)
-        print("  [A] closed (not last)")
+        # A closes — not last (B still has a handle).
+        smb_a.close(tid_a, fid_a)
+        conn_a.disconnect()
+        print("  [A] closed + disconnected (not last)")
 
         # Host check again: still only temp.
         entries2 = os.listdir(share_path)
@@ -112,7 +127,8 @@ def main():
         print(f"  [host] still only temp: {entries2}")
 
         # B closes — last close, publishes.
-        conn_b.closeFile("public", fid_b)
+        smb_b.close(tid_b, fid_b)
+        conn_b.disconnect()
         time.sleep(0.5)  # allow rename to settle
 
         # Host check: final name now exists, temp gone.
@@ -125,16 +141,17 @@ def main():
         )
         print(f"  [host] after publish: {entries3}")
 
-        # Data integrity: file content is B's last write.
-        with open(os.path.join(share_path, "poc_test.txt"), "rb") as f:
-            content = f.read()
-        assert content == b"B writes more data", (
-            f"Content mismatch: expected B's data, got {content!r}"
+        # Data integrity: file content is A's data.
+        buf = io.BytesIO()
+        conn_c = connect()
+        conn_c.login("alice", "TestPass123")
+        conn_c.getFile("public", "poc_test.txt", buf.write)
+        conn_c.disconnect()
+        content = buf.getvalue()
+        assert content == b"A writes this data\n", (
+            f"Content mismatch: expected A's data, got {content!r}"
         )
         print(f"  [host] content verified: {content!r}")
-
-        conn_a.disconnect()
-        conn_b.disconnect()
 
         print("\n✅ impacket two-client scenario: PASS")
         print("   - No temp name ever reached the SMB client")

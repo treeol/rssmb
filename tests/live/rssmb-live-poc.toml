@@ -1,0 +1,29 @@
+# Config for the smbtorture baseline with publish_on_close ON.
+# Same as rssmb-live.toml but with publish_on_close=true on the public share.
+listen_addr = "127.0.0.1"
+port = 4450
+min_dialect = "smb21"
+max_dialect = "smb311"
+signing = "desired"
+encryption = "disabled"
+guest_access = true
+health_port = 18080
+max_credits = 1024
+
+[shares.public]
+name = "public"
+comment = "Pub (publish_on_close)"
+path = "/tmp/rssmb-live/public"
+guest_ok = true
+publish_on_close = true
+
+[shares.private]
+name = "private"
+comment = "Priv"
+path = "/tmp/rssmb-live/private"
+guest_ok = false
+valid_users = ["alice"]
+
+[[users]]
+username = "alice"
+password = "TestPass123"

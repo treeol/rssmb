@@ -445,25 +445,17 @@ impl PendingPublishTable {
         let kdir = self.share.key_dir(dir);
         let kname = self.share.key_name(name);
         let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
-        let map = dirs.get_mut(&kdir).ok_or_else(|| {
-            PathBuf::new() // no entry — caller shouldn't call close_publish
-        })?;
-        let pending = map.get_mut(&kname).ok_or_else(|| PathBuf::new())?;
+        let map = dirs.get_mut(&kdir).ok_or(PathBuf::new())?; // no entry — caller shouldn't call close_publish
+        let pending = map.get_mut(&kname).ok_or(PathBuf::new())?;
         pending.open_count = pending.open_count.saturating_sub(1);
         if pending.open_count > 0 {
             return Ok(None);
         }
         // Last close: extract the entry, then call publish_fn while we still
-        // hold the write lock. The entry stays in the map until publish_fn
-        // succeeds — a racing resolve_or_acquire will attach to it (correct:
-        // the file is still pending, not yet published on disk).
-        let pending = map.remove(&kname).ok_or_else(|| PathBuf::new())?;
-        if pending.delete_on_close {
-            // Delete-on-close: caller unlinks the temp, no publish.
-            // Return the temp path via Err so the caller can unlink it.
-            // The entry is already removed.
-            return Err(pending.temp_name);
-        }
+        // hold the write lock. The entry is removed atomically with the
+        // publish — a racing resolve_or_acquire between the removal and the
+        // filesystem rename cannot miss the entry.
+        let pending = map.remove(&kname).ok_or(PathBuf::new())?;
         match publish_fn(&pending.temp_name) {
             Ok(()) => Ok(Some(())),
             Err(temp) => {
