@@ -788,7 +788,6 @@ pub struct RemoveResult {
 /// and whether it is exclusive. The check-then-acquire step is atomic under
 /// the lock. Locks are released on CLOSE (all locks for the open_id) and on
 /// tree-disconnect/session-logoff (all locks for the tree/session).
-#[derive(Debug)]
 pub struct OpenTable {
     opens: RwLock<HashMap<FileId, Vec<OpenEntry>>>,
     /// Files with at least one open that has delete_on_close = true.
@@ -798,6 +797,54 @@ pub struct OpenTable {
     range_locks: RwLock<HashMap<FileId, Vec<RangeLock>>>,
     /// Per-file lease and traditional oplock state.
     leases: RwLock<LeaseManager>,
+    /// Blocking-lock waiters (K5): each pended LOCK request that waits for
+    /// a conflicting range to be released registers here. Every lock
+    /// release (single, open-close, tree-disconnect, logoff) wakes the
+    /// matching waiters.
+    lock_waiters: RwLock<Vec<LockWaiter>>,
+}
+
+/// A pended blocking LOCK request (MS-SMB2 3.3.5.14: a lock that conflicts
+/// and does not carry FAIL_IMMEDIATELY waits for the range to become
+/// grantable, up to a server-chosen timeout).
+pub struct LockWaiter {
+    /// Which file the lock targets.
+    pub file_id: FileId,
+    /// The requesting open (excluded from the re-check).
+    pub open_id: OpenId,
+    /// The pended element(s): (offset, length, exclusive).
+    pub elements: Vec<(u64, u64, bool)>,
+    /// Fired by the release paths when this waiter should re-check.
+    pub wake: tokio::sync::watch::Sender<bool>,
+}
+
+impl LockWaiter {
+    /// True if any pended element would still conflict with the current
+    /// lock state.
+    fn still_blocked(&self, locks: &HashMap<FileId, Vec<RangeLock>>) -> bool {
+        let empty = Vec::new();
+        let list = locks.get(&self.file_id).unwrap_or(&empty);
+        for &(offset, length, exclusive) in &self.elements {
+            for lock in list {
+                if lock.open_id == self.open_id {
+                    // Same open: only exclusive acquisition conflicts.
+                    if exclusive && lock.exclusive
+                        && ranges_overlap(offset, length, lock.offset, lock.length)
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                if !ranges_overlap(offset, length, lock.offset, lock.length) {
+                    continue;
+                }
+                if lock.exclusive || exclusive {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 impl OpenTable {
@@ -808,6 +855,7 @@ impl OpenTable {
             delete_pending: RwLock::new(HashSet::new()),
             range_locks: RwLock::new(HashMap::new()),
             leases: RwLock::new(LeaseManager::default()),
+            lock_waiters: RwLock::new(Vec::new()),
         }
     }
 
@@ -1227,7 +1275,82 @@ impl OpenTable {
             session_id,
             tree_id,
         });
+        drop(locks);
+        self.wake_lock_waiters(&[file_id]).await;
         Ok(())
+    }
+
+    /// Re-check all pended blocking-lock waiters for `file_ids` and fire
+    /// the wake signal of every waiter whose elements would now be granted.
+    /// Called after any lock-table mutation (single release, unlock, open
+    /// close, tree disconnect, logoff).
+    async fn wake_lock_waiters(&self, file_ids: &[FileId]) {
+        if file_ids.is_empty() {
+            return;
+        }
+        let locks = self.range_locks.read().await;
+        let mut waiters = self.lock_waiters.write().await;
+        let mut woken: Vec<usize> = Vec::new();
+        for (i, w) in waiters.iter().enumerate() {
+            if !file_ids.contains(&w.file_id) {
+                continue;
+            }
+            if !w.still_blocked(&locks) {
+                let _ = w.wake.send(true);
+                woken.push(i);
+            }
+        }
+        // Remove woken waiters (highest index first to keep indices valid).
+        for i in woken.into_iter().rev() {
+            waiters.remove(i);
+        }
+    }
+
+    /// Register a blocking-lock waiter. Returns a receiver that fires
+    /// (true) when the waiter may re-attempt the acquisition, or is
+    /// dropped/aborted (also fired with true on abort — callers must
+    /// re-check and treat a lost race as LOCK_NOT_GRANTED or cancel).
+    pub async fn register_lock_waiter(
+        &self,
+        waiter: LockWaiter,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        let rx = waiter.wake.subscribe();
+        self.lock_waiters.write().await.push(waiter);
+        rx
+    }
+
+    /// Remove all waiters registered by `open_id` (open closed / request
+    /// abandoned) and wake them so their completion tasks can finish.
+    pub async fn abort_lock_waiters_for_open(&self, owner_open_id: OpenId) {
+        let mut waiters = self.lock_waiters.write().await;
+        let mut aborted: Vec<usize> = Vec::new();
+        for (i, w) in waiters.iter().enumerate() {
+            if w.open_id == owner_open_id {
+                let _ = w.wake.send(true);
+                aborted.push(i);
+            }
+        }
+        for i in aborted.into_iter().rev() {
+            waiters.remove(i);
+        }
+    }
+
+    /// Remove all waiters for `session_id` (logoff) and wake them. The
+    /// session's pended locks are completed out-of-band by the LOGOFF
+    /// sweep; this just drops the registry entries.
+    pub async fn abort_lock_waiters_for_session(&self, _session_id: u64) {
+        // Waiters don't carry the session; derive it via their open's
+        // absence — simpler: wake all waiters whose open no longer exists.
+        // The dispatch layer removes opens before calling this, so just
+        // wake everything whose elements can no longer conflict is handled
+        // by wake_lock_waiters; here we drop waiters whose open is gone by
+        // waking all of them (the completion task then sees the open is
+        // gone and completes RANGE_NOT_LOCKED/OK).
+        let mut waiters = self.lock_waiters.write().await;
+        for w in waiters.iter() {
+            let _ = w.wake.send(true);
+        }
+        waiters.clear();
     }
 
     /// Release ONE byte-range lock on `file_id` for the open identified by
@@ -1257,6 +1380,8 @@ impl OpenTable {
                 if list.is_empty() {
                     locks.remove(&file_id);
                 }
+                drop(locks);
+                self.wake_lock_waiters(&[file_id]).await;
                 return Ok(());
             }
         }
@@ -1269,12 +1394,17 @@ impl OpenTable {
     pub async fn release_all_locks_for_open(&self, owner_open_id: OpenId) -> usize {
         let mut locks = self.range_locks.write().await;
         let mut released = 0;
+        let mut touched: Vec<FileId> = Vec::new();
         let empty_keys: Vec<FileId> = locks
             .iter_mut()
             .filter_map(|(fid, list)| {
                 let before = list.len();
                 list.retain(|l| l.open_id != owner_open_id);
-                released += before - list.len();
+                let removed = before - list.len();
+                if removed > 0 {
+                    released += removed;
+                    touched.push(*fid);
+                }
                 if list.is_empty() {
                     Some(*fid)
                 } else {
@@ -1285,6 +1415,9 @@ impl OpenTable {
         for key in empty_keys {
             locks.remove(&key);
         }
+        drop(locks);
+        self.abort_lock_waiters_for_open(owner_open_id).await;
+        self.wake_lock_waiters(&touched).await;
         released
     }
 
@@ -1294,12 +1427,17 @@ impl OpenTable {
     pub async fn release_all_locks_for_tree(&self, tree_id: u32) -> usize {
         let mut locks = self.range_locks.write().await;
         let mut released = 0;
+        let mut touched: Vec<FileId> = Vec::new();
         let empty_keys: Vec<FileId> = locks
             .iter_mut()
             .filter_map(|(fid, list)| {
                 let before = list.len();
                 list.retain(|l| l.tree_id != tree_id);
-                released += before - list.len();
+                let removed = before - list.len();
+                if removed > 0 {
+                    released += removed;
+                    touched.push(*fid);
+                }
                 if list.is_empty() {
                     Some(*fid)
                 } else {
@@ -1310,6 +1448,10 @@ impl OpenTable {
         for key in empty_keys {
             locks.remove(&key);
         }
+        drop(locks);
+        // Waiters pended by opens of this tree are aborted by their own
+        // close path (release_all_locks_for_open); wake the rest.
+        self.wake_lock_waiters(&touched).await;
         released
     }
 
@@ -1319,12 +1461,17 @@ impl OpenTable {
     pub async fn release_all_locks_for_session(&self, session_id: u64) -> usize {
         let mut locks = self.range_locks.write().await;
         let mut released = 0;
+        let mut touched: Vec<FileId> = Vec::new();
         let empty_keys: Vec<FileId> = locks
             .iter_mut()
             .filter_map(|(fid, list)| {
                 let before = list.len();
                 list.retain(|l| l.session_id != session_id);
-                released += before - list.len();
+                let removed = before - list.len();
+                if removed > 0 {
+                    released += removed;
+                    touched.push(*fid);
+                }
                 if list.is_empty() {
                     Some(*fid)
                 } else {
@@ -1335,6 +1482,9 @@ impl OpenTable {
         for key in empty_keys {
             locks.remove(&key);
         }
+        drop(locks);
+        self.abort_lock_waiters_for_session(session_id).await;
+        self.wake_lock_waiters(&touched).await;
         released
     }
 

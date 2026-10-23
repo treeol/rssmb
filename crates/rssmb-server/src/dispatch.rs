@@ -418,6 +418,10 @@ pub struct AsyncOp {
     /// STATUS_NOTIFY_CLEANUP; CLOSE of any other handle on the tree must
     /// leave the notify pending.
     pub watched_file_id: Option<u64>,
+    /// The volatile id of the open that pended a blocking LOCK. CLOSE of
+    /// that open completes the pended lock with RANGE_NOT_LOCKED (torture
+    /// cancel "cancel by close").
+    pub lock_open_volatile: Option<u64>,
 }
 
 /// A tree connection entry tracking the owning session and VFS backend.
@@ -2207,6 +2211,32 @@ async fn handle_logoff(
                     drop(pending);
                     send_notify_cleanup(conn_state, key, op).await;
                     pending = conn_state.pending_async.lock().await;
+                } else if op.command == Command::Lock {
+                    // Pended blocking LOCK: complete out-of-band (torture
+                    // cancel-logoff accepts RANGE_NOT_LOCKED or OK).
+                    drop(pending);
+                    let mut header = Header {
+                        credit_charge: 0,
+                        status: NtStatus::RangeNotLocked.to_u32(),
+                        command: Command::Lock,
+                        credit_request: 0,
+                        flags: HeaderFlags::new().with_server_to_redir(true),
+                        next_command: 0,
+                        message_id: key,
+                        tree_id: Some(op.tree_id),
+                        async_id: None,
+                        session_id: op.session_id,
+                        signature: 0,
+                    };
+                    header.to_async(key);
+                    let resp = FramedResponse::Plain(PlainResponse {
+                        header,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    });
+                    send_unsolicited(conn_state, &resp, true).await;
+                    pending = conn_state.pending_async.lock().await;
                 } else {
                     let _ = op.cancel.send(());
                     if let Some(handle) = op.notify_handle {
@@ -2620,6 +2650,35 @@ async fn handle_tree_disconnect(
                 if op.command == Command::ChangeNotify {
                     drop(pending);
                     send_notify_cleanup(conn_state, key, op).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else if op.command == Command::Lock {
+                    // Pended blocking LOCK: complete it out-of-band so the
+                    // client's smb2_lock_recv unblocks (torture cancel-tdis
+                    // accepts RANGE_NOT_LOCKED or OK; a silent drop made the
+                    // client wait for its 35 s timeout → IO_TIMEOUT at
+                    // lock.c:1064).
+                    drop(pending);
+                    let mut header = Header {
+                        credit_charge: 0,
+                        status: NtStatus::RangeNotLocked.to_u32(),
+                        command: Command::Lock,
+                        credit_request: 0,
+                        flags: HeaderFlags::new().with_server_to_redir(true),
+                        next_command: 0,
+                        message_id: key,
+                        tree_id: Some(op.tree_id),
+                        async_id: None,
+                        session_id: op.session_id,
+                        signature: 0,
+                    };
+                    header.to_async(key);
+                    let resp = FramedResponse::Plain(PlainResponse {
+                        header,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    });
+                    send_unsolicited(conn_state, &resp, true).await;
                     pending = conn_state.pending_async.lock().await;
                 } else {
                     let _ = op.cancel.send(());
@@ -4331,6 +4390,47 @@ async fn handle_close(
                         pending = conn_state.pending_async.lock().await;
                     }
                 }
+                // Pended blocking LOCKs owned by the CLOSING open are
+                // completed with RANGE_NOT_LOCKED (torture cancel "cancel
+                // by close", lock.c:978 — the client's smb2_lock_recv must
+                // unblock when h2 closes). Locks pended by other opens are
+                // untouched.
+                let lock_keys: Vec<u64> = pending
+                    .iter()
+                    .filter(|(_, op)| {
+                        op.command == Command::Lock
+                            && op.lock_open_volatile == Some(closed_volatile)
+                            && op.session_id == session_id
+                    })
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in lock_keys {
+                    if let Some(op) = pending.remove(&key) {
+                        drop(pending);
+                        let mut header = Header {
+                            credit_charge: 0,
+                            status: NtStatus::RangeNotLocked.to_u32(),
+                            command: Command::Lock,
+                            credit_request: 0,
+                            flags: HeaderFlags::new().with_server_to_redir(true),
+                            next_command: 0,
+                            message_id: key,
+                            tree_id: Some(op.tree_id),
+                            async_id: None,
+                            session_id: op.session_id,
+                            signature: 0,
+                        };
+                        header.to_async(key);
+                        let resp = FramedResponse::Plain(PlainResponse {
+                            header,
+                            content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                                error_data: vec![],
+                            }),
+                        });
+                        send_unsolicited(conn_state, &resp, true).await;
+                        pending = conn_state.pending_async.lock().await;
+                    }
+                }
             }
 
             let close_flags = if postquery {
@@ -4419,6 +4519,19 @@ async fn handle_read(
     // Bound the allocation by the negotiated MaxReadSize.
     if read_req.length > max_io_size(&state.config) {
         return error_response_for(Command::Read, NtStatus::InvalidParameter, &req.header);
+    }
+
+    // A 0-byte READ is answered with OK + 0 bytes regardless of file size,
+    // offset, or lock state — even past EOF and inside another open's
+    // exclusive range (torture zerobyteread asserts OK for a 0-byte read
+    // at offset 5 under an exclusive lock [0,10); smbd behaves the same).
+    // Must precede the lock-conflict check below.
+    if read_req.length == 0 {
+        let read_response = rssmb_proto::file::ReadResponse { buffer: vec![] };
+        return FramedResponse::Plain(build_response(
+            &req.header,
+            ResponseContent::Read(read_response),
+        ));
     }
 
     // Byte-range lock check: a READ must not conflict with an exclusive lock
@@ -5394,6 +5507,7 @@ async fn handle_set_info(
                                     cancel: cancel_tx,
                                     notify_handle: None,
                                     watched_file_id: None,
+                        lock_open_volatile: None,
                                 },
                             );
                             // Send interim STATUS_PENDING. Construct manually
@@ -5657,6 +5771,7 @@ async fn handle_change_notify(
                     cancel: cancel_tx,
                     notify_handle: None,
                     watched_file_id: None,
+                        lock_open_volatile: None,
                 },
             );
             let mut response = build_response(
@@ -5703,6 +5818,7 @@ async fn handle_change_notify(
             cancel: cancel_tx,
             notify_handle: Some(notify_handle),
             watched_file_id: Some(file_id_volatile),
+            lock_open_volatile: None,
         },
     );
     drop(pending_guard);
@@ -6006,13 +6122,20 @@ async fn handle_lock(
         return error_response_for(Command::Lock, status, &req.header);
     }
 
-    // Look up the open handle, validating session/tree ownership.
+    // Look up the open handle, validating session/tree ownership. A handle
+    // that is gone (closed/tdis/logoff) is FILE_CLOSED for LOCK (torture
+    // cancel-logoff lock.c:1166 and valid-request lock.c:133 both assert
+    // FILE_CLOSED here; most other commands keep INVALID_HANDLE).
     let file_id_volatile = lock_req.file_id.volatile;
-    let entry =
-        match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
-            Ok(e) => e,
-            Err(status) => return error_response_for(Command::Lock, status, &req.header),
-        };
+    let entry = match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile)
+        .await
+    {
+        Ok(e) => e,
+        Err(NtStatus::InvalidHandle) => {
+            return error_response_for(Command::Lock, NtStatus::FileClosed, &req.header)
+        }
+        Err(status) => return error_response_for(Command::Lock, status, &req.header),
+    };
 
     // Pipe opens don't support byte-range locks.
     if entry.is_pipe {
@@ -6106,6 +6229,11 @@ async fn handle_lock(
         let offset = element.offset;
         let length = element.length;
         let exclusive = flags & lock_flags::EXCLUSIVE != 0;
+        // A lock element without FAIL_IMMEDIATELY is a BLOCKING lock
+        // (MS-SMB2 3.3.5.14); SHARED/EXCLUSIVE-only first elements were
+        // validated above. Blocking only applies to the single-element
+        // request (the multi-element case already failed validation).
+        let blocking = flags & lock_flags::FAIL_IMMEDIATELY == 0;
 
         // Per-element validation (smbd's second switch): a non-unlock
         // request accepts only SHARED, EXCLUSIVE, SHARED|FI or
@@ -6127,10 +6255,12 @@ async fn handle_lock(
             }
         }
 
-        // >63-bit lock requests (offset+length overflows u64) are
-        // NT_STATUS_INVALID_LOCK_RANGE (0xC00001A1; torture valid-request
-        // ">63-bit lock requests").
-        if length > 0 && offset.checked_add(length).is_none() {
+        // >63-bit lock requests: per MS-FSA (and Samba's byte_range_valid),
+        // INVALID_LOCK_RANGE only when (offset + length - 1) wraps AND
+        // length != 0 — so offset=u64::MAX with length=1 (the single last
+        // byte) is a VALID lock (torture lock "Trying max/1 lock" asserts
+        // OK at lock.c:747).
+        if length != 0 && (length - 1) > u64::MAX - offset {
             for (o, l, _) in &acquired {
                 let _ = state
                     .open_table
@@ -6162,16 +6292,112 @@ async fn handle_lock(
                 acquired.push((offset, length, exclusive));
             }
             Err(_conflict) => {
-                // Lock conflict — roll back all locks acquired so far.
+                // Blocking lock (no FAIL_IMMEDIATELY): pend until the
+                // conflicting range is released, the request is cancelled,
+                // or the server-side timeout — then either grant
+                // (STATUS_OK async completion) or fail LOCK_NOT_GRANTED
+                // (MS-SMB2 3.3.5.14; torture async/cancel/cancel-tdis/
+                // cancel-logoff).
+                if blocking {
+                    let message_id = req.header.message_id;
+                    let (wake_tx, mut wake_rx) = tokio::sync::watch::channel(false);
+                    let waiter = opens::LockWaiter {
+                        file_id,
+                        open_id: entry.open_id,
+                        elements: vec![(offset, length, exclusive)],
+                        wake: wake_tx,
+                    };
+                    let rx = state.open_table.register_lock_waiter(waiter).await;
+                    let _ = rx;
+                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                    conn_state.pending_async.lock().await.insert(
+                        message_id,
+                        AsyncOp {
+                            command: Command::Lock,
+                            session_id,
+                            tree_id,
+                            cancel: cancel_tx,
+                            notify_handle: None,
+                            watched_file_id: None,
+                            lock_open_volatile: Some(file_id_volatile),
+                        },
+                    );
+                    let mut pending_hdr = req.header.clone();
+                    pending_hdr.status = NtStatus::Pending.to_u32();
+                    pending_hdr.to_async(message_id);
+                    pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+                    let pending_resp = PlainResponse {
+                        header: pending_hdr,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    };
+                    let conn_clone = conn_state.clone();
+                    let req_header = req.header.clone();
+                    let open_table = state.open_table.clone();
+                    let entry_open_id = entry.open_id;
+                    let client_signed = req.header.flags.signed();
+                    tokio::spawn(async move {
+                        let timeout = tokio::time::sleep(std::time::Duration::from_secs(35));
+                        tokio::pin!(timeout);
+                        let granted = tokio::select! {
+                            _ = wake_rx.changed() => true,
+                            _ = timeout => false,
+                            _ = cancel_rx => {
+                                conn_clone.pending_async.lock().await.remove(&message_id);
+                                return;
+                            }
+                        };
+                        // Ownership rule: the completion is sent only by the
+                        // task that successfully removes the pending_async
+                        // entry. CLOSE/TDIS/LOGOFF sweeps complete pended
+                        // locks out-of-band and remove the entry first, so a
+                        // woken watcher whose entry is gone must stay silent
+                        // (a second response for the same MessageId is
+                        // INVALID_NETWORK_RESPONSE for the client).
+                        if conn_clone.pending_async.lock().await.remove(&message_id).is_none() {
+                            return;
+                        }
+                        // Re-check and apply atomically; a lost race (another
+                        // waiter or request grabbed the range) fails.
+                        let outcome = if granted
+                            && open_table
+                                .acquire_range_lock(
+                                    file_id,
+                                    entry_open_id,
+                                    session_id,
+                                    tree_id,
+                                    offset,
+                                    length,
+                                    exclusive,
+                                )
+                                .await
+                                .is_ok()
+                        {
+                            NtStatus::Success
+                        } else {
+                            NtStatus::LockNotGranted
+                        };
+                        let mut resp = build_response(
+                            &req_header,
+                            ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
+                        );
+                        resp.header.to_async(message_id);
+                        resp.header.status = outcome.to_u32();
+                        resp.header.credit_charge = 0;
+                        resp.header.credit_request = 0;
+                        send_unsolicited(&conn_clone, &FramedResponse::Plain(resp), client_signed)
+                            .await;
+                    });
+                    return FramedResponse::Plain(pending_resp);
+                }
+                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED.
                 for (o, l, _) in &acquired {
                     let _ = state
                         .open_table
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;
                 }
-                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED. Blocking locks (no
-                // FAIL_IMMEDIATELY) will pend in K5; for now they also
-                // fail immediately with LOCK_NOT_GRANTED.
                 return error_response_for(
                     Command::Lock,
                     NtStatus::LockNotGranted,
@@ -6449,7 +6675,10 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
                         conn_id = conn_state.conn_id,
                         newest, "cancel: pre-interim CANCEL (mid=0) — cancelled newest pending op"
                     );
-                    return Some(finish_cancel(conn_state, op, newest, req_header).await);
+                    finish_cancel(conn_state, op, newest, req_header).await;
+                    // CANCEL never gets its own response; the completion was
+                    // already sent out-of-band.
+                    return None;
                 }
             }
         }
@@ -6459,7 +6688,12 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
         );
         return None;
     };
-    Some(finish_cancel(conn_state, op, target, req_header).await)
+    finish_cancel(conn_state, op, target, req_header).await;
+    // CANCEL never gets a response (MS-SMB2 3.3.5.16); the STATUS_CANCELLED
+    // completion went out-of-band above. Returning it here too made the
+    // read loop send it twice (torture lock `cancel`: INVALID_NETWORK_
+    // RESPONSE at lock.c:926).
+    None
 }
 
 /// Fire the cancel signal, stop any watcher, and send the STATUS_CANCELLED
@@ -6531,6 +6765,7 @@ async fn pend_until_breaks(
             cancel: cancel_tx,
             notify_handle: None,
             watched_file_id: None,
+                        lock_open_volatile: None,
         },
     );
     let mut pending_hdr = req_header.clone();
