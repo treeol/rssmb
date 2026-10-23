@@ -86,7 +86,7 @@ def main():
             # Write 4 MiB of data — enough to observe the temp during the write.
             data = bytes(range(256)) * (4 * 1024 * 1024 // 256)
             c.putFile(SHARE, "poc_test_1.bin", io.BytesIO(data).read)
-            c.disconnect()
+            c.logoff()
 
         def poll_host():
             while not stop_polling.is_set():
@@ -136,7 +136,7 @@ def main():
         c.login("alice", "TestPass123")
         buf = io.BytesIO()
         c.getFile(SHARE, "poc_test_1.bin", buf.write)
-        c.disconnect()
+        c.logoff()
         expected = bytes(range(256)) * (4 * 1024 * 1024 // 256)
         assert buf.getvalue() == expected, "Data mismatch after publish"
         print(f"  [host] data integrity: {len(buf.getvalue())} bytes verified — PASS")
@@ -152,7 +152,7 @@ def main():
             f"No temp name must appear in listing, got {names}"
         )
         print(f"  [SMB] listing: {names}")
-        c.disconnect()
+        c.logoff()
         print("  ✅ Test 2: PASS")
 
         # ── Test 3: Two-handle scenario (low-level API) ──
@@ -189,11 +189,11 @@ def main():
             f"B must not see temp, got {names2}"
         )
         print(f"  [B] listing: {names2}")
-        c2.disconnect()
+        c2.logoff()
 
         # Close — publishes.
         smb.close(tid, fid)
-        c.disconnect()
+        c.logoff()
         time.sleep(0.3)
 
         # Host: final exists, temp gone.
@@ -214,7 +214,7 @@ def main():
         c3.login("alice", "TestPass123")
         buf2 = io.BytesIO()
         c3.getFile(SHARE, "poc_test_2.txt", buf2.write)
-        c3.disconnect()
+        c3.logoff()
         assert buf2.getvalue() == b"two-handle data\n", (
             f"Data mismatch: expected 'two-handle data\\n', got {buf2.getvalue()!r}"
         )
