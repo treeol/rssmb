@@ -4403,8 +4403,7 @@ async fn handle_read(
         let max_read = read_req.length as usize;
         let _ = max_read;
         if data.is_empty() {
-            return error_response_for(Command::Read, NtStatus::Other(0xC000_0050), &req.header);
-            // STATUS_PIPE_EMPTY = 0xC0000050
+            return error_response_for(Command::Read, NtStatus::PipeEmpty, &req.header);
         }
         let read_response = rssmb_proto::file::ReadResponse { buffer: data };
         let mut response = build_response(&req.header, ResponseContent::Read(read_response));
@@ -4430,7 +4429,7 @@ async fn handle_read(
         {
             return error_response_for(
                 Command::Read,
-                NtStatus::Other(0xC000_0070), // STATUS_FILE_LOCK_CONFLICT
+                NtStatus::FileLockConflict,
                 &req.header,
             );
         }
@@ -4626,7 +4625,7 @@ async fn handle_write(
         {
             return error_response_for(
                 Command::Write,
-                NtStatus::Other(0xC000_0070), // STATUS_FILE_LOCK_CONFLICT
+                NtStatus::FileLockConflict,
                 &req.header,
             );
         }
@@ -5801,8 +5800,7 @@ async fn handle_ioctl(
         let (output, read_status) = state.read(max_output);
 
         if output.is_empty() {
-            return error_response_for(Command::Ioctl, NtStatus::Other(0xC000_0050), &req.header);
-            // STATUS_PIPE_EMPTY
+            return error_response_for(Command::Ioctl, NtStatus::PipeEmpty, &req.header);
         }
 
         let ioctl_resp = rssmb_proto::ioctl::IoctlResponse {
@@ -6089,7 +6087,7 @@ async fn handle_lock(
                 // not supported yet, so we always return LOCK_NOT_GRANTED.
                 return error_response_for(
                     Command::Lock,
-                    NtStatus::Other(0xC000_005A), // STATUS_LOCK_NOT_GRANTED
+                    NtStatus::LockNotGranted,
                     &req.header,
                 );
             }

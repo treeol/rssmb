@@ -40,10 +40,21 @@ pub enum NtStatus {
     ObjectNameNotFound,
     /// Object name collision (0xC0000035)
     ObjectNameCollision,
-    /// Duplicate object ID (0xC0000042) — e.g. a non-replay DH2Q reusing a
+    /// Duplicate object ID (0xC000022A) — e.g. a non-replay DH2Q reusing a
     /// CreateGuid that is still held by a live durable open (MS-SMB2
-    /// 3.3.5.9.10).
+    /// 3.3.5.9.10). Value per MS-ERREF §2.3.1; 0xC0000042 is
+    /// STATUS_INVALID_PORT_HANDLE, not this code.
     DuplicateObjectId,
+    /// Lock not granted (0xC0000055) — an overlapping conflicting lock is
+    /// held (MS-SMB2 2.2.21; MS-ERREF §2.3.1).
+    LockNotGranted,
+    /// File lock conflict (0xC0000054) — a byte-range lock conflicts with
+    /// the attempted READ/WRITE (MS-ERREF §2.3.1). 0xC0000070 is
+    /// STATUS_INVALID_WORKSTATION, not this code.
+    FileLockConflict,
+    /// Named pipe empty (0xC00000D9) — read on a pipe with no data
+    /// available (MS-ERREF §2.3.1). 0xC0000050 is STATUS_EA_TOO_LARGE.
+    PipeEmpty,
     /// Object name invalid (0xC0000033) — invalid path/name
     ObjectNameInvalid,
     /// Sharing violation (0xC0000043)
@@ -104,7 +115,10 @@ impl NtStatus {
             NtStatus::AccessDenied => 0xC0000022,
             NtStatus::ObjectNameNotFound => 0xC0000034,
             NtStatus::ObjectNameCollision => 0xC0000035,
-            NtStatus::DuplicateObjectId => 0xC0000042,
+            NtStatus::DuplicateObjectId => 0xC000022A,
+            NtStatus::LockNotGranted => 0xC0000055,
+            NtStatus::FileLockConflict => 0xC0000054,
+            NtStatus::PipeEmpty => 0xC00000D9,
             NtStatus::ObjectNameInvalid => 0xC0000033,
             NtStatus::SharingViolation => 0xC0000043,
             NtStatus::FileIsADirectory => 0xC00000BA,
@@ -163,6 +177,10 @@ impl NtStatus {
             0xC0000003 => NtStatus::InvalidInfoClass,
             0xC00000C9 => NtStatus::NetworkNameDeleted,
             0xC0000203 => NtStatus::UserSessionDeleted,
+            0xC000022A => NtStatus::DuplicateObjectId,
+            0xC0000055 => NtStatus::LockNotGranted,
+            0xC0000054 => NtStatus::FileLockConflict,
+            0xC00000D9 => NtStatus::PipeEmpty,
             0xC05D0000 => NtStatus::SmbNoPreauthIntegrityHashOverlap,
             _ => NtStatus::Other(val),
         }
@@ -201,6 +219,10 @@ mod tests {
             NtStatus::LogonFailure,
             NtStatus::EndOfFile,
             NtStatus::NoMoreEntries,
+            NtStatus::DuplicateObjectId,
+            NtStatus::LockNotGranted,
+            NtStatus::FileLockConflict,
+            NtStatus::PipeEmpty,
         ];
         for code in codes {
             let raw = code.to_u32();
