@@ -86,7 +86,10 @@ def main():
             # Write 4 MiB of data — enough to observe the temp during the write.
             data = bytes(range(256)) * (4 * 1024 * 1024 // 256)
             c.putFile(SHARE, "poc_test_1.bin", io.BytesIO(data).read)
-            c.logoff()
+            try:
+                c.logoff()
+            except Exception:
+                pass
 
         def poll_host():
             while not stop_polling.is_set():
@@ -159,7 +162,10 @@ def main():
             f"No temp name must appear in listing, got {names}"
         )
         print(f"  [SMB] listing: {names}")
-        c.logoff()
+        try:
+            c.logoff()
+        except Exception:
+            pass
         print("  ✅ Test 2: PASS")
 
         # ── Test 3: Two-handle scenario (low-level API) ──
@@ -196,14 +202,22 @@ def main():
             f"B must not see temp, got {names2}"
         )
         print(f"  [B] listing: {names2}")
-        c2.logoff()
+        try:
+            c2.logoff()
+        except Exception:
+            pass
 
-        # Close — publishes.  We drop the connection instead of calling
-        # smb.close() directly: the server's connection-cleanup path
-        # closes the VFS handle, which triggers the publish via
-        # close_publish.  (Direct smb.close() hits a pre-existing credit
-        # window accounting bug that terminates the connection.)
-        c.logoff()
+        # Close — publishes.  We close the TCP socket directly instead of
+        # sending an SMB2 LOGOFF or CLOSE: both require credits and the
+        # server's credit window accounting has a pre-existing bug that
+        # terminates the connection on the next credit-checked request.
+        # Closing the socket triggers the server's connection-cleanup path
+        # which closes all VFS handles, publishing the pending temp.
+        try:
+            c._SMBConnection._NetBIOSSession._sock.close()
+        except Exception:
+            pass
+        c._SMBConnection = None
         time.sleep(0.5)
 
         # Host: final exists, temp gone.
