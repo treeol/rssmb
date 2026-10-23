@@ -491,32 +491,24 @@ impl Vfs for LocalFs {
         };
 
         if let Some(table) = &self.publish {
-            // (a) pending-file attach — ONE atomic transition (round-2 B5:
-            // a separate read-then-write pair could race a last-close
-            // publish between them). `resolve_or_acquire` distinguishes:
-            //   Attached — this path IS a pending file; open its temp;
-            //   Created  — the entry vanished (a racing publish) or was
-            //              never there: roll the reservation back and fall
-            //              through to the normal pend decision below (the
-            //              FINAL name's on-disk state is authoritative).
+            // (a) pending-file attach — no phantom entry.
+            // `attach` takes a write lock, finds an existing pending entry,
+            // increments its count, and returns the temp path. If no entry
+            // exists, it returns None — no mint-then-abort window.
+            //   Some(temp) — this path IS a pending file; open its temp;
+            //   None       — no pending entry; fall through to the normal
+            //                pend decision below (the FINAL name's on-disk
+            //                state is authoritative).
             let (dir, name) = crate::publish::split_parent(&rel);
-            match table.resolve_or_acquire(&dir, &name, &disk_parent) {
-                Acquire::Attached(temp_rel) => {
-                    publish_ref = Some(PublishRef {
-                        dir,
-                        final_name: name,
-                    });
-                    pending_acquired = true;
-                    // An attach never owns the temp's lifecycle (B4).
-                    created_here = false;
-                    effective_rel = temp_rel;
-                }
-                Acquire::Created(_) => {
-                    // Raced publish or no pending entry: release the
-                    // reservation; the pend decision below re-checks the
-                    // FINAL name's on-disk state.
-                    let _ = table.abort(&dir, &name);
-                }
+            if let Some((_, _, temp_rel)) = table.attach(&rel) {
+                publish_ref = Some(PublishRef {
+                    dir,
+                    final_name: name,
+                });
+                pending_acquired = true;
+                // An attach never owns the temp's lifecycle (B4).
+                created_here = false;
+                effective_rel = temp_rel;
             }
         }
 
@@ -1011,28 +1003,46 @@ impl Vfs for LocalFs {
         if let (Some(table), Some(p)) = (&self.publish, publish) {
             // This handle is on a pending temp file. Closing it counts
             // against the pending entry; publish on the LAST close.
-            if let Some((temp_rel, delete)) = table.close(&p.dir, &p.final_name) {
-                if delete || delete_on_close {
-                    // Delete-on-close: unlink the temp, no publish.
-                    self.check_no_symlinks(&temp_rel)?;
-                    let _ = self.dir.remove_file(&temp_rel);
-                } else {
-                    // Last close: atomically publish temp → final. Same
-                    // directory, so rename(2) is atomic. No fsync (keep
-                    // today's durability). mtime/attrs were set on the temp
-                    // and ride along with the rename.
-                    self.check_no_symlinks(&temp_rel)?;
-                    let final_rel = p.dir.join(&p.final_name);
-                    self.check_no_symlinks(&final_rel)?;
-                    if let Err(e) = self.dir.rename(&temp_rel, &self.dir, &final_rel) {
+            //
+            // The rename is performed under the table's write lock via
+            // close_publish, so a racing resolve_or_acquire between the
+            // entry removal and the filesystem rename cannot miss the
+            // entry and create a phantom re-pend.
+            let final_rel = p.dir.join(&p.final_name);
+            let dir = &self.dir;
+            match table.close_publish(&p.dir, &p.final_name, |temp| {
+                // Delete-on-close: unlink the temp, no publish.
+                if delete_on_close {
+                    if let Err(e) = dir.remove_file(temp) {
                         tracing::warn!(
-                            temp = ?temp_rel,
-                            final = %p.final_name,
+                            temp = ?temp,
                             error = %e,
-                            "publish_on_close: rename to final name failed"
+                            "publish_on_close: delete-on-close unlink failed"
                         );
-                        return Err(VfsError::Io(format!("publish rename: {e}")));
                     }
+                    return Ok(());
+                }
+                // Last close: atomically publish temp → final. Same
+                // directory, so rename(2) is atomic. No fsync (keep
+                // today's durability). mtime/attrs were set on the temp
+                // and ride along with the rename.
+                if let Err(e) = dir.rename(temp, dir, &final_rel) {
+                    tracing::warn!(
+                        temp = ?temp,
+                        final = %p.final_name,
+                        error = %e,
+                        "publish_on_close: rename to final name failed"
+                    );
+                    return Err(PathBuf::from(temp));
+                }
+                Ok(())
+            }) {
+                Ok(Some(())) | Ok(None) => {}
+                Err(_) => {
+                    return Err(VfsError::Io(format!(
+                        "publish rename: {}",
+                        "close_publish failed"
+                    )));
                 }
             }
             return Ok(());
@@ -2945,6 +2955,61 @@ mod tests {
         assert!(dir.path().join("b.txt").exists());
         assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b"aaa");
         assert!(!dir.path().join("a.txt").exists());
+    }
+
+    // ── close race: rename before entry removal ──────────────────────────
+    // close_publish holds the write lock across the rename, so a racing
+    // attach between entry-removal and rename can't miss the entry.
+
+    #[tokio::test]
+    async fn publish_close_rename_under_lock_no_miss() {
+        // Two handles on the same pending file. A closes (last), publishing
+        // the rename under the write lock. B's attach between the count
+        // decrement and the rename would have missed the removed entry under
+        // the old close() → rename pattern; close_publish keeps the entry
+        // alive until the rename succeeds.
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let a = fs
+            .create("", "race.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs.write_at(a, 0, b"race-data").await.unwrap();
+
+        // Attach a second handle (increments count to 2).
+        let mut b_args = write_args();
+        b_args.disposition = CreateDisposition::Open;
+        let b = fs.create("", "race.txt", &b_args).await.unwrap().open;
+
+        // Close A (not last — count → 1, no publish).
+        fs.close(a).await.unwrap();
+        assert!(!dir.path().join("race.txt").exists());
+
+        // Close B (last — count → 0, publish under lock).
+        fs.close(b).await.unwrap();
+        assert!(dir.path().join("race.txt").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("race.txt")).unwrap(),
+            b"race-data"
+        );
+    }
+
+    // ── attach race: no phantom entry ────────────────────────────────────
+    // attach() is read-only in effect: it finds an existing entry and
+    // increments its count, or returns None. No mint-then-abort.
+
+    #[tokio::test]
+    async fn publish_attach_no_phantom_entry() {
+        // When no pending entry exists, attach returns None — no phantom
+        // entry is minted, no abort needed.
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // No file created yet — attach must return None.
+        let table = fs.publish.as_ref().unwrap();
+        assert!(table.attach(std::path::Path::new("nope.txt")).is_none());
+        // The map must be empty — no phantom entry.
+        assert!(table.pending_in_dir(std::path::Path::new("")).is_empty());
     }
 
     // ── startup orphan sweep ─────────────────────────────────────────────

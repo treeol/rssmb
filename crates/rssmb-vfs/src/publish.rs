@@ -332,6 +332,24 @@ impl PendingPublishTable {
         temp.map(|t| (dir, name, t))
     }
 
+    /// Attach to an existing pending entry for `rel` (count++), returning
+    /// the authoritative temp path. Returns `None` if no pending entry
+    /// exists — no phantom entry is created, no abort needed.
+    ///
+    /// This replaces the old probe-via-`resolve_or_acquire` that minted a
+    /// `Created` entry and immediately aborted it (a window where a racing
+    /// `close` or `resolve_or_acquire` could see the phantom entry).
+    pub fn attach(&self, rel: &Path) -> Option<(PathBuf, String, PathBuf)> {
+        let (dir, name) = split_parent(rel);
+        let kdir = self.share.key_dir(&dir);
+        let kname = self.share.key_name(&name);
+        let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
+        let map = dirs.get_mut(&kdir)?;
+        let pending = map.get_mut(&kname)?;
+        pending.open_count += 1;
+        Some((dir, name, pending.temp_name.clone()))
+    }
+
     /// Atomically resolve-or-acquire a pending file: attach to an existing
     /// pending entry (count++) or mint a new one, all under one write lock
     /// (B1). Returns the **authoritative** temp path from the map — the
@@ -405,6 +423,56 @@ impl PendingPublishTable {
         }
         let pending = map.remove(&kname)?;
         Some((pending.temp_name, pending.delete_on_close))
+    }
+
+    /// Last-close publish: decrement the count and, if this is the last
+    /// close, call `publish_fn(temp)` **under the write lock** so that no
+    /// racing `resolve_or_acquire` can create a phantom entry between the
+    /// entry removal and the filesystem rename. The entry is removed only
+    /// after `publish_fn` returns `Ok(())`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — not the last close (count > 0 after decrement).
+    /// - `Ok(Some(()))` — last close, `publish_fn` succeeded, entry removed.
+    /// - `Err(temp)` — last close, `publish_fn` failed; the entry is NOT
+    ///   removed (the caller may retry or abort).
+    pub fn close_publish(
+        &self,
+        dir: &Path,
+        name: &str,
+        publish_fn: impl FnOnce(&Path) -> Result<(), PathBuf>,
+    ) -> Result<Option<()>, PathBuf> {
+        let kdir = self.share.key_dir(dir);
+        let kname = self.share.key_name(name);
+        let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
+        let map = dirs.get_mut(&kdir).ok_or_else(|| {
+            PathBuf::new() // no entry — caller shouldn't call close_publish
+        })?;
+        let pending = map.get_mut(&kname).ok_or_else(|| PathBuf::new())?;
+        pending.open_count = pending.open_count.saturating_sub(1);
+        if pending.open_count > 0 {
+            return Ok(None);
+        }
+        // Last close: extract the entry, then call publish_fn while we still
+        // hold the write lock. The entry stays in the map until publish_fn
+        // succeeds — a racing resolve_or_acquire will attach to it (correct:
+        // the file is still pending, not yet published on disk).
+        let pending = map.remove(&kname).ok_or_else(|| PathBuf::new())?;
+        if pending.delete_on_close {
+            // Delete-on-close: caller unlinks the temp, no publish.
+            // Return the temp path via Err so the caller can unlink it.
+            // The entry is already removed.
+            return Err(pending.temp_name);
+        }
+        match publish_fn(&pending.temp_name) {
+            Ok(()) => Ok(Some(())),
+            Err(temp) => {
+                // Publish failed: put the entry back so the caller can retry
+                // or the sweeper can clean it up later.
+                map.insert(kname, pending);
+                Err(temp)
+            }
+        }
     }
 
     /// Set or clear delete-on-close on the pending entry for `dir/name`.
