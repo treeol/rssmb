@@ -20,9 +20,10 @@ pub struct LockRequest {
     #[bw(try_calc(u16::try_from(locks.len())))]
     #[br(temp)]
     lock_count: u16,
-    #[bw(calc = 0)]
-    #[br(temp)]
-    lock_sequence: u32,
+    /// LockSequence (MS-SMB2 2.2.21): bucket number in the high bits
+    /// (sequence >> 4, buckets 1..=64 valid), sequence value in the low
+    /// nibble. The server uses it to detect replayed lock requests.
+    pub lock_sequence: u32,
     /// The file handle to lock.
     pub file_id: FileId,
     /// Array of LOCK_ELEMENT structures (each 24 bytes).
@@ -81,6 +82,7 @@ mod tests {
     #[test]
     fn test_lock_request_roundtrip() {
         let req = LockRequest {
+            lock_sequence: 0x0121, // bucket 1, value 1 — round-trips
             file_id: FileId {
                 persistent: 1,
                 volatile: 2,
@@ -119,6 +121,7 @@ mod tests {
     #[test]
     fn test_lock_request_multiple_elements() {
         let req = LockRequest {
+            lock_sequence: 0x0402, // bucket 4, value 2 — round-trips
             file_id: FileId {
                 persistent: 10,
                 volatile: 20,

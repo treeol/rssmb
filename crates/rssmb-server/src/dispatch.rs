@@ -65,6 +65,13 @@ pub struct OpenEntry {
     /// persistent id in the DurableTable's v1 side table. `None` for
     /// non-durable and v2-durable opens.
     pub durable_persistent_id: Option<u64>,
+    /// LockSequence replay-detection array (MS-SMB2 3.3.5.14; smbd's
+    /// fsp->op->global->lock_sequence_array): 64 buckets, each storing the
+    /// last successfully processed sequence value (low nibble), 0xFF =
+    /// invalid/never-set. Enabled for ALL opens when the server
+    /// advertises SMB2_CAP_MULTI_CHANNEL (which we do) or the open is
+    /// durable — same rule smbd implements from the spec.
+    pub lock_sequence_array: Arc<std::sync::Mutex<[u8; 64]>>,
 }
 
 /// Per-open directory enumeration cursor (MS-SMB2 3.3.5.18).
@@ -410,8 +417,18 @@ pub struct AsyncOp {
     /// Sender to deliver the completion response to the write task.
     pub cancel: tokio::sync::oneshot::Sender<()>,
     /// Optional directory watch handle for CHANGE_NOTIFY. Dropping this
-    /// stops the background watcher task.
+    /// closes only the op's own watch — it must NOT be used to stop
+    /// unrelated pending notifies.
     pub notify_handle: Option<crate::notify::NotifyHandle>,
+    /// The volatile id of the watched directory handle (CHANGE_NOTIFY
+    /// only). CLOSE of THIS handle completes the notify with
+    /// STATUS_NOTIFY_CLEANUP; CLOSE of any other handle on the tree must
+    /// leave the notify pending.
+    pub watched_file_id: Option<u64>,
+    /// The volatile id of the open that pended a blocking LOCK. CLOSE of
+    /// that open completes the pended lock with RANGE_NOT_LOCKED (torture
+    /// cancel "cancel by close").
+    pub lock_open_volatile: Option<u64>,
 }
 
 /// A tree connection entry tracking the owning session and VFS backend.
@@ -1903,6 +1920,28 @@ async fn handle_session_setup(
                     "session_setup complete — PreviousSessionId check"
                 );
                 if previous_session_id != 0 && previous_session_id != session_id {
+                    // Complete the old session's pending CHANGE_NOTIFY ops
+                    // with NOTIFY_CLEANUP before tearing it down — the
+                    // client is blocked in smb2_notify_recv and expects the
+                    // async completion (smb2.notify session-reconnect).
+                    {
+                        let mut pending = conn_state.pending_async.lock().await;
+                        let keys: Vec<u64> = pending
+                            .iter()
+                            .filter(|(_, op)| {
+                                op.command == Command::ChangeNotify
+                                    && op.session_id == previous_session_id
+                            })
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for key in keys {
+                            if let Some(op) = pending.remove(&key) {
+                                drop(pending);
+                                send_notify_cleanup(conn_state, key, op).await;
+                                pending = conn_state.pending_async.lock().await;
+                            }
+                        }
+                    }
                     teardown_previous_session(state, previous_session_id, &identity.username).await;
                 }
             }
@@ -2070,6 +2109,20 @@ async fn handle_logoff(
 ) -> FramedResponse {
     let session_id = req_header.session_id;
 
+    // LOGOFF of an unknown/already-logged-off session fails with
+    // USER_SESSION_DELETED (MS-SMB2 3.3.5.6; torture connect.c:248 logs
+    // off twice and asserts the second logoff fails with this). Checked
+    // BEFORE teardown so the first (valid) logoff succeeds.
+    if !conn_state
+        .sessions
+        .read()
+        .await
+        .iter()
+        .any(|s| s.id == session_id)
+    {
+        return error_response_for(Command::Logoff, NtStatus::UserSessionDeleted, req_header);
+    }
+
     // Remove all opens belonging to this session, closing them via VFS.
     let removed = {
         let opens_ref = conn_state.opens_ref();
@@ -2161,7 +2214,10 @@ async fn handle_logoff(
         st.retiring = true;
     }
 
-    // Cancel any pending async ops for this session.
+    // Cancel any pending async ops for this session. CHANGE_NOTIFY ops
+    // get the async STATUS_NOTIFY_CLEANUP completion (MS-SMB2: logoff
+    // ends the watches and notifies the client) — silently dropping them
+    // left smb2.notify logoff waiting forever.
     {
         let mut pending = conn_state.pending_async.lock().await;
         let to_remove: Vec<u64> = pending
@@ -2171,19 +2227,51 @@ async fn handle_logoff(
             .collect();
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
-                let _ = op.cancel.send(());
-                if let Some(handle) = op.notify_handle {
-                    handle.cancel();
+                if op.command == Command::ChangeNotify {
+                    drop(pending);
+                    send_notify_cleanup(conn_state, key, op).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else if op.command == Command::Lock {
+                    // Pended blocking LOCK: complete out-of-band (torture
+                    // cancel-logoff accepts RANGE_NOT_LOCKED or OK).
+                    drop(pending);
+                    let mut header = Header {
+                        credit_charge: 0,
+                        status: NtStatus::RangeNotLocked.to_u32(),
+                        command: Command::Lock,
+                        credit_request: 0,
+                        flags: HeaderFlags::new().with_server_to_redir(true),
+                        next_command: 0,
+                        message_id: key,
+                        tree_id: Some(op.tree_id),
+                        async_id: None,
+                        session_id: op.session_id,
+                        signature: 0,
+                    };
+                    header.to_async(key);
+                    let resp = FramedResponse::Plain(PlainResponse {
+                        header,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    });
+                    send_unsolicited(conn_state, &resp, true).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else {
+                    let _ = op.cancel.send(());
+                    if let Some(handle) = op.notify_handle {
+                        handle.cancel();
+                    }
                 }
             }
         }
     }
 
-    let response = build_response(
+    let resp = build_response(
         req_header,
         ResponseContent::Logoff(rssmb_proto::session_setup::LogoffResponse::default()),
     );
-    FramedResponse::Plain(response)
+    FramedResponse::Plain(resp)
 }
 
 /// Build an ECHO response.
@@ -2507,7 +2595,16 @@ async fn handle_tree_disconnect(
             .unwrap_or(false)
     };
     if !tree_owned {
-        return error_response_for(Command::TreeDisconnect, NtStatus::AccessDenied, req_header);
+        // Second TDIS on an already-disconnected tree: the tree id is
+        // simply unknown. MS-SMB2 3.3.5.9 has no success path here —
+        // torture connect.c:234 double-tdis asserts
+        // NT_STATUS_NETWORK_NAME_DELETED (Windows/Samba behavior), not
+        // ACCESS_DENIED.
+        return error_response_for(
+            Command::TreeDisconnect,
+            NtStatus::NetworkNameDeleted,
+            req_header,
+        );
     }
 
     // Remove all opens belonging to this tree, closing them via VFS.
@@ -2566,7 +2663,10 @@ async fn handle_tree_disconnect(
     // Remove the tree from the connection tree table.
     conn_state.trees_ref().write().await.remove(&tree_id);
 
-    // Cancel any pending async ops for this tree.
+    // Cancel any pending async ops for this tree. CHANGE_NOTIFY ops get
+    // the async STATUS_NOTIFY_CLEANUP completion (MS-SMB2 3.3.5.10: tree
+    // disconnect ends the watch and notifies the client) — silently
+    // dropping them left smb2.notify tdis/tdis1 waiting forever.
     {
         let mut pending = conn_state.pending_async.lock().await;
         let to_remove: Vec<u64> = pending
@@ -2576,9 +2676,44 @@ async fn handle_tree_disconnect(
             .collect();
         for key in to_remove {
             if let Some(op) = pending.remove(&key) {
-                let _ = op.cancel.send(());
-                if let Some(handle) = op.notify_handle {
-                    handle.cancel();
+                if op.command == Command::ChangeNotify {
+                    drop(pending);
+                    send_notify_cleanup(conn_state, key, op).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else if op.command == Command::Lock {
+                    // Pended blocking LOCK: complete it out-of-band so the
+                    // client's smb2_lock_recv unblocks (torture cancel-tdis
+                    // accepts RANGE_NOT_LOCKED or OK; a silent drop made the
+                    // client wait for its 35 s timeout → IO_TIMEOUT at
+                    // lock.c:1064).
+                    drop(pending);
+                    let mut header = Header {
+                        credit_charge: 0,
+                        status: NtStatus::RangeNotLocked.to_u32(),
+                        command: Command::Lock,
+                        credit_request: 0,
+                        flags: HeaderFlags::new().with_server_to_redir(true),
+                        next_command: 0,
+                        message_id: key,
+                        tree_id: Some(op.tree_id),
+                        async_id: None,
+                        session_id: op.session_id,
+                        signature: 0,
+                    };
+                    header.to_async(key);
+                    let resp = FramedResponse::Plain(PlainResponse {
+                        header,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    });
+                    send_unsolicited(conn_state, &resp, true).await;
+                    pending = conn_state.pending_async.lock().await;
+                } else {
+                    let _ = op.cancel.send(());
+                    if let Some(handle) = op.notify_handle {
+                        handle.cancel();
+                    }
                 }
             }
         }
@@ -3234,6 +3369,7 @@ async fn handle_create(
                 } else {
                     Some(file_id.persistent)
                 },
+                lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
             },
         );
 
@@ -3447,6 +3583,7 @@ async fn handle_create(
                 ))),
                 durable_guid: None,
                 durable_persistent_id: None,
+                lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
             },
         );
         let create_response = rssmb_proto::create::CreateResponse {
@@ -3917,6 +4054,7 @@ async fn handle_create(
                     pipe_state: None,
                     durable_guid,
                     durable_persistent_id,
+                    lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFF; 64])),
                 },
             );
 
@@ -4250,26 +4388,79 @@ async fn handle_close(
                 }
             }
 
-            // Complete any pending CHANGE_NOTIFY for this tree with
-            // STATUS_NOTIFY_CLEANUP (MS-SMB2 3.3.5.10). Cancel the
-            // directory watcher and remove from pending_async.
+            // Complete any pending CHANGE_NOTIFY whose WATCHED HANDLE is
+            // the one being closed with STATUS_NOTIFY_CLEANUP
+            // (MS-SMB2 3.3.5.10: closes the watch and notifies the client
+            // via an async completion). Other pending CHANGE_NOTIFY ops on
+            // this tree watch DIFFERENT handles and must stay pending —
+            // cancelling them tree-wide hung smb2.notify's valid-req
+            // (setup-file CLOSE killed the unrelated root-dir watch).
             {
                 let mut pending = conn_state.pending_async.lock().await;
-                let to_remove: Vec<u64> = pending
+                let closed_volatile = file_id_volatile;
+                let cleanup_keys: Vec<u64> = pending
                     .iter()
-                    // Only CHANGE_NOTIFY is tied to a handle being closed;
-                    // other async ops (deferred CREATE / rename awaiting a
-                    // lease-break ack) must survive unrelated CLOSEs.
-                    .filter(|(_, op)| op.tree_id == tree_id && op.command == Command::ChangeNotify)
+                    .filter(|(_, op)| {
+                        op.command == Command::ChangeNotify
+                            && op.tree_id == tree_id
+                            && op.watched_file_id == Some(closed_volatile)
+                    })
                     .map(|(k, _)| *k)
                     .collect();
-                for key in to_remove {
+                for key in cleanup_keys {
                     if let Some(op) = pending.remove(&key) {
-                        let _ = op.cancel.send(());
-                        // Cancel the notify watcher if present.
-                        if let Some(handle) = op.notify_handle {
-                            handle.cancel();
-                        }
+                        // Guard must be released first — send_notify_cleanup
+                        // awaits, and re-locking below while the old guard
+                        // is still held would self-deadlock the connection
+                        // task (Rust drops the old binding only AFTER the
+                        // RHS completes).
+                        drop(pending);
+                        // Stops the watcher, then sends the async
+                        // NOTIFY_CLEANUP completion.
+                        send_notify_cleanup(conn_state, key, op).await;
+                        // Re-acquire for any remaining keys.
+                        pending = conn_state.pending_async.lock().await;
+                    }
+                }
+                // Pended blocking LOCKs owned by the CLOSING open are
+                // completed with RANGE_NOT_LOCKED (torture cancel "cancel
+                // by close", lock.c:978 — the client's smb2_lock_recv must
+                // unblock when h2 closes). Locks pended by other opens are
+                // untouched.
+                let lock_keys: Vec<u64> = pending
+                    .iter()
+                    .filter(|(_, op)| {
+                        op.command == Command::Lock
+                            && op.lock_open_volatile == Some(closed_volatile)
+                            && op.session_id == session_id
+                    })
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in lock_keys {
+                    if let Some(op) = pending.remove(&key) {
+                        drop(pending);
+                        let mut header = Header {
+                            credit_charge: 0,
+                            status: NtStatus::RangeNotLocked.to_u32(),
+                            command: Command::Lock,
+                            credit_request: 0,
+                            flags: HeaderFlags::new().with_server_to_redir(true),
+                            next_command: 0,
+                            message_id: key,
+                            tree_id: Some(op.tree_id),
+                            async_id: None,
+                            session_id: op.session_id,
+                            signature: 0,
+                        };
+                        header.to_async(key);
+                        let resp = FramedResponse::Plain(PlainResponse {
+                            header,
+                            content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                                error_data: vec![],
+                            }),
+                        });
+                        send_unsolicited(conn_state, &resp, true).await;
+                        pending = conn_state.pending_async.lock().await;
                     }
                 }
             }
@@ -4299,7 +4490,10 @@ async fn handle_close(
                 file_id = file_id_volatile,
                 "close: handle not found"
             );
-            error_response_for(Command::Close, NtStatus::InvalidHandle, &req.header)
+            // Close of an unknown/already-closed handle is FILE_CLOSED
+            // (MS-SMB2 3.3.5.16: fail with STATUS_FILE_CLOSED; torture
+            // connect.c:227 asserts exactly this on double-close).
+            error_response_for(Command::Close, NtStatus::FileClosed, &req.header)
         }
     }
 }
@@ -4344,8 +4538,7 @@ async fn handle_read(
         let max_read = read_req.length as usize;
         let _ = max_read;
         if data.is_empty() {
-            return error_response_for(Command::Read, NtStatus::Other(0xC000_0050), &req.header);
-            // STATUS_PIPE_EMPTY = 0xC0000050
+            return error_response_for(Command::Read, NtStatus::PipeEmpty, &req.header);
         }
         let read_response = rssmb_proto::file::ReadResponse { buffer: data };
         let mut response = build_response(&req.header, ResponseContent::Read(read_response));
@@ -4360,6 +4553,19 @@ async fn handle_read(
         return error_response_for(Command::Read, NtStatus::InvalidParameter, &req.header);
     }
 
+    // A 0-byte READ is answered with OK + 0 bytes regardless of file size,
+    // offset, or lock state — even past EOF and inside another open's
+    // exclusive range (torture zerobyteread asserts OK for a 0-byte read
+    // at offset 5 under an exclusive lock [0,10); smbd behaves the same).
+    // Must precede the lock-conflict check below.
+    if read_req.length == 0 {
+        let read_response = rssmb_proto::file::ReadResponse { buffer: vec![] };
+        return FramedResponse::Plain(build_response(
+            &req.header,
+            ResponseContent::Read(read_response),
+        ));
+    }
+
     // Byte-range lock check: a READ must not conflict with an exclusive lock
     // held by a different open on the same file. We use `check_range_lock`
     // which only reports conflicts with exclusive locks by other opens.
@@ -4369,11 +4575,7 @@ async fn handle_read(
             .check_range_lock(fid, entry.open_id, read_req.offset, read_req.length as u64)
             .await
         {
-            return error_response_for(
-                Command::Read,
-                NtStatus::Other(0xC000_0070), // STATUS_FILE_LOCK_CONFLICT
-                &req.header,
-            );
+            return error_response_for(Command::Read, NtStatus::FileLockConflict, &req.header);
         }
         // Break any Write lease/oplock held by another client on this file.
         let (breaks, waiters) = state
@@ -4565,11 +4767,7 @@ async fn handle_write(
             )
             .await
         {
-            return error_response_for(
-                Command::Write,
-                NtStatus::Other(0xC000_0070), // STATUS_FILE_LOCK_CONFLICT
-                &req.header,
-            );
+            return error_response_for(Command::Write, NtStatus::FileLockConflict, &req.header);
         }
         // Break any Read or Write lease/oplock held by another client on this file.
         let (breaks, waiters) = state
@@ -5332,6 +5530,8 @@ async fn handle_set_info(
                                     tree_id,
                                     cancel: cancel_tx,
                                     notify_handle: None,
+                                    watched_file_id: None,
+                                    lock_open_volatile: None,
                                 },
                             );
                             // Send interim STATUS_PENDING. Construct manually
@@ -5594,6 +5794,8 @@ async fn handle_change_notify(
                     tree_id,
                     cancel: cancel_tx,
                     notify_handle: None,
+                    watched_file_id: None,
+                    lock_open_volatile: None,
                 },
             );
             let mut response = build_response(
@@ -5639,6 +5841,8 @@ async fn handle_change_notify(
             tree_id,
             cancel: cancel_tx,
             notify_handle: Some(notify_handle),
+            watched_file_id: Some(file_id_volatile),
+            lock_open_volatile: None,
         },
     );
     drop(pending_guard);
@@ -5678,6 +5882,7 @@ async fn handle_ioctl(
     const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
     const FSCTL_DFS_GET_REFERRALS_EX: u32 = 0x0006_01B0;
     const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
+    const FSCTL_LMR_REQ_RESILIENCY: u32 = 0x0014_01F4;
     const FSCTL_QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
     const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
     const STATUS_NOT_FOUND: u32 = 0xC000_0225;
@@ -5739,8 +5944,7 @@ async fn handle_ioctl(
         let (output, read_status) = state.read(max_output);
 
         if output.is_empty() {
-            return error_response_for(Command::Ioctl, NtStatus::Other(0xC000_0050), &req.header);
-            // STATUS_PIPE_EMPTY
+            return error_response_for(Command::Ioctl, NtStatus::PipeEmpty, &req.header);
         }
 
         let ioctl_resp = rssmb_proto::ioctl::IoctlResponse {
@@ -5903,9 +6107,42 @@ async fn handle_ioctl(
                 }
             }
         }
+        FSCTL_LMR_REQ_RESILIENCY => {
+            // MS-SMB2 3.3.5.15.15: client asks the server to make the open
+            // resilient (min 1 s timeout in the 8-byte input). We have no
+            // durable-handle wipe on connection loss for plain opens, so
+            // this is a validated no-op: require a live file handle and
+            // reply OK (torture replay_broken_windows asserts OK at
+            // lock.c:2992; the old fall-through returned
+            // INVALID_DEVICE_REQUEST).
+            let file_id_volatile = io.file_id.volatile;
+            let session_id = req.header.session_id;
+            let tree_id = req.header.tree_id.unwrap_or(0);
+            if let Err(status) =
+                lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await
+            {
+                return error_response_for(Command::Ioctl, status, &req.header);
+            }
+            NtStatus::Success
+        }
         _ => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
     };
     error_response_for(Command::Ioctl, status, &req.header)
+}
+
+/// Re-arm the LockSequence bucket with the incoming value after a request
+/// completed successfully (smbd stores `state->lock_sequence_value` in the
+/// cleanup fn on success only).
+fn rearm_lock_sequence(
+    seq_element: &Option<Arc<std::sync::Mutex<[u8; 64]>>>,
+    seq_bucket: usize,
+    seq_value: u8,
+) {
+    if let Some(arr) = seq_element {
+        if (1..=64).contains(&seq_bucket) {
+            arr.lock().unwrap()[seq_bucket - 1] = seq_value;
+        }
+    }
 }
 
 /// LOCK — acquire or release byte-range locks (MS-SMB2 3.3.5.14).
@@ -5928,14 +6165,44 @@ async fn handle_lock(
         _ => return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header),
     };
 
+    // lock_count == 0 is INVALID_PARAMETER (torture `valid-request`,
+    // MS-SMB2 2.2.21: LockCount must be at least 1).
+    if lock_req.locks.is_empty() {
+        return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+    }
+
     let session_id = req.header.session_id;
     let tree_id = req.header.tree_id.unwrap_or(0);
 
-    // Look up the open handle, validating session/tree ownership.
+    // LOCK-specific: validate the persistent half of the FileId (forged
+    // persistent → FILE_CLOSED, torture valid-request lock.c:133).
+    if let Err(status) = check_lock_file_id_persistent(conn_state, &lock_req.file_id).await {
+        return error_response_for(Command::Lock, status, &req.header);
+    }
+
+    // LockSequence replay detection (MS-SMB2 3.3.5.14; smbd
+    // smbd_smb2_lock_send): the server advertises MULTI_CHANNEL, so
+    // checking is enabled for all opens (spec SHOULD; also enabled for
+    // durable handles). Bucket = sequence >> 4 (only 1..=64 valid);
+    // value = sequence & 0xF. A replayed (bucket == stored value) request
+    // is ignored: the request returns the ORIGINAL result — replayed
+    // success is succeeded silently again, replayed failure is also
+    // suppressed, which is what the torture replay_* subtests assert.
+    let lock_sequence = lock_req.lock_sequence;
+    let seq_bucket = (lock_sequence >> 4) as usize;
+    let seq_value = (lock_sequence & 0xF) as u8;
+
+    // Look up the open handle, validating session/tree ownership. A handle
+    // that is gone (closed/tdis/logoff) is FILE_CLOSED for LOCK (torture
+    // cancel-logoff lock.c:1166 and valid-request lock.c:133 both assert
+    // FILE_CLOSED here; most other commands keep INVALID_HANDLE).
     let file_id_volatile = lock_req.file_id.volatile;
     let entry =
         match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
             Ok(e) => e,
+            Err(NtStatus::InvalidHandle) => {
+                return error_response_for(Command::Lock, NtStatus::FileClosed, &req.header)
+            }
             Err(status) => return error_response_for(Command::Lock, status, &req.header),
         };
 
@@ -5950,55 +6217,156 @@ async fn handle_lock(
         None => return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header),
     };
 
-    // Process each lock element. If any element fails, we roll back all
-    // previously acquired locks in this request (all-or-nothing per
-    // MS-SMB2 3.3.5.14: if any lock cannot be granted, the request fails
-    // and no locks from this request are applied).
+    // LockSequence check (needs the open; see comment above). smbd runs
+    // this BEFORE parsing element flags — a replayed request short-circuits
+    // to OK regardless of its content.
+    let seq_element: Option<Arc<std::sync::Mutex<[u8; 64]>>> = if (1..=64).contains(&seq_bucket) {
+        Some(entry.lock_sequence_array.clone())
+    } else {
+        None
+    };
+    if let Some(arr) = &seq_element {
+        let mut a = arr.lock().unwrap();
+        let stored = &mut a[seq_bucket - 1];
+        if *stored == seq_value {
+            // Replay of an already-successful request: ignore completely
+            // (return OK, touch nothing) — smbd tevent_req_done path.
+            return build_lock_ok(&req);
+        }
+        // Not a replay: invalidate the bucket while processing; it is
+        // re-armed with the incoming value only on success (matching
+        // smbd's cleanup fn).
+        *stored = 0xFF;
+    }
+
+    // Process the lock elements exactly like smbd (source3/smbd/smb2_lock.c,
+    // verified against torture valid-request/unlock/multiple-unlock):
+    //
+    // 1. First-element flags switch (pre-loop):
+    //    - SHARED or EXCLUSIVE alone (no FAIL_IMMEDIATELY) with >1 element
+    //      → INVALID_PARAMETER; alone it is a BLOCKING lock (K5 pends on
+    //      conflict; a conflict-free blocking lock grants immediately).
+    //    - SHARED|FI, EXCLUSIVE|FI → normal immediate locks.
+    //    - UNLOCK → the whole request is an unlock request (only the first
+    //      element may carry the UNLOCK bit, MS-SMB2 3.3.5.14).
+    //    - anything else (0, type bit | UNLOCK, stray bits) →
+    //      INVALID_PARAMETER before any state changes.
+    // 2. Non-unlock requests with >1 element: every element must carry
+    //    FAIL_IMMEDIATELY (MS-SMB2 3.3.5.14.2 SHOULD) → INVALID_PARAMETER.
+    // 3. Unlock requests: ALL unlock elements are processed first (applied
+    //    unlocks stay applied); the first missing range fails the request
+    //    with RANGE_NOT_LOCKED (deferred-invalid elements lose to a real
+    //    unlock miss); invalid (type-bit/unknown) elements then fail with
+    //    INVALID_PARAMETER (MS-SMB2 3.3.5.14.1, torture multiple-unlock
+    //    Test4/Test10).
     use rssmb_proto::lock::lock_flags;
+
+    let elements = &lock_req.locks;
+    let first_flags = elements[0].flags;
+    let isunlock = first_flags == lock_flags::UNLOCK;
+
+    match first_flags {
+        lock_flags::SHARED | lock_flags::EXCLUSIVE => {
+            if elements.len() > 1 {
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            }
+        }
+        f if f == lock_flags::SHARED | lock_flags::FAIL_IMMEDIATELY
+            || f == lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY =>
+        {
+            // SHARED|FI or EXCLUSIVE|FI — normal immediate lock.
+        }
+        lock_flags::UNLOCK => {}
+        _ => {
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+        }
+    }
+
+    if !isunlock && elements.len() > 1 {
+        for el in elements {
+            if el.flags & lock_flags::FAIL_IMMEDIATELY == 0 {
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            }
+        }
+    }
 
     let mut acquired: Vec<(u64, u64, bool)> = Vec::new();
 
-    for element in &lock_req.locks {
+    if isunlock {
+        let mut saw_invalid = false;
+        for element in elements {
+            if element.flags != lock_flags::UNLOCK {
+                // Type bit | UNLOCK or unknown flags: deferred error — all
+                // valid unlock elements are processed first.
+                saw_invalid = true;
+                continue;
+            }
+            if let Err(_miss) = state
+                .open_table
+                .release_range_lock(file_id, entry.open_id, element.offset, element.length)
+                .await
+            {
+                return error_response_for(Command::Lock, NtStatus::RangeNotLocked, &req.header);
+            }
+        }
+        if saw_invalid {
+            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+        }
+        rearm_lock_sequence(&seq_element, seq_bucket, seq_value);
+        return build_lock_ok(&req);
+    }
+
+    for element in elements {
         let flags = element.flags;
         let offset = element.offset;
         let length = element.length;
-
-        // UNLOCK flag: release a previously held lock.
-        if flags & lock_flags::UNLOCK != 0 {
-            state
-                .open_table
-                .release_range_lock(file_id, entry.open_id, offset, length)
-                .await;
-            continue;
-        }
-
-        // Validate flags: must be SHARED or EXCLUSIVE (not both).
         let exclusive = flags & lock_flags::EXCLUSIVE != 0;
-        let shared = flags & lock_flags::SHARED != 0;
-        if (exclusive && shared) || (!exclusive && !shared) {
-            // Invalid flags combination.
-            // Roll back any locks acquired so far.
+        // A lock element without FAIL_IMMEDIATELY is a BLOCKING lock
+        // (MS-SMB2 3.3.5.14); SHARED/EXCLUSIVE-only first elements were
+        // validated above. Blocking only applies to the single-element
+        // request (the multi-element case already failed validation).
+        let blocking = flags & lock_flags::FAIL_IMMEDIATELY == 0;
+
+        // Per-element validation (smbd's second switch): a non-unlock
+        // request accepts only SHARED, EXCLUSIVE, SHARED|FI or
+        // EXCLUSIVE|FI — anything else (0, type|FI mixtures like
+        // SHARED-only on a later element, UNLOCK, unknown bits) is
+        // INVALID_PARAMETER (torture valid-request flag permutations).
+        match flags {
+            lock_flags::SHARED | lock_flags::EXCLUSIVE => {}
+            f if f == lock_flags::SHARED | lock_flags::FAIL_IMMEDIATELY
+                || f == lock_flags::EXCLUSIVE | lock_flags::FAIL_IMMEDIATELY => {}
+            _ => {
+                for (o, l, _) in &acquired {
+                    let _ = state
+                        .open_table
+                        .release_range_lock(file_id, entry.open_id, *o, *l)
+                        .await;
+                }
+                return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            }
+        }
+
+        // >63-bit lock requests: per MS-FSA (and Samba's byte_range_valid),
+        // INVALID_LOCK_RANGE only when (offset + length - 1) wraps AND
+        // length != 0 — so offset=u64::MAX with length=1 (the single last
+        // byte) is a VALID lock (torture lock "Trying max/1 lock" asserts
+        // OK at lock.c:747).
+        if length != 0 && (length - 1) > u64::MAX - offset {
             for (o, l, _) in &acquired {
-                state
+                let _ = state
                     .open_table
                     .release_range_lock(file_id, entry.open_id, *o, *l)
                     .await;
             }
-            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
+            return error_response_for(Command::Lock, NtStatus::InvalidLockRange, &req.header);
         }
 
-        // Zero-length ranges are invalid for locking.
-        if length == 0 {
-            for (o, l, _) in &acquired {
-                state
-                    .open_table
-                    .release_range_lock(file_id, entry.open_id, *o, *l)
-                    .await;
-            }
-            return error_response_for(Command::Lock, NtStatus::InvalidParameter, &req.header);
-        }
-
-        // Attempt to acquire the lock.
+        // Zero-length locks are VALID entries (torture `lock` "Trying 0/0
+        // lock" and `zerobytelength` — MS-SMB2 2.2.21 allows Length 0;
+        // smbd treats them like any other stacked entry). The u128 overlap
+        // math makes a 0-length range conflict with nothing, and only an
+        // exact (offset, 0) unlock removes it.
         match state
             .open_table
             .acquire_range_lock(
@@ -6016,28 +6384,123 @@ async fn handle_lock(
                 acquired.push((offset, length, exclusive));
             }
             Err(_conflict) => {
-                // Lock conflict — roll back all locks acquired so far.
+                // Blocking lock (no FAIL_IMMEDIATELY): pend until the
+                // conflicting range is released, the request is cancelled,
+                // or the server-side timeout — then either grant
+                // (STATUS_OK async completion) or fail LOCK_NOT_GRANTED
+                // (MS-SMB2 3.3.5.14; torture async/cancel/cancel-tdis/
+                // cancel-logoff).
+                if blocking {
+                    let message_id = req.header.message_id;
+                    let (wake_tx, mut wake_rx) = tokio::sync::watch::channel(false);
+                    let waiter = opens::LockWaiter {
+                        file_id,
+                        open_id: entry.open_id,
+                        elements: vec![(offset, length, exclusive)],
+                        wake: wake_tx,
+                    };
+                    let rx = state.open_table.register_lock_waiter(waiter).await;
+                    let _ = rx;
+                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                    conn_state.pending_async.lock().await.insert(
+                        message_id,
+                        AsyncOp {
+                            command: Command::Lock,
+                            session_id,
+                            tree_id,
+                            cancel: cancel_tx,
+                            notify_handle: None,
+                            watched_file_id: None,
+                            lock_open_volatile: Some(file_id_volatile),
+                        },
+                    );
+                    let mut pending_hdr = req.header.clone();
+                    pending_hdr.status = NtStatus::Pending.to_u32();
+                    pending_hdr.to_async(message_id);
+                    pending_hdr.flags = pending_hdr.flags.with_server_to_redir(true);
+                    let pending_resp = PlainResponse {
+                        header: pending_hdr,
+                        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse {
+                            error_data: vec![],
+                        }),
+                    };
+                    let conn_clone = conn_state.clone();
+                    let req_header = req.header.clone();
+                    let open_table = state.open_table.clone();
+                    let entry_open_id = entry.open_id;
+                    let client_signed = req.header.flags.signed();
+                    tokio::spawn(async move {
+                        let timeout = tokio::time::sleep(std::time::Duration::from_secs(35));
+                        tokio::pin!(timeout);
+                        let granted = tokio::select! {
+                            _ = wake_rx.changed() => true,
+                            _ = timeout => false,
+                            _ = cancel_rx => {
+                                conn_clone.pending_async.lock().await.remove(&message_id);
+                                return;
+                            }
+                        };
+                        // Ownership rule: the completion is sent only by the
+                        // task that successfully removes the pending_async
+                        // entry. CLOSE/TDIS/LOGOFF sweeps complete pended
+                        // locks out-of-band and remove the entry first, so a
+                        // woken watcher whose entry is gone must stay silent
+                        // (a second response for the same MessageId is
+                        // INVALID_NETWORK_RESPONSE for the client).
+                        if conn_clone
+                            .pending_async
+                            .lock()
+                            .await
+                            .remove(&message_id)
+                            .is_none()
+                        {
+                            return;
+                        }
+                        // Re-check and apply atomically; a lost race (another
+                        // waiter or request grabbed the range) fails.
+                        let outcome = if granted
+                            && open_table
+                                .acquire_range_lock(
+                                    file_id,
+                                    entry_open_id,
+                                    session_id,
+                                    tree_id,
+                                    offset,
+                                    length,
+                                    exclusive,
+                                )
+                                .await
+                                .is_ok()
+                        {
+                            NtStatus::Success
+                        } else {
+                            NtStatus::LockNotGranted
+                        };
+                        let mut resp = build_response(
+                            &req_header,
+                            ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
+                        );
+                        resp.header.to_async(message_id);
+                        resp.header.status = outcome.to_u32();
+                        resp.header.credit_charge = 0;
+                        resp.header.credit_request = 0;
+                        send_unsolicited(&conn_clone, &FramedResponse::Plain(resp), client_signed)
+                            .await;
+                    });
+                    return FramedResponse::Plain(pending_resp);
+                }
+                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED.
                 for (o, l, _) in &acquired {
-                    state
+                    let _ = state
                         .open_table
                         .release_range_lock(file_id, entry.open_id, *o, *l)
                         .await;
                 }
-                // FAIL_IMMEDIATELY → LOCK_NOT_GRANTED; blocking locks are
-                // not supported yet, so we always return LOCK_NOT_GRANTED.
-                return error_response_for(
-                    Command::Lock,
-                    NtStatus::Other(0xC000_005A), // STATUS_LOCK_NOT_GRANTED
-                    &req.header,
-                );
+                return error_response_for(Command::Lock, NtStatus::LockNotGranted, &req.header);
             }
         }
     }
 
-    let response = build_response(
-        &req.header,
-        ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
-    );
     if !acquired.is_empty() {
         let (breaks, waiters) = state
             .open_table
@@ -6046,7 +6509,16 @@ async fn handle_lock(
         send_break_notifications(&breaks).await;
         state.open_table.arm_break_timers(&waiters);
     }
-    FramedResponse::Plain(response)
+
+    rearm_lock_sequence(&seq_element, seq_bucket, seq_value);
+    fn build_lock_ok(req: &rssmb_proto::plain::PlainRequest) -> FramedResponse {
+        FramedResponse::Plain(build_response(
+            &req.header,
+            ResponseContent::Lock(rssmb_proto::lock::LockResponse::default()),
+        ))
+    }
+
+    build_lock_ok(&req)
 }
 
 /// Encode and send unsolicited SMB2 OPLOCK_BREAK / LEASE_BREAK notifications
@@ -6209,6 +6681,47 @@ async fn handle_oplock_break(
     }
 }
 
+/// Complete a removed CHANGE_NOTIFY async op with STATUS_NOTIFY_CLEANUP
+/// (0x0000010B, empty buffer) — MS-SMB2 3.3.5.10/3.3.5.19.2: closing the
+/// watched handle or tree-disconnect ends the watch and notifies the
+/// client with an async completion. The watcher is stopped first so no
+/// second completion can race.
+async fn send_notify_cleanup(conn_state: &ConnState, key: u64, op: AsyncOp) {
+    let _ = op.cancel.send(());
+    if let Some(handle) = op.notify_handle {
+        handle.cancel();
+    }
+    let mut header = Header {
+        credit_charge: 0,
+        status: 0x0000_010B,
+        command: Command::ChangeNotify,
+        credit_request: 0,
+        flags: HeaderFlags::new().with_server_to_redir(true),
+        next_command: 0,
+        message_id: key,
+        tree_id: Some(op.tree_id),
+        async_id: None,
+        session_id: op.session_id,
+        signature: 0,
+    };
+    header.to_async(key);
+    let resp = FramedResponse::Plain(PlainResponse {
+        header,
+        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
+    });
+    // Out-of-band completion: sign when the session requires signing
+    // (same rule as handle_cancel: the client signs requests when signing
+    // is required, so the request's signed flag and `required` agree).
+    let signed = conn_state
+        .signing_ref()
+        .read()
+        .unwrap()
+        .get(&op.session_id)
+        .map(|st| st.required)
+        .unwrap_or(false);
+    send_unsolicited(conn_state, &resp, signed).await;
+}
+
 /// CANCEL — cancel a pending async operation (MS-SMB2 3.3.5.16).
 ///
 /// CANCEL itself never gets a response. The cancelled operation is completed
@@ -6227,19 +6740,72 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
         }
     };
     let Some(op) = removed else {
+        // MS-SMB2 pre-interim CANCEL: Samba's client sends the CANCEL
+        // immediately after smb2_notify_send, before the STATUS_PENDING
+        // interim arrives (smbXcli_base.c smb2cli_req_cancel: MessageId=0,
+        // AsyncId=0, no ASYNC flag). smbd answers this by cancelling the
+        // session's most recent pending async op — do the same: the
+        // highest message_id (client mids are monotonic per session).
+        if target == 0 && req_header.session_id != 0 {
+            let candidates: Vec<u64> = {
+                let pending = conn_state.pending_async.lock().await;
+                pending
+                    .iter()
+                    .filter(|(_, op)| op.session_id == req_header.session_id)
+                    .map(|(k, _)| *k)
+                    .collect()
+            };
+            if let Some(newest) = candidates.into_iter().max() {
+                let removed = {
+                    let mut pending = conn_state.pending_async.lock().await;
+                    match pending.get(&newest) {
+                        Some(op) if op.session_id == req_header.session_id => {
+                            pending.remove(&newest)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(op) = removed {
+                    debug!(
+                        conn_id = conn_state.conn_id,
+                        newest, "cancel: pre-interim CANCEL (mid=0) — cancelled newest pending op"
+                    );
+                    finish_cancel(conn_state, op, newest, req_header).await;
+                    // CANCEL never gets its own response; the completion was
+                    // already sent out-of-band.
+                    return None;
+                }
+            }
+        }
         debug!(
             conn_id = conn_state.conn_id,
             target, "cancel: no matching pending op"
         );
         return None;
     };
+    finish_cancel(conn_state, op, target, req_header).await;
+    // CANCEL never gets a response (MS-SMB2 3.3.5.16); the STATUS_CANCELLED
+    // completion went out-of-band above. Returning it here too made the
+    // read loop send it twice (torture lock `cancel`: INVALID_NETWORK_
+    // RESPONSE at lock.c:926).
+    None
+}
+
+/// Fire the cancel signal, stop any watcher, and send the STATUS_CANCELLED
+/// async completion for a removed pending op. Shared by the exact-match and
+/// pre-interim (mid=0) CANCEL paths.
+async fn finish_cancel(
+    conn_state: &ConnState,
+    op: AsyncOp,
+    target: u64,
+    req_header: &Header,
+) -> FramedResponse {
     let _ = op.cancel.send(());
     // Cancel the notify watcher if present.
     if let Some(handle) = op.notify_handle {
         handle.cancel();
     }
     debug!(conn_id = conn_state.conn_id, target, "cancelled async op");
-
     let mut header = Header {
         credit_charge: 0,
         status: NtStatus::Other(0xC000_0120).to_u32(), // STATUS_CANCELLED
@@ -6261,7 +6827,7 @@ async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<Fr
     // Out-of-band responses must be signed like any other (the CANCEL itself
     // was signed if the session requires it — verified before dispatch).
     send_unsolicited(conn_state, &resp, req_header.flags.signed()).await;
-    None
+    resp
 }
 
 /// Encode, sign (per session signing state) and enqueue a response that is
@@ -6293,6 +6859,8 @@ async fn pend_until_breaks(
             tree_id: req_header.tree_id.unwrap_or(0),
             cancel: cancel_tx,
             notify_handle: None,
+            watched_file_id: None,
+            lock_open_volatile: None,
         },
     );
     let mut pending_hdr = req_header.clone();
@@ -6698,6 +7266,12 @@ async fn lookup_open_for_session(
 ) -> Result<OpenEntry, NtStatus> {
     let opens_ref = conn_state.opens_ref();
     let opens = opens_ref.read().await;
+    // Note: the generic missing-handle status stays InvalidHandle —
+    // blanket FILE_CLOSED regressed smb2.dir/getinfo/setinfo (their
+    // torture suites expect different statuses for their not-found
+    // paths). FILE_CLOSED is returned only where asserted:
+    // CLOSE of a closed handle (3.3.5.16) and forged persistent halves
+    // in LOCK (below).
     let entry = opens
         .get(&file_id_volatile)
         .ok_or(NtStatus::InvalidHandle)?;
@@ -6710,6 +7284,24 @@ async fn lookup_open_for_session(
         return Err(NtStatus::InvalidHandle);
     }
     Ok(entry.clone())
+}
+
+/// LOCK-specific handle check: valid-request corrupts the PERSISTENT half
+/// of the FileId (handle.data[0]) and asserts NT_STATUS_FILE_CLOSED
+/// (lock.c:133). We key opens on the volatile half only, so the forged
+/// id collides with a live open; detect it by re-deriving the expected
+/// persistent value from the connection's id allocation.
+async fn check_lock_file_id_persistent(
+    conn_state: &ConnState,
+    file_id: &rssmb_proto::create::FileId,
+) -> Result<(), NtStatus> {
+    let expected = conn_state
+        .persistent_base_val()
+        .wrapping_add(file_id.volatile);
+    if file_id.persistent != expected {
+        return Err(NtStatus::FileClosed);
+    }
+    Ok(())
 }
 
 /// Build an error response carrying the request's header fields so the
@@ -7477,8 +8069,9 @@ mod tests {
         // GVFS sends CLOSE with flags=0 (no POSTQUERY_ATTRIB).
         // Before the fix, smb-msg asserted flags==POSTQUERY and the request
         // was rejected, causing the client to hang. This test verifies that
-        // a CLOSE with flags=0 on a non-existent handle returns InvalidHandle
-        // (i.e. the request parsed successfully; the failure is just no handle).
+        // a CLOSE with flags=0 on a non-existent handle returns FileClosed
+        // (MS-SMB2 3.3.5.16: close of a handle that is not open is
+        // STATUS_FILE_CLOSED; the request itself parsed fine).
         let state = make_test_state();
         let conn = make_conn_state();
         establish_negotiation(&state, &conn).await;
@@ -7512,15 +8105,16 @@ mod tests {
         let resp = handle_message(&state, &conn, framed, &[], None).await;
         let resp = resp.expect("CLOSE should produce a response");
         match resp {
-            // No handle → InvalidHandle is correct; the important thing is
-            // that we got here at all (the request parsed).
+            // No handle → FileClosed is correct (MS-SMB2 3.3.5.16); the
+            // important thing is that we got here at all (the request
+            // parsed).
             FramedResponse::Error {
                 command, status, ..
             } => {
                 assert_eq!(command, Command::Close);
-                assert_eq!(status, NtStatus::InvalidHandle);
+                assert_eq!(status, NtStatus::FileClosed);
             }
-            other => panic!("expected Error(InvalidHandle), got {:?}", other),
+            other => panic!("expected Error(FileClosed), got {:?}", other),
         }
     }
 
@@ -7570,7 +8164,7 @@ mod tests {
                     "propagated error lost the effective session"
                 );
                 assert_eq!(ps[1].header.tree_id, Some(7));
-                assert_eq!(ps[1].header.status, NtStatus::InvalidHandle.to_u32());
+                assert_eq!(ps[1].header.status, NtStatus::FileClosed.to_u32());
             }
             other => panic!("expected Compound, got {:?}", other),
         }

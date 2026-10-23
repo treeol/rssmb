@@ -96,7 +96,6 @@ pub struct ReadResponse {
     #[br(temp)]
     reserved: u8,
     #[bw(try_calc = buffer.len().try_into())]
-    #[br(assert(_data_length > 0))]
     #[br(temp)]
     _data_length: u32,
     #[bw(calc = 0)]
@@ -106,9 +105,10 @@ pub struct ReadResponse {
     #[bw(calc = 0)]
     #[br(temp)]
     _reserved: u32,
-    /// Data read from the file.
+    /// Data read from the file. May be empty: a 0-byte READ (Length=0) is
+    /// a legal request answered with OK + DataLength=0 (torture
+    /// zerobyteread; MS-SMB2 2.2.19 has no minimum DataLength).
     #[br(count = _data_length)]
-    #[bw(assert(!buffer.is_empty()))]
     #[bw(write_with = PosMarker::write_aoff, args(&_data_offset))]
     pub buffer: Vec<u8>,
 }
@@ -319,6 +319,21 @@ mod tests {
         let mut cursor = Cursor::new(&bytes[..]);
         let decoded: ReadResponse = ReadResponse::read_le(&mut cursor).unwrap();
         assert_eq!(decoded.buffer, vec![0x41; 16]);
+    }
+
+    #[test]
+    fn test_read_response_zero_byte_roundtrip() {
+        // A 0-byte READ response (DataLength=0) is legal — torture
+        // zerobyteread; the old encoder asserted non-empty and killed the
+        // connection (encode_response returned empty).
+        let resp = ReadResponse { buffer: vec![] };
+        let mut buf = Cursor::new(Vec::new());
+        resp.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes.len(), 16, "StructureSize(2)+DataOffset(1)+Reserved(1)+DataLength(4)+DataRemaining(4)+Reserved(4), 0 data");
+        let mut cursor = Cursor::new(&bytes[..]);
+        let decoded: ReadResponse = ReadResponse::read_le(&mut cursor).unwrap();
+        assert!(decoded.buffer.is_empty());
     }
 
     #[test]
