@@ -115,7 +115,6 @@ pub(crate) struct ReconnectContext<'a> {
 
 /// Serialize a list of `(name, data)` create contexts into an 8-byte aligned
 /// SMB2_CREATE_CONTEXT chain (MS-SMB2 2.2.13.2).
-
 pub(crate) fn encode_create_contexts(contexts: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     for (idx, (name, data)) in contexts.iter().enumerate() {

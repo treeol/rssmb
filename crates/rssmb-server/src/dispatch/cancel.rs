@@ -40,7 +40,10 @@ pub(crate) async fn send_notify_cleanup(conn_state: &ConnState, key: u64, op: As
 ///
 /// CANCEL itself never gets a response. The cancelled operation is completed
 /// with STATUS_CANCELLED, sent on the write channel as an async response.
-pub(crate) async fn handle_cancel(conn_state: &ConnState, req_header: &Header) -> Option<FramedResponse> {
+pub(crate) async fn handle_cancel(
+    conn_state: &ConnState,
+    req_header: &Header,
+) -> Option<FramedResponse> {
     // Async CANCEL carries the AsyncId; sync CANCEL carries the MessageId of
     // the original request. We use MessageId as AsyncId, so both map here.
     let target = req_header.async_id.unwrap_or(req_header.message_id);

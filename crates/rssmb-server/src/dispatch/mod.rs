@@ -39,58 +39,61 @@ use crate::ServerState;
 use crate::limits::max_io_size;
 
 // ── Per-command modules (pure move from the old monolithic dispatch.rs) ──
-mod negotiate;
-mod session_setup;
-mod logoff;
-mod echo;
-mod tree_connect;
-mod tree_disconnect;
-mod create;
-mod close;
-mod read;
-mod write;
-mod flush;
-mod query_info;
-mod query_directory;
-mod set_info;
+mod async_helpers;
+mod cancel;
 mod change_notify;
+mod close;
+mod create;
+mod echo;
+mod flush;
 mod ioctl;
 mod lock;
+mod logoff;
+mod negotiate;
 mod oplock_break;
-mod cancel;
-mod async_helpers;
+mod query_directory;
+mod query_info;
+mod read;
+mod session_setup;
+mod set_info;
+mod tree_connect;
+mod tree_disconnect;
+mod write;
 
 // Re-exports for cross-crate access (notify.rs, connection.rs)
 
-// Cross-module re-exports so sub-modules can call each other's helpers
-// and handle_plain in mod.rs can dispatch to all handlers.
-pub(crate) use echo::{next_session_id, next_tree_id, next_file_id};
-pub(crate) use cancel::send_notify_cleanup;
-pub(crate) use oplock_break::send_break_notifications;
+// Cross-module re-exports: only symbols used in a DIFFERENT module than
+// their defining one. Verified via cross-use audit.
 pub(crate) use async_helpers::{pend_until_breaks, send_unsolicited};
-pub(crate) use negotiate::{dialect_config_to_negotiate, dialect_config_to_wire, wire_dialect_to_config, select_dialect};
-pub(crate) use create::{encode_create_contexts, build_rqls_response_data, parse_create_contexts, DHNQ_NAME, DHNC_NAME, DH2Q_NAME, DH2C_NAME, RQLS_NAME, ParsedCreateContexts, Dh2qContext, Dh2cContext, DhncContext, DhnqContext, RqLsContext, ReconnectContext};
+pub(crate) use cancel::send_notify_cleanup;
+pub(crate) use echo::{next_file_id, next_session_id, next_tree_id};
+pub(crate) use negotiate::{dialect_config_to_negotiate, dialect_config_to_wire, select_dialect};
+pub(crate) use oplock_break::send_break_notifications;
+// Test-only cross-module uses: mod.rs tests call create.rs helpers.
+#[cfg(test)]
+pub(crate) use create::{
+    build_rqls_response_data, encode_create_contexts, parse_create_contexts, RQLS_NAME,
+};
 // Handler re-exports for handle_plain dispatch
-pub(crate) use negotiate::handle_negotiate;
-pub(crate) use session_setup::handle_session_setup;
-pub(crate) use logoff::handle_logoff;
+pub(crate) use cancel::handle_cancel;
+pub(crate) use change_notify::handle_change_notify;
+pub(crate) use close::handle_close;
+pub(crate) use create::handle_create;
 pub(crate) use echo::handle_echo;
+pub(crate) use flush::handle_flush;
+pub(crate) use ioctl::handle_ioctl;
+pub(crate) use lock::handle_lock;
+pub(crate) use logoff::handle_logoff;
+pub(crate) use negotiate::handle_negotiate;
+pub(crate) use oplock_break::handle_oplock_break;
+pub(crate) use query_directory::handle_query_directory;
+pub(crate) use query_info::handle_query_info;
+pub(crate) use read::handle_read;
+pub(crate) use session_setup::handle_session_setup;
+pub(crate) use set_info::handle_set_info;
 pub(crate) use tree_connect::handle_tree_connect;
 pub(crate) use tree_disconnect::handle_tree_disconnect;
-pub(crate) use create::handle_create;
-pub(crate) use close::handle_close;
-pub(crate) use read::handle_read;
 pub(crate) use write::handle_write;
-pub(crate) use flush::handle_flush;
-pub(crate) use query_info::handle_query_info;
-pub(crate) use query_directory::handle_query_directory;
-pub(crate) use set_info::handle_set_info;
-pub(crate) use change_notify::handle_change_notify;
-pub(crate) use ioctl::handle_ioctl;
-pub(crate) use lock::{rearm_lock_sequence, handle_lock};
-pub(crate) use oplock_break::handle_oplock_break;
-pub(crate) use cancel::handle_cancel;
-
 
 /// A per-connection open handle entry.
 #[derive(Clone)]
@@ -846,7 +849,10 @@ pub(crate) fn substitute_file_id(
 ///   (MS-SMB2 3.3.5.2.3) → `Err(Disconnect)`: terminate the connection.
 /// - Affordable but above our local cap (256, policy rather than a protocol
 ///   limit) → `Err(INVALID_PARAMETER reply)`; the credits are still spent.
-pub(crate) fn charge_credits(conn_state: &ConnState, header: &Header) -> Result<(), Box<FramedResponse>> {
+pub(crate) fn charge_credits(
+    conn_state: &ConnState,
+    header: &Header,
+) -> Result<(), Box<FramedResponse>> {
     use rssmb_wire_adapter::credits::CreditError;
     match conn_state
         .credits
@@ -1041,42 +1047,6 @@ async fn handle_plain(
 /// offer, the set of implemented dialects, and the configured [min, max]
 /// range. Stores the negotiation record in conn_state for SESSION_SETUP,
 /// signing, and VALIDATE_NEGOTIATE_INFO.
-async fn finish_cancel(
-    conn_state: &ConnState,
-    op: AsyncOp,
-    target: u64,
-    req_header: &Header,
-) -> FramedResponse {
-    let _ = op.cancel.send(());
-    // Cancel the notify watcher if present.
-    if let Some(handle) = op.notify_handle {
-        handle.cancel();
-    }
-    debug!(conn_id = conn_state.conn_id, target, "cancelled async op");
-    let mut header = Header {
-        credit_charge: 0,
-        status: NtStatus::Other(0xC000_0120).to_u32(), // STATUS_CANCELLED
-        command: op.command,
-        credit_request: 0,
-        flags: HeaderFlags::new().with_server_to_redir(true),
-        next_command: 0,
-        message_id: target,
-        tree_id: Some(op.tree_id),
-        async_id: None,
-        session_id: op.session_id,
-        signature: 0,
-    };
-    header.to_async(target);
-    let resp = FramedResponse::Plain(PlainResponse {
-        header,
-        content: ResponseContent::Error(rssmb_proto::error::ErrorResponse { error_data: vec![] }),
-    });
-    // Out-of-band responses must be signed like any other (the CANCEL itself
-    // was signed if the session requires it — verified before dispatch).
-    send_unsolicited(conn_state, &resp, req_header.flags.signed()).await;
-    resp
-}
-
 /// Encode, sign (per session signing state) and enqueue a response that is
 /// not returned through the read loop — async completions, cancellations.
 ///
@@ -1385,7 +1355,11 @@ pub(crate) async fn check_lock_file_id_persistent(
 
 /// Build an error response carrying the request's header fields so the
 /// client can match it to the original request.
-pub(crate) fn error_response_for(command: Command, status: NtStatus, req_header: &Header) -> FramedResponse {
+pub(crate) fn error_response_for(
+    command: Command,
+    status: NtStatus,
+    req_header: &Header,
+) -> FramedResponse {
     FramedResponse::Error {
         command,
         status,
