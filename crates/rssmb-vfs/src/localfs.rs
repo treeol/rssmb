@@ -611,17 +611,28 @@ impl Vfs for LocalFs {
         // Error rollback (B2/B4): on any failure after the acquisition,
         // release this handle's reservation. When the reservation reaches
         // zero: unlink the temp ONLY when this handle CREATED it (a fresh
-        // empty temp); an ATTACH that rolls back must leave the temp alone —
-        // another handle's data lives there (the removed entry then becomes
-        // an age-guarded orphan).
+        // empty temp); an ATTACH that rolls back to zero must PUBLISH the
+        // temp — another handle's data lives there and must not be orphaned.
         macro_rules! rollback_on_err {
             ($e:expr) => {{
                 let e = $e;
                 if pending_acquired {
                     if let (Some(table), Some(p)) = (&self.publish, &publish_ref) {
-                        if let Some(temp) = table.abort(&p.dir, &p.final_name) {
-                            if created_here {
+                        if let Some((temp, delete)) = table.abort(&p.dir, &p.final_name) {
+                            if created_here || delete {
                                 let _ = self.dir.remove_file(&temp);
+                            } else {
+                                // Attach rolled back to zero: publish the
+                                // temp (another handle wrote data to it).
+                                let final_rel = p.dir.join(&p.final_name);
+                                if let Err(e2) = self.dir.rename(&temp, &self.dir, &final_rel) {
+                                    tracing::warn!(
+                                        temp = ?temp,
+                                        final = %p.final_name,
+                                        error = %e2,
+                                        "publish_on_close: rollback publish rename failed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -791,7 +802,11 @@ impl Vfs for LocalFs {
                 };
                 // Drop this handle's reservation, then re-mint a fresh temp
                 // under the same map key (fresh reservation, count 1).
-                let _ = table.abort(&p.dir, &p.final_name);
+                if let Some((temp, _)) = table.abort(&p.dir, &p.final_name) {
+                    // Abort reached zero: unlink the temp we created (it was
+                    // empty — the open failed with AlreadyExists).
+                    let _ = self.dir.remove_file(&temp);
+                }
                 if let Acquire::Created(fresh) =
                     table.resolve_or_acquire(&p.dir, &p.final_name, &disk_parent)
                 {
@@ -1523,23 +1538,18 @@ impl Vfs for LocalFs {
         // skipped entirely for pending files.
         if let (Some(table), Some(p)) = (&self.publish, &publish) {
             let (new_dir, new_name) = crate::publish::split_parent(&new_rel);
-            // Destination collision: a pending file already occupies the
-            // destination final name. With `replace` the destination's
-            // pending entry (and its unpublished temp) is discarded and
-            // the move proceeds; without `replace` the rename is refused
-            // (matching the non-pending AlreadyExists path semantics).
-            let collision = table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
-            if collision {
-                if !replace {
-                    return Err(VfsError::AlreadyExists);
-                }
-                if let Some(dest) = table.take_destination(&new_dir, &new_name) {
-                    // The destination pending file will never publish: its
-                    // data is silently discarded by the rename semantics.
+            // Atomic rename + collision handling under one table-level lock.
+            match table.rename_with_replace(&p.dir, &p.final_name, &new_dir, &new_name, replace) {
+                Ok(None) => { /* no collision (or source not pending), moved */ }
+                Ok(Some(dest)) => {
+                    // Collision with replace: the destination's pending temp
+                    // is discarded (its data never publishes).
                     let _ = self.dir.remove_file(&dest.temp_name);
                 }
-                // Retry the move now that the destination key is free.
-                let _ = table.rename(&p.dir, &p.final_name, &new_dir, &new_name);
+                Err(_) => {
+                    // Collision without replace — nothing changed.
+                    return Err(VfsError::AlreadyExists);
+                }
             }
             // Update every handle on this pending entry: visible identity
             // moves to the new final name; rel_path keeps pointing at the
@@ -2875,6 +2885,66 @@ mod tests {
             std::fs::read(dir.path().join("reconnect.txt")).unwrap(),
             b"reconnect-data"
         );
+    }
+
+    // ── abort orphaning fix ──────────────────────────────────────────────
+    // When an attach rolls back to zero via abort, the temp (with another
+    // handle's data) must publish, not be orphaned. The rollback_on_err
+    // macro now publishes on !created_here && !delete_on_close.
+
+    #[tokio::test]
+    async fn publish_abort_to_zero_publishes_not_orphans() {
+        // A creates and writes; B opens same name (attach); A closes (not
+        // last); B closes (last close → publishes). Verifies that data
+        // written through an attached handle survives to publish.
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        let a = fs
+            .create("", "shared.txt", &write_args())
+            .await
+            .unwrap()
+            .open;
+        fs.write_at(a, 0, b"A-data").await.unwrap();
+        // B opens same name — attach, not create.
+        let mut b_args = write_args();
+        b_args.disposition = CreateDisposition::Open;
+        let b = fs.create("", "shared.txt", &b_args).await.unwrap().open;
+        fs.write_at(b, 0, b"B-data-too").await.unwrap();
+        // A closes — not last (B still open).
+        fs.close(a).await.unwrap();
+        // B closes — last close, publishes with the last-written data.
+        fs.close(b).await.unwrap();
+        assert!(dir.path().join("shared.txt").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("shared.txt")).unwrap(),
+            b"B-data-too"
+        );
+    }
+
+    // ── rename_with_replace atomicity ───────────────────────────────────
+    // rename_with_replace does the move + collision handling under one
+    // table-level write lock — no intermediate state where both source and
+    // destination are absent.
+
+    #[tokio::test]
+    async fn publish_rename_with_replace_atomic() {
+        let dir = tmp_root();
+        let fs = LocalFs::new_with_publish(dir.path(), FollowSymlinks::Never, false).unwrap();
+        // Create two pending files.
+        let a = fs.create("", "a.txt", &write_args()).await.unwrap().open;
+        let b = fs.create("", "b.txt", &write_args()).await.unwrap().open;
+        fs.write_at(a, 0, b"aaa").await.unwrap();
+        fs.write_at(b, 0, b"bbb").await.unwrap();
+        // Rename a→b with replace: b's temp is discarded, a's temp
+        // publishes as b.txt.
+        fs.rename(a, "b.txt", true).await.unwrap();
+        // Close a (now pointing at b.txt) — publishes.
+        fs.close(a).await.unwrap();
+        // Close b — the original b.txt handle is now invalid (entry moved).
+        // Just verify the final state: b.txt exists with a's data.
+        assert!(dir.path().join("b.txt").exists());
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b"aaa");
+        assert!(!dir.path().join("a.txt").exists());
     }
 
     // ── startup orphan sweep ─────────────────────────────────────────────

@@ -107,6 +107,11 @@ pub enum Acquire {
     Created(PathBuf),
 }
 
+/// Error returned by [`PendingPublishTable::rename_with_replace`] when a
+/// collision is detected but `replace` is false — nothing was changed.
+#[derive(Debug)]
+pub struct RenameCollision;
+
 /// Pending-publish state for one share root.
 #[derive(Debug)]
 struct SharePending {
@@ -360,11 +365,15 @@ impl PendingPublishTable {
     }
 
     /// Roll back an acquisition (a CREATE failed after
-    /// [`Self::resolve_or_acquire`]). Decrements the count; removes the entry
-    /// when it reaches zero, returning the temp path so the caller can
-    /// best-effort unlink a freshly-created (empty) temp. Never unlinks an
-    /// entry other handles still use (count > 0 keeps the entry).
-    pub fn abort(&self, dir: &Path, name: &str) -> Option<PathBuf> {
+    /// [`Self::resolve_or_acquire`]). Decrements the count; when it reaches
+    /// zero, removes the entry and returns `(temp, delete_on_close)` — the
+    /// same shape as [`Self::close`]. The caller publishes (rename temp →
+    /// final) unless `created_here` (a freshly-created, empty temp that
+    /// should be unlinked) or `delete_on_close` is set.
+    ///
+    /// This prevents data-loss when an *attach* rolls back to zero: the
+    /// temp holds another handle's data and must publish, not be orphaned.
+    pub fn abort(&self, dir: &Path, name: &str) -> Option<(PathBuf, bool)> {
         let kdir = self.share.key_dir(dir);
         let kname = self.share.key_name(name);
         let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
@@ -372,7 +381,7 @@ impl PendingPublishTable {
         let p = map.get_mut(&kname)?;
         p.open_count = p.open_count.saturating_sub(1);
         if p.open_count == 0 {
-            return map.remove(&kname).map(|p| p.temp_name);
+            return map.remove(&kname).map(|p| (p.temp_name, p.delete_on_close));
         }
         None
     }
@@ -457,6 +466,51 @@ impl PendingPublishTable {
         let nkname = self.share.key_name(new_name);
         let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
         dirs.get_mut(&nkdir).and_then(|m| m.remove(&nkname))
+    }
+
+    /// Rename the pending entry `dir/name` → `new_dir/new_name` in one
+    /// atomic table-level operation under a single write lock.
+    ///
+    /// Returns:
+    /// - `Ok(Some(dest))` — collision with `replace`; `dest` is the displaced
+    ///   destination entry (caller unlinks its temp). Source moved to dest.
+    /// - `Ok(None)` — no collision; the source was moved to the destination.
+    /// - `Err(RenameCollision)` — collision without `replace`; nothing was
+    ///   changed. The caller refuses with `AlreadyExists`.
+    /// - Returns `Ok(None)` when the source was not pending either (nothing
+    ///   to move — same as the non-pending rename path in the caller).
+    pub fn rename_with_replace(
+        &self,
+        dir: &Path,
+        name: &str,
+        new_dir: &Path,
+        new_name: &str,
+        replace: bool,
+    ) -> Result<Option<PendingPublish>, RenameCollision> {
+        let kdir = self.share.key_dir(dir);
+        let kname = self.share.key_name(name);
+        let nkdir = self.share.key_dir(new_dir);
+        let nkname = self.share.key_name(new_name);
+        let mut dirs = self.share.dirs.write().expect("publish map lock poisoned");
+        let Some(pending) = dirs.get_mut(&kdir).and_then(|m| m.remove(&kname)) else {
+            // Source was not pending — nothing to move.
+            return Ok(None);
+        };
+        let dest = dirs.get_mut(&nkdir).and_then(|m| m.remove(&nkname));
+        if dest.is_some() && !replace {
+            // Collision without replace: put everything back.
+            dirs.get_mut(&nkdir)
+                .and_then(|m| m.insert(nkname, dest.unwrap()));
+            dirs.get_mut(&kdir).and_then(|m| m.insert(kname, pending));
+            return Err(RenameCollision);
+        }
+        // Move the source entry to the destination (with new display name).
+        let pending = PendingPublish {
+            display_name: new_name.to_string(),
+            ..pending
+        };
+        dirs.entry(nkdir).or_default().insert(nkname, pending);
+        Ok(dest)
     }
 
     /// Delete the pending entry (the temp unlink happened on the temp path).
@@ -704,7 +758,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(t.abort(Path::new(""), "a.txt"), Some(temp));
+        assert_eq!(t.abort(Path::new(""), "a.txt"), Some((temp, false)));
         let (_, _, mapped) = unpack(t.resolve(Path::new("a.txt")));
         assert!(mapped.is_none());
     }
@@ -785,6 +839,62 @@ mod tests {
         let listed = t.pending_in_dir(Path::new(""));
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, "New.TXT");
+    }
+
+    #[test]
+    fn rename_with_replace_no_collision() {
+        let t = table(false);
+        let _ = t.resolve_or_acquire(Path::new(""), "a.txt", Path::new(""));
+        // No collision: returns Ok(None), entry moved.
+        assert!(t
+            .rename_with_replace(Path::new(""), "a.txt", Path::new(""), "b.txt", true)
+            .is_ok());
+        // Old key gone, new key present.
+        let (_, _, mapped) = unpack(t.resolve(Path::new("a.txt")));
+        assert!(mapped.is_none());
+        let (_, _, mapped) = unpack(t.resolve(Path::new("b.txt")));
+        assert!(mapped.is_some());
+    }
+
+    #[test]
+    fn rename_with_replace_collision_replace() {
+        let t = table(false);
+        let _ = t.resolve_or_acquire(Path::new(""), "a.txt", Path::new(""));
+        let _ = t.resolve_or_acquire(Path::new(""), "b.txt", Path::new(""));
+        // Collision with replace: Ok(Some(dest)), source moved.
+        let dest = t.rename_with_replace(Path::new(""), "a.txt", Path::new(""), "b.txt", true);
+        assert!(dest.is_ok());
+        assert!(dest.unwrap().is_some()); // displaced destination
+                                          // a.txt gone, b.txt now has a.txt's entry.
+        let (_, _, mapped) = unpack(t.resolve(Path::new("a.txt")));
+        assert!(mapped.is_none());
+        let (_, _, mapped) = unpack(t.resolve(Path::new("b.txt")));
+        assert!(mapped.is_some());
+    }
+
+    #[test]
+    fn rename_with_replace_collision_no_replace() {
+        let t = table(false);
+        let _ = t.resolve_or_acquire(Path::new(""), "a.txt", Path::new(""));
+        let _ = t.resolve_or_acquire(Path::new(""), "b.txt", Path::new(""));
+        // Collision without replace: Err, nothing changed.
+        assert!(t
+            .rename_with_replace(Path::new(""), "a.txt", Path::new(""), "b.txt", false)
+            .is_err());
+        // Both entries still present.
+        let (_, _, mapped) = unpack(t.resolve(Path::new("a.txt")));
+        assert!(mapped.is_some());
+        let (_, _, mapped) = unpack(t.resolve(Path::new("b.txt")));
+        assert!(mapped.is_some());
+    }
+
+    #[test]
+    fn rename_with_replace_source_not_pending() {
+        let t = table(false);
+        // No pending entry for "x.txt" — returns Ok(None), no collision.
+        let result = t.rename_with_replace(Path::new(""), "x.txt", Path::new(""), "y.txt", true);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
