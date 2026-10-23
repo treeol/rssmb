@@ -1922,7 +1922,7 @@ mod tests {
                 pipe_state: None,
                 durable_guid: None,
                 durable_persistent_id: None,
-                lock_sequence_array: Default::default(),
+                lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFFu8; 64])),
             },
         );
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();

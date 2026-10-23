@@ -82,6 +82,7 @@ mod tests {
     #[test]
     fn test_lock_request_roundtrip() {
         let req = LockRequest {
+            lock_sequence: 0x0121, // bucket 1, value 1 — round-trips
             file_id: FileId {
                 persistent: 1,
                 volatile: 2,
@@ -120,6 +121,7 @@ mod tests {
     #[test]
     fn test_lock_request_multiple_elements() {
         let req = LockRequest {
+            lock_sequence: 0x0402, // bucket 4, value 2 — round-trips
             file_id: FileId {
                 persistent: 10,
                 volatile: 20,

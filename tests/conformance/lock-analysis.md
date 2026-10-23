@@ -1,6 +1,9 @@
 # Campaign C — smb2.lock analysis (conf/locks)
 
-Status: **analysis + side tasks done — no lock-path server changes yet.**
+Status: **implementation complete — smb2.lock passes in full (22 pass +
+3 skip, suite exit 0), exact smbd 4.19.5 golden parity.** Groups K1–K6
+committed individually; K7 (errorcode) flipped as a side effect of the
+K1–K6 semantics, no dedicated commit needed.
 
 - Baseline (this branch, 2026-10-23, uncapped harness, smbtorture 4.19.5):
   **3/22** (`truncate` passes; `rw-none`, `replay_broken_windows`,
@@ -23,6 +26,11 @@ Status: **analysis + side tasks done — no lock-path server changes yet.**
   `.reference/samba-torture/lock.c` (Samba 4.19.5, gitignored).
 
 ## Root-cause groups (ordered by subtests unblocked)
+
+Outcome: K1 (86f6aab) 3→5, K2 (d61dc15) 5→11, K3+K4 (6f7ed8d) 11→16,
+K5 + zerobyteread (0abce47) 16→22, K6 (f8db945) → suite rc=0.
+`overlap` and `range` flipped with K2 (stacked-unlock semantics), and
+`errorcode` with K1–K6 — neither needed a dedicated K7 commit.
 
 ### K1 — Wrong NTSTATUS constants (2 one-line fixes; flips ~3 subtests)
 We hard-coded two wrong codes:

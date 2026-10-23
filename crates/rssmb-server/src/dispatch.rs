@@ -2110,6 +2110,18 @@ async fn handle_logoff(
 ) -> FramedResponse {
     let session_id = req_header.session_id;
 
+    // LOGOFF of an unknown/already-logged-off session fails with
+    // USER_SESSION_DELETED (MS-SMB2 3.3.5.6; torture connect.c:248 logs
+    // off twice and asserts the second logoff fails with this). Checked
+    // BEFORE teardown so the first (valid) logoff succeeds.
+    if !conn_state.sessions.read().await.iter().any(|s| s.id == session_id) {
+        return error_response_for(
+            Command::Logoff,
+            NtStatus::UserSessionDeleted,
+            req_header,
+        );
+    }
+
     // Remove all opens belonging to this session, closing them via VFS.
     let removed = {
         let opens_ref = conn_state.opens_ref();
@@ -2254,11 +2266,11 @@ async fn handle_logoff(
         }
     }
 
-    let response = build_response(
+    let mut resp = build_response(
         req_header,
         ResponseContent::Logoff(rssmb_proto::session_setup::LogoffResponse::default()),
     );
-    FramedResponse::Plain(response)
+    FramedResponse::Plain(resp)
 }
 
 /// Build an ECHO response.
@@ -2582,7 +2594,16 @@ async fn handle_tree_disconnect(
             .unwrap_or(false)
     };
     if !tree_owned {
-        return error_response_for(Command::TreeDisconnect, NtStatus::AccessDenied, req_header);
+        // Second TDIS on an already-disconnected tree: the tree id is
+        // simply unknown. MS-SMB2 3.3.5.9 has no success path here —
+        // torture connect.c:234 double-tdis asserts
+        // NT_STATUS_NETWORK_NAME_DELETED (Windows/Samba behavior), not
+        // ACCESS_DENIED.
+        return error_response_for(
+            Command::TreeDisconnect,
+            NtStatus::NetworkNameDeleted,
+            req_header,
+        );
     }
 
     // Remove all opens belonging to this tree, closing them via VFS.
