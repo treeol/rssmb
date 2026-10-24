@@ -445,7 +445,7 @@ mod tests {
         // MessageId can be reused by the next request.
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
-        // WRITE: charge 0 → balance -= 1, but MessageId 5 not consumed.
+                       // WRITE: charge 0 → balance -= 1, but MessageId 5 not consumed.
         mgr.check_and_deduct(5, 0).unwrap();
         assert_eq!(mgr.available_credits(), 99);
         // CLOSE: same MessageId 5, charge 1 → should succeed because
@@ -460,7 +460,7 @@ mod tests {
     fn test_zero_charge_does_not_advance_low() {
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
-        // Consume 0..5 with charge 1 each — low advances to 5.
+                       // Consume 0..5 with charge 1 each — low advances to 5.
         for m in 0..5 {
             mgr.check_and_deduct(m, 1).unwrap();
         }
