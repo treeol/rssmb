@@ -1465,6 +1465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "md4"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2177,7 +2186,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "md-5 0.10.6",
- "md4",
+ "md4 0.11.0",
  "rand 0.8.8",
  "sha2 0.10.9",
  "sspi",
@@ -2685,7 +2694,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac 0.13.0",
  "md-5 0.11.0",
- "md4",
+ "md4 0.10.2",
  "num-derive",
  "num-traits",
  "oid",
@@ -2801,7 +2810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
