@@ -15,7 +15,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 cap-std = { workspace = true }
-cap-primitives = "3"
+cap-primitives = "4"
 unicode-normalization = { workspace = true }
 serde = { workspace = true }
 
