@@ -64,6 +64,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phantom entry. Replaced with `attach()` which finds an existing
   pending entry and increments its count, or returns `None` — no mint,
   no abort, no phantom.
+- **Credit window: `credit_charge=0` consumed a MessageId.** Per MS-SMB2
+  §3.3.1.2, `credit_charge=0` MUST be treated as 1 for the **credit
+  balance** (available credits), but the **MessageId sequence window**
+  must use the actual `credit_charge` value (0 = no MessageIds
+  consumed). The server incorrectly treated `credit_charge=0` as 1 for
+  both, consuming MessageId `M` for a zero-charge WRITE and then
+  rejecting a CLOSE with the same MessageId `M` as "already used".
+  Fixed by separating the balance charge (`max(charge, 1)`) from the
+  window charge (actual `charge`) in `CreditManager::check_and_deduct`.
+  Also added a balance-availability check so a zero-charge request with
+  no available credits still fails (instead of silently saturating to
+  0). This fixes the impacket `smb.close()`/`logoff()` connection
+  terminations that forced the publish-on-close integration test to
+  work around them by dropping the TCP socket.
 
 ### Changed
 

@@ -856,7 +856,7 @@ pub(crate) fn charge_credits(
     use rssmb_wire_adapter::credits::CreditError;
     match conn_state
         .credits
-        .check_and_deduct(header.message_id, header.credit_charge.max(1) as u32)
+        .check_and_deduct(header.message_id, header.credit_charge as u32)
     {
         Ok(()) => Ok(()),
         Err(CreditError::InsufficientCredits {
