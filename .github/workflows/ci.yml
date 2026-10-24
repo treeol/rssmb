@@ -56,4 +56,5 @@ jobs:
         # Ignore transitive advisories already documented in deny.toml:
         # - RUSTSEC-2023-0071: rsa via sspi -> picky (RSSMB uses NTLMv2 only; RSA never reached)
         # - RUSTSEC-2025-0134: rustls-pemfile unmaintained warning
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+        # - RUSTSEC-2026-0387: crypto-bigint 0.7.5 timing variability (transitive via aws-lc-sys; constant-time ops unused)
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0387
