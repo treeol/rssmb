@@ -109,30 +109,52 @@ impl CreditManager {
     ///   consumed the MessageIds. State **is** mutated; the error is a policy
     ///   rejection, not a protocol violation.
     pub fn check_and_deduct(&self, message_id: u64, charge: u32) -> Result<(), CreditError> {
-        let charge = charge.max(1);
+        // The credit balance charge is max(charge, 1) per MS-SMB2 3.3.1.2:
+        // "If the CreditCharge field is 0, it MUST be treated as 1."
+        // The MessageId window, however, uses the actual charge: a request
+        // with credit_charge=0 consumes 0 MessageIds (the MessageId is not
+        // advanced). This prevents a spurious "already used" rejection when
+        // a subsequent request reuses the same MessageId — a pattern seen
+        // with impacket, which sends WRITE with credit_charge=0 and then
+        // CLOSE with the same MessageId.
+        let balance_charge = charge.max(1) as u64;
+        let window_charge = charge as u64;
         let mut w = self.window.lock().unwrap();
 
         let low = w.low;
+
+        // Check the credit balance first: the balance charge (max(charge, 1)
+        // per MS-SMB2 3.3.1.2) must be available. This catches the case
+        // where the MessageId is in-window (e.g. charge=0 → end=message_id,
+        // which is always <= high when message_id >= low) but the balance
+        // is exhausted.
+        if (w.available as u64) < balance_charge {
+            return Err(CreditError::InsufficientCredits {
+                available: w.available,
+                requested: balance_charge as u32,
+            });
+        }
 
         // The MessageId must be >= low (not before the window).
         if message_id < low {
             return Err(CreditError::InsufficientCredits {
                 available: w.available,
-                requested: charge,
+                requested: balance_charge as u32,
             });
         }
 
         // Check the upper bound: m + c must be <= high.
-        let end = message_id.checked_add(charge as u64).ok_or_else(|| {
+        // With window_charge=0, end = message_id (always in-window if >= low).
+        let end = message_id.checked_add(window_charge).ok_or_else(|| {
             CreditError::InsufficientCredits {
                 available: w.available,
-                requested: charge,
+                requested: balance_charge as u32,
             }
         })?;
         if end > w.high {
             return Err(CreditError::InsufficientCredits {
                 available: w.available,
-                requested: charge,
+                requested: balance_charge as u32,
             });
         }
 
@@ -141,7 +163,7 @@ impl CreditManager {
             if w.used.contains(&mid) {
                 return Err(CreditError::InsufficientCredits {
                     available: w.available,
-                    requested: charge,
+                    requested: balance_charge as u32,
                 });
             }
         }
@@ -152,8 +174,8 @@ impl CreditManager {
             w.used.insert(mid);
         }
 
-        // Consume the credits.
-        w.available = w.available.saturating_sub(charge);
+        // Consume the credits (balance charge, not window charge).
+        w.available = w.available.saturating_sub(balance_charge as u32);
 
         // Advance low past the contiguous used prefix. This removes entries
         // from `used`, keeping its size bounded by the window width.
@@ -168,8 +190,8 @@ impl CreditManager {
 
         // Policy cap: charge above max_charge is ExcessiveCharge (the credits
         // are still spent — the client sent the request).
-        if charge > self.max_charge {
-            return Err(CreditError::ExcessiveCharge(charge));
+        if balance_charge > self.max_charge as u64 {
+            return Err(CreditError::ExcessiveCharge(balance_charge as u32));
         }
 
         Ok(())
@@ -413,6 +435,43 @@ mod tests {
                       // credit_charge 0 → treated as 1
         mgr.check_and_deduct(0, 0).unwrap();
         assert_eq!(mgr.available_credits(), 9);
+    }
+
+    #[test]
+    fn test_zero_charge_reuses_message_id() {
+        // Impacket sends WRITE with credit_charge=0 and then CLOSE with the
+        // same MessageId. The balance is charged 1 (max(0,1) per MS-SMB2
+        // 3.3.1.2), but the MessageId window consumes 0 — so the same
+        // MessageId can be reused by the next request.
+        let mgr = CreditManager::new(1024);
+        mgr.grant(99); // 100 total, window [0..100)
+                       // WRITE: charge 0 → balance -= 1, but MessageId 5 not consumed.
+        mgr.check_and_deduct(5, 0).unwrap();
+        assert_eq!(mgr.available_credits(), 99);
+        // CLOSE: same MessageId 5, charge 1 → should succeed because
+        // MessageId 5 was not consumed by the zero-charge WRITE.
+        mgr.check_and_deduct(5, 1).unwrap();
+        assert_eq!(mgr.available_credits(), 98);
+        // MessageId 6 is the next valid one (5 was consumed by the CLOSE).
+        mgr.check_and_deduct(6, 1).unwrap();
+    }
+
+    #[test]
+    fn test_zero_charge_does_not_advance_low() {
+        let mgr = CreditManager::new(1024);
+        mgr.grant(99); // 100 total, window [0..100)
+                       // Consume 0..5 with charge 1 each — low advances to 5.
+        for m in 0..5 {
+            mgr.check_and_deduct(m, 1).unwrap();
+        }
+        assert_eq!(mgr.available_credits(), 95);
+        // Zero-charge request at 5: balance -= 1, low stays at 5 (no
+        // MessageId consumed).
+        mgr.check_and_deduct(5, 0).unwrap();
+        assert_eq!(mgr.available_credits(), 94);
+        // MessageId 5 is still available for a charge-1 request.
+        mgr.check_and_deduct(5, 1).unwrap();
+        assert_eq!(mgr.available_credits(), 93);
     }
 
     #[test]

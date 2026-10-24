@@ -5,8 +5,8 @@ impacket two-client publish_on_close integration test.
 Tests the publish_on_close behavior with real SMB2 clients:
   1. putFile — host sees only temp during write, final after publish
   2. SMB listing shows final name, no temp
-  3. Two-connection scenario — A writes, B lists during pending, after
-     A disconnects the file publishes with A's data
+  3. Two-handle scenario — A creates+writes, B lists, A closes → publish,
+     B reads back via SMB to verify data integrity
 
 Asserts:
   - No temp name ever reaches the SMB client (directory listing).
@@ -23,6 +23,10 @@ import threading
 
 from impacket.smbconnection import SMBConnection
 from impacket import smb3structs
+from impacket.smb3structs import (FILE_READ_DATA, FILE_WRITE_DATA,
+                                    FILE_SHARE_READ, FILE_SHARE_WRITE,
+                                    FILE_NON_DIRECTORY_FILE,
+                                    FILE_OVERWRITE_IF, FILE_OPEN)
 
 HOST = "127.0.0.1"
 PORT = 4450
@@ -39,24 +43,15 @@ def ls(c, share):
     return sorted(f.get_longname() for f in c.listPath(share, "*"))
 
 
-def safe_logoff(c):
-    try:
-        c.logoff()
-    except Exception:
-        pass
-
-
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.join(script_dir, "..", "..")
     rssmb_bin = os.environ.get("RSSMB", os.path.join(repo_root, "target", "debug", "rssmb"))
     config = os.path.join(script_dir, "poc-on.toml")
 
-    # Clean and prepare the share tree.
     shutil.rmtree("/tmp/rssmb-poc", ignore_errors=True)
     os.makedirs(SHARE_PATH, exist_ok=True)
 
-    # Start the server with publish_on_close ON.
     server = subprocess.Popen(
         [rssmb_bin, "--config", config],
         stdout=subprocess.PIPE,
@@ -72,15 +67,13 @@ def main():
 
         host_snapshots = []
         stop_polling = threading.Event()
-        write_done = threading.Event()
 
         def write_file():
             c = connect()
             c.login("alice", "TestPass123")
             data = bytes(range(256)) * (4 * 1024 * 1024 // 256)
             c.putFile(SHARE, "poc_test_1.bin", io.BytesIO(data).read)
-            write_done.set()
-            safe_logoff(c)
+            c.logoff()
 
         def poll_host():
             while not stop_polling.is_set():
@@ -90,13 +83,10 @@ def main():
 
         t = threading.Thread(target=poll_host, daemon=True)
         t.start()
-
         write_file()
-        write_done.wait(timeout=30)
         stop_polling.set()
         t.join(timeout=5)
 
-        # After putFile completes, the final name must exist and no temp.
         entries_after = os.listdir(SHARE_PATH)
         assert "poc_test_1.bin" in entries_after, (
             f"Final name must exist after publish, got {entries_after}"
@@ -106,7 +96,6 @@ def main():
         )
         print(f"  [host] after publish: {entries_after}")
 
-        # During the write, the final name must not have appeared on host.
         temps_seen = any(
             any(e.startswith(".rssmb-tmp.") for e in snap)
             for snap in host_snapshots
@@ -120,7 +109,6 @@ def main():
         else:
             print(f"  [host] write too fast to poll — SKIP")
 
-        # Data integrity (read from host to avoid SMB credit bug).
         with open(os.path.join(SHARE_PATH, "poc_test_1.bin"), "rb") as f:
             content = f.read()
         expected = bytes(range(256)) * (4 * 1024 * 1024 // 256)
@@ -138,40 +126,48 @@ def main():
             f"No temp in listing, got {names}"
         )
         print(f"  [SMB] listing: {names}")
-        safe_logoff(c)
+        c.logoff()
         print("  ✅ Test 2: PASS")
 
-        # ── Test 3: Two-connection — A writes, B lists during, A drops → publish ──
-        print("\n=== Test 3: Two-connection (A writes, B lists, A drops → publish) ===")
-        # Use putFile in a thread; while it's writing, B lists the share.
-        c_b = connect()
-        c_b.login("alice", "TestPass123")
+        # ── Test 3: Two-handle — A creates+writes+closes, B reads back ──
+        print("\n=== Test 3: Two-handle (A creates+writes+closes, B reads) ===")
+        c = connect()
+        c.login("alice", "TestPass123")
+        smb = c._SMBConnection
+        tid = smb.connectTree(SHARE)
 
-        def write_file_2():
-            c = connect()
-            c.login("alice", "TestPass123")
-            data = b"two-connection data\n" * 10000  # ~200 KB
-            c.putFile(SHARE, "poc_test_2.txt", io.BytesIO(data).read)
-            safe_logoff(c)
+        fid = smb.create(tid, "poc_test_2.txt",
+                         FILE_READ_DATA | FILE_WRITE_DATA,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         FILE_NON_DIRECTORY_FILE, FILE_OVERWRITE_IF, 0)
+        smb.write(tid, fid, b"two-handle data\n", 0, len(b"two-handle data\n"))
+        print("  [A] created + wrote, handle open")
 
-        t2 = threading.Thread(target=write_file_2)
-        t2.start()
-
-        # While the write is in progress, B lists — should see final name, no temp.
-        time.sleep(0.05)  # let the write start
-        names_b = ls(c_b, SHARE)
-        # poc_test_2.txt may or may not appear depending on timing; the key
-        # assertion is that NO temp name appears in the SMB listing.
-        assert not any(n.startswith(".rssmb-tmp.") for n in names_b), (
-            f"B must not see temp names, got {names_b}"
+        entries = os.listdir(SHARE_PATH)
+        temps = [e for e in entries if e.startswith(".rssmb-tmp.")]
+        finals = [e for e in entries if not e.startswith(".rssmb-tmp.")]
+        assert len(temps) >= 1, f"Expected temp on host, got {entries}"
+        assert "poc_test_2.txt" not in finals, (
+            f"Final name must NOT exist on host while pending, got {entries}"
         )
-        print(f"  [B] listing during write: {names_b}")
-        safe_logoff(c_b)
+        print(f"  [host] only temp: {entries}")
 
-        t2.join(timeout=30)
+        # B lists — sees final name, no temp.
+        c2 = connect()
+        c2.login("alice", "TestPass123")
+        names2 = ls(c2, SHARE)
+        assert "poc_test_2.txt" in names2, f"B must see final name, got {names2}"
+        assert not any(n.startswith(".rssmb-tmp.") for n in names2), (
+            f"B must not see temp, got {names2}"
+        )
+        print(f"  [B] listing: {names2}")
+        c2.logoff()
+
+        # A closes — publishes (smb.close() now works after credit fix).
+        smb.close(tid, fid)
+        c.logoff()
         time.sleep(0.3)
 
-        # After the write completes, the final name must exist on host.
         entries2 = os.listdir(SHARE_PATH)
         assert "poc_test_2.txt" in entries2, (
             f"Final name must exist after publish, got {entries2}"
@@ -181,14 +177,16 @@ def main():
         )
         print(f"  [host] after publish: {entries2}")
 
-        # Data integrity (read from host).
-        with open(os.path.join(SHARE_PATH, "poc_test_2.txt"), "rb") as f:
-            content2 = f.read()
-        expected2 = b"two-connection data\n" * 10000
-        assert content2 == expected2, (
-            f"Data mismatch: expected {len(expected2)} bytes, got {len(content2)}"
+        # B reads back via SMB to verify data integrity.
+        c3 = connect()
+        c3.login("alice", "TestPass123")
+        buf2 = io.BytesIO()
+        c3.getFile(SHARE, "poc_test_2.txt", buf2.write)
+        c3.logoff()
+        assert buf2.getvalue() == b"two-handle data\n", (
+            f"Data mismatch: expected 'two-handle data\\n', got {buf2.getvalue()!r}"
         )
-        print(f"  [host] data integrity: {len(content2)} bytes — PASS")
+        print(f"  [B] read-back via SMB: {buf2.getvalue()!r} — PASS")
         print("  ✅ Test 3: PASS")
 
         print("\n✅ All publish_on_close integration tests: PASS")

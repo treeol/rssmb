@@ -14,6 +14,12 @@ ignore = [
     # rustls-pemfile unmaintained — informational; used only to load the QUIC
     # cert/key PEM files at startup. Migrate to rustls-pki-types PEM parsing.
     { id = "RUSTSEC-2025-0134", reason = "unmaintained notice only; startup-time PEM loading; migration pending" },
+    # crypto-bigint 0.7.5 timing variability — transitive via aws-lc-sys
+    # (picky/QUIC). The vulnerable constant-time operations are in the
+    # modular arithmetic path; rssmb does not use crypto-bigint directly
+    # and does not perform private-key operations that depend on
+    # constant-time guarantees from this crate. No fixed version available.
+    { id = "RUSTSEC-2026-0387", reason = "transitive via aws-lc-sys/crypto-bigint; constant-time ops unused; no upstream fix" },
 ]
 
 [licenses]
