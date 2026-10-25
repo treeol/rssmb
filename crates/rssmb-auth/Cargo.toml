@@ -17,6 +17,6 @@ tracing = { workspace = true }
 rand = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-md4 = "0.10"
+md4 = "0.11"
 md-5 = "0.10"
 hex = "0.4"

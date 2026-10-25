@@ -317,25 +317,9 @@ be reused in other SMB tools.
 
 ## Roadmap
 
-**Implemented (1.0 scope):**
-- ✅ SMB 2.1 – 3.1.1 with encryption, signing, and NTLMv2
-- ✅ Durable handles v1/v2 (smb2.durable-v2-open 14/15), byte-range locks (smb2.lock 22/22), change notify
-- ✅ SIGHUP hot-reload, Prometheus metrics, graceful shutdown
-- ✅ `smbtorture` conformance, impacket/smbclient interop, fuzzing
-
-**Recently implemented:**
-- ✅ File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks (Level II, Exclusive, Batch)
-- ✅ SMB over QUIC transport (TLS 1.3, ALPN `smb`, UDP/443)
-- ✅ Multichannel (SMB 3.x session binding, shared state across channels)
-- ✅ `FSCTL_QUERY_NETWORK_INTERFACE_INFO` — NIC enumeration for multichannel
-  interface discovery, with `multichannel_interfaces` override for NAT/Kubernetes
-
-**Not yet implemented:**
-- Kerberos authentication
-- Persistent handles (TLER resilient)
-- Multichannel binding hardening (per-channel signing key derivation for
-  SMB 3.1.1; binding works but is not yet hardened against a malicious
-  second channel)
+The tracked list of everything open lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) —
+items `R-01`…`R-29` across priorities P0–P3, plus accepted-never exclusions.
+Every campaign and PR references a roadmap item ID.
 
 ## License
 
