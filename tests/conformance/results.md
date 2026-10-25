@@ -1,5 +1,8 @@
 # smbtorture baseline — 2026-10-24T09:05:31Z
 
+> Open work is tracked in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) — every
+> campaign references a roadmap item ID there.
+
 - Server: rssmb 0.1.6 (481de59, branch fix/credit-accounting)
 - smbtorture: smbtorture 4.19.5-Ubuntu (docker smbt419)
 - Target: //172.17.0.6:4450/public (publish_on_close OFF)
