@@ -3,8 +3,8 @@
 //! Pure functions that validate the client's negotiate contexts and produce
 //! the server's response contexts. No I/O — unit-testable in isolation.
 
-use rand::rngs::SysRng;
 use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use rand::Rng;
 use rssmb_proto::negotiate::{
     EncryptionCapabilities, EncryptionCipher, HashAlgorithm, NegotiateContext,
