@@ -1,7 +1,7 @@
 # RSSMB Roadmap
 
 - **Date:** 2026-10-25
-- **Current version:** 0.1.7
+- **Current version:** 0.1.8
 - **Current baseline:** smbtorture 4.19.5, uncapped run of 2026-10-24
   ([`tests/conformance/results.md`](../tests/conformance/results.md)),
   captured against rssmb 0.1.6 (481de59) with the 0.1.7 credit-accounting fix

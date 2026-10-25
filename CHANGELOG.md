@@ -5,6 +5,37 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] — 2026-10-25
+
+### Changed
+
+- **Dependency refresh (24 bumps, no behavior change).** All
+  merge-blocking dependency updates since 0.1.7, each green through the
+  full gate (fmt, clippy -D warnings, build --locked, test --workspace,
+  deny, audit, and the impacket/smbclient/rclone/publish-on-close
+  interop jobs):
+  - `aes` 0.8.4 → 0.9.3 with companion bumps `aes-gcm` 0.10 → 0.11 and
+    `cmac` 0.7 → 0.8. AES-128-GCM encrypt/decrypt and CMAC signing
+    adapted to the new `aead` API surface (`encrypt/decrypt_inout_detached`,
+    `Array` conversions via `TryFrom`/`Into`); all 35 crypto unit tests
+    pass unchanged, wire behavior byte-identical.
+  - `rand` 0.8.8 → 0.10.3 (`rng()`, `Rng`, `random_range`, `SysRng` +
+    `UnwrapErr` API adaptation — affects negotiate-context nonce
+    generation only).
+  - `cap-std`/`cap-primitives` 3.4.6 → 4.0.3 (family kept on one
+    version to avoid dual `FollowSymlinks` types in the graph).
+  - `sspi` 0.21.3 → 0.23.0, `thiserror` 1.0.69 → 2.0.21,
+    `libc` 0.2.190 → 0.2.191, `unicode-normalization` 0.1.25 → 0.1.26,
+    `md4` 0.10.6 → 0.11.0.
+  - GitHub Actions: checkout v7, download-artifact v8,
+    build-push-action v7, metadata-action v6, gh-release v3.
+- **Docs: tracked roadmap and working method.** `docs/ROADMAP.md`
+  (R-01…R-29, P0–P3 + accepted-never, the single tracked list of open
+  work; every campaign references an item ID) and
+  `docs/WORKING-METHOD.md` (the 10 working rules). README and
+  `tests/conformance/results.md` now point at the roadmap; PR template
+  gained a roadmap-item line.
+
 ## [0.1.7] — 2026-10-24
 
 ### Added

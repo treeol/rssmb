@@ -169,7 +169,7 @@ static musl binaries for `x86_64` and `aarch64` Linux (with `SHA256SUMS`),
 and a multi-arch image:
 
 ```sh
-docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.0
+docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.8
 docker run -d --name rssmb -p 445:445 \
   -v ./config/rssmb.toml:/etc/rssmb/rssmb.toml:ro \
   -v ./data:/data ghcr.io/treeol/rssmb:latest
