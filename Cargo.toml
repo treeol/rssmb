@@ -57,7 +57,7 @@ rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
 
 # External — VFS confinement
-cap-std = "3"
+cap-std = "4"
 unicode-normalization = "0.1"
 
 # External — auth
