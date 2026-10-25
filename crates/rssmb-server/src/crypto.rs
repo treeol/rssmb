@@ -399,7 +399,7 @@ pub fn encrypt_message(
     let aad = transform_aad(&hdr);
     // The AEAD nonce is the first 12 bytes (GCM) of the 16-byte wire nonce.
     let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
-    let cipher = Aes128Gcm::new(key.try_into().unwrap());
+    let cipher = Aes128Gcm::new(key.into());
     // encrypt_inout_detached: encrypts the buffer in place and returns
     // the 16-byte tag. It does NOT append the tag to the buffer.
     let tag = cipher
@@ -455,7 +455,7 @@ pub fn decrypt_message(
             gcm_nonce.into(),
             aad,
             buf.as_mut_slice().into(),
-            (&tag).try_into().unwrap(),
+            (&tag).into(),
         )
         .map_err(|_| EncryptionError::DecryptFailed)?;
     Ok(buf)
