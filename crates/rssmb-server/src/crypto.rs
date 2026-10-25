@@ -19,9 +19,10 @@
 use std::sync::atomic::AtomicU64;
 
 use aes::Aes128;
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::Aes128Gcm;
+use cmac::digest::KeyInit as CmacKeyInit;
+use cmac::digest::Mac as CmacMac;
 use cmac::Cmac;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
@@ -397,12 +398,12 @@ pub fn encrypt_message(
     let hdr = build_transform_header(nonce, original_message_size, session_id);
     let aad = transform_aad(&hdr);
     // The AEAD nonce is the first 12 bytes (GCM) of the 16-byte wire nonce.
-    let gcm_nonce = GenericArray::from_slice(&nonce[..12]);
-    let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
-    // encrypt_in_place_detached: encrypts the buffer in place and returns
+    let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
+    let cipher = Aes128Gcm::new(key.into());
+    // encrypt_inout_detached: encrypts the buffer in place and returns
     // the 16-byte tag. It does NOT append the tag to the buffer.
     let tag = cipher
-        .encrypt_in_place_detached(gcm_nonce, &aad, plaintext)
+        .encrypt_inout_detached(gcm_nonce.into(), &aad, plaintext.into())
         .map_err(|_| EncryptionError::EncryptFailed)?;
     Ok((hdr, tag.into()))
 }
@@ -445,12 +446,17 @@ pub fn decrypt_message(
         .try_into()
         .map_err(|_| EncryptionError::DecryptFailed)?;
     // The GCM nonce is the first 12 bytes of the 16-byte wire nonce.
-    let gcm_nonce = GenericArray::from_slice(&nonce[..12]);
+    let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
     let ciphertext = &raw[TRANSFORM_HEADER_SIZE..];
-    let cipher = Aes128Gcm::new(GenericArray::from_slice(key));
+    let cipher = Aes128Gcm::new(key.into());
     let mut buf = ciphertext.to_vec();
     cipher
-        .decrypt_in_place_detached(gcm_nonce, aad, &mut buf, GenericArray::from_slice(&tag))
+        .decrypt_inout_detached(
+            gcm_nonce.into(),
+            aad,
+            buf.as_mut_slice().into(),
+            (&tag).into(),
+        )
         .map_err(|_| EncryptionError::DecryptFailed)?;
     Ok(buf)
 }
@@ -491,10 +497,10 @@ pub fn sign_message(signing_key: &[u8], message: &[u8], dialect: DialectConfig) 
             sig
         }
         DialectConfig::Smb30 | DialectConfig::Smb302 | DialectConfig::Smb311 => {
-            let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(signing_key)
+            let mut mac = <Cmac<Aes128> as CmacKeyInit>::new_from_slice(signing_key)
                 .expect("CMAC key must be 16 bytes for AES-128");
-            mac.update(message);
-            let full = mac.finalize();
+            CmacMac::update(&mut mac, message);
+            let full = CmacMac::finalize(mac);
             let mut sig = [0u8; 16];
             sig.copy_from_slice(&full.into_bytes()[..16]);
             sig
