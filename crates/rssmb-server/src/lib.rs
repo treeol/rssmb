@@ -168,9 +168,9 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(config: ServerConfig) -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut guid = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut guid);
+        rand::rng().fill_bytes(&mut guid);
 
         // Build the identity store from config users — NT hashes are
         // pre-computed here so the plaintext password is never retained
