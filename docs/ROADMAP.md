@@ -83,3 +83,6 @@ New items are appended with a fresh ID only when they have evidence (a suite
 count, a file:line, a captured log, or a user-reported scenario). Baseline
 numbers come only from uncapped smbtorture runs recorded in
 `tests/conformance/results.md`.
+
+The rules governing how all of this work is done live in
+[`WORKING-METHOD.md`](WORKING-METHOD.md).
