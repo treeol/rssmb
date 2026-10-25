@@ -36,6 +36,7 @@ tested against the Linux kernel CIFS client, `smbclient`, GNOME Files
 - [Testing & conformance](#testing--conformance)
 - [Architecture](#architecture)
 - [Roadmap](#roadmap)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Why RSSMB?
@@ -320,6 +321,12 @@ be reused in other SMB tools.
 The tracked list of everything open lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) —
 items `R-01`…`R-29` across priorities P0–P3, plus accepted-never exclusions.
 Every campaign and PR references a roadmap item ID.
+
+## Contributing
+
+Follow [`docs/WORKING-METHOD.md`](docs/WORKING-METHOD.md) — the rules for
+roadmap references, conformance campaigns, golden behaviour, reviews, and
+releases.
 
 ## License
 
