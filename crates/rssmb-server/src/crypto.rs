@@ -22,9 +22,9 @@ use aes::Aes128;
 use aes_gcm::aead::array::Array;
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::Aes128Gcm;
-use cmac::Cmac;
 use cmac::digest::KeyInit as CmacKeyInit;
 use cmac::digest::Mac as CmacMac;
+use cmac::Cmac;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
 
@@ -452,7 +452,12 @@ pub fn decrypt_message(
     let cipher = Aes128Gcm::new(Array::from_slice(key));
     let mut buf = ciphertext.to_vec();
     cipher
-        .decrypt_inout_detached(gcm_nonce, aad, buf.as_mut_slice().into(), Array::from_slice(&tag))
+        .decrypt_inout_detached(
+            gcm_nonce,
+            aad,
+            buf.as_mut_slice().into(),
+            Array::from_slice(&tag),
+        )
         .map_err(|_| EncryptionError::DecryptFailed)?;
     Ok(buf)
 }
