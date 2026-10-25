@@ -310,9 +310,9 @@ pub struct NonceSource {
 impl NonceSource {
     /// Create a new nonce source for the given cipher with a random suffix.
     pub fn new(cipher: Cipher) -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut suffix = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut suffix);
+        rand::rng().fill_bytes(&mut suffix);
         Self {
             counter: AtomicU64::new(0),
             suffix,

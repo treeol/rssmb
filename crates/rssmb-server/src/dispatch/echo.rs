@@ -13,9 +13,9 @@ pub(crate) fn handle_echo(req_header: &Header) -> FramedResponse {
 /// against the connection's sessions, pending sessions, and the global
 /// session registry).
 pub(crate) fn next_session_id(conn_state: &ConnState, state: &ServerState) -> u64 {
-    use rand::Rng;
+    use rand::RngExt;
     loop {
-        let id: u64 = rand::thread_rng().gen_range(1..u64::MAX);
+        let id: u64 = rand::rng().random_range(1..u64::MAX);
         // Check against active sessions and pending sessions.
         let sessions = conn_state.sessions.try_read();
         let pending = conn_state.pending_sessions.try_read();

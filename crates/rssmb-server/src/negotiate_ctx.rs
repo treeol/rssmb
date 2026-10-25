@@ -3,8 +3,9 @@
 //! Pure functions that validate the client's negotiate contexts and produce
 //! the server's response contexts. No I/O — unit-testable in isolation.
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
+use rand::Rng;
 use rssmb_proto::negotiate::{
     EncryptionCapabilities, EncryptionCipher, HashAlgorithm, NegotiateContext,
     NegotiateContextType, NegotiateRequest, PreauthIntegrityCapabilities, SigningAlgorithmId,
@@ -180,7 +181,7 @@ pub fn process_request_contexts_for_transport(
 
     // --- Generate server salt (32 random bytes) ---
     let mut salt = vec![0u8; 32];
-    OsRng.fill_bytes(&mut salt);
+    UnwrapErr(SysRng).fill_bytes(&mut salt);
 
     let negotiated = Negotiated311 {
         preauth_hash_alg,
