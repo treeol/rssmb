@@ -1740,7 +1740,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.1",
  "sha3",
- "thiserror 2.0.21",
+ "thiserror",
  "x25519-dalek",
  "zeroize",
 ]
@@ -1809,7 +1809,7 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "sha1",
- "thiserror 2.0.21",
+ "thiserror",
  "uuid",
 ]
 
@@ -1971,7 +1971,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -1993,7 +1993,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.21",
+ "thiserror",
  "tinyvec",
  "tracing",
  "web-time",
@@ -2190,7 +2190,7 @@ dependencies = [
  "rand 0.8.8",
  "sha2 0.10.9",
  "sspi",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2205,7 +2205,7 @@ dependencies = [
  "rssmb-server",
  "rssmb-vfs",
  "serde",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
@@ -2228,7 +2228,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "rssmb-proto",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2262,7 +2262,7 @@ dependencies = [
  "sha2 0.10.9",
  "sspi",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
@@ -2296,7 +2296,7 @@ dependencies = [
  "rustix",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "tracing",
  "unicode-normalization",
@@ -2310,7 +2310,7 @@ dependencies = [
  "bytes",
  "proptest",
  "rssmb-proto",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2818,31 +2818,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
