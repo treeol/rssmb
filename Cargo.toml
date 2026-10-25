@@ -13,7 +13,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -21,12 +21,12 @@ authors = ["Valon Mamudi"]
 
 [workspace.dependencies]
 # Internal crates
-rssmb-proto = { path = "crates/rssmb-proto", version = "0.1.6" }
-rssmb-server = { path = "crates/rssmb-server", version = "0.1.6" }
-rssmb-wire-adapter = { path = "crates/rssmb-wire-adapter", version = "0.1.6" }
-rssmb-auth = { path = "crates/rssmb-auth", version = "0.1.6" }
-rssmb-vfs = { path = "crates/rssmb-vfs", version = "0.1.6" }
-rssmb-rpc-server = { path = "crates/rssmb-rpc-server", version = "0.1.6" }
+rssmb-proto = { path = "crates/rssmb-proto", version = "0.1.8" }
+rssmb-server = { path = "crates/rssmb-server", version = "0.1.8" }
+rssmb-wire-adapter = { path = "crates/rssmb-wire-adapter", version = "0.1.8" }
+rssmb-auth = { path = "crates/rssmb-auth", version = "0.1.8" }
+rssmb-vfs = { path = "crates/rssmb-vfs", version = "0.1.8" }
+rssmb-rpc-server = { path = "crates/rssmb-rpc-server", version = "0.1.8" }
 
 # External — async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "macros", "signal", "fs", "time"] }
