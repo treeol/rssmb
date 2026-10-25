@@ -19,7 +19,6 @@
 use std::sync::atomic::AtomicU64;
 
 use aes::Aes128;
-use aes_gcm::aead::array::Array;
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::Aes128Gcm;
 use cmac::digest::KeyInit as CmacKeyInit;
@@ -399,12 +398,12 @@ pub fn encrypt_message(
     let hdr = build_transform_header(nonce, original_message_size, session_id);
     let aad = transform_aad(&hdr);
     // The AEAD nonce is the first 12 bytes (GCM) of the 16-byte wire nonce.
-    let gcm_nonce = Array::from_slice(&nonce[..12]);
-    let cipher = Aes128Gcm::new(Array::from_slice(key));
+    let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
+    let cipher = Aes128Gcm::new(key.try_into().unwrap());
     // encrypt_inout_detached: encrypts the buffer in place and returns
     // the 16-byte tag. It does NOT append the tag to the buffer.
     let tag = cipher
-        .encrypt_inout_detached(gcm_nonce, &aad, plaintext.into())
+        .encrypt_inout_detached(gcm_nonce.into(), &aad, plaintext.into())
         .map_err(|_| EncryptionError::EncryptFailed)?;
     Ok((hdr, tag.into()))
 }
@@ -447,16 +446,16 @@ pub fn decrypt_message(
         .try_into()
         .map_err(|_| EncryptionError::DecryptFailed)?;
     // The GCM nonce is the first 12 bytes of the 16-byte wire nonce.
-    let gcm_nonce = Array::from_slice(&nonce[..12]);
+    let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
     let ciphertext = &raw[TRANSFORM_HEADER_SIZE..];
-    let cipher = Aes128Gcm::new(Array::from_slice(key));
+    let cipher = Aes128Gcm::new(key.try_into().unwrap());
     let mut buf = ciphertext.to_vec();
     cipher
         .decrypt_inout_detached(
-            gcm_nonce,
+            gcm_nonce.into(),
             aad,
             buf.as_mut_slice().into(),
-            Array::from_slice(&tag),
+            (&tag).try_into().unwrap(),
         )
         .map_err(|_| EncryptionError::DecryptFailed)?;
     Ok(buf)
