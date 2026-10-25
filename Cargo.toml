@@ -37,9 +37,9 @@ futures = "0.3"
 # External — crypto
 hmac = "0.12"
 sha2 = "0.10"
-cmac = "0.7"
+cmac = "0.8"
 aes = "0.9"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = "0.10"
 
 # External — utility
