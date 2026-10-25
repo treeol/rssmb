@@ -448,7 +448,7 @@ pub fn decrypt_message(
     // The GCM nonce is the first 12 bytes of the 16-byte wire nonce.
     let gcm_nonce: &[u8; 12] = (&nonce[..12]).try_into().unwrap();
     let ciphertext = &raw[TRANSFORM_HEADER_SIZE..];
-    let cipher = Aes128Gcm::new(key.try_into().unwrap());
+    let cipher = Aes128Gcm::new(key.into());
     let mut buf = ciphertext.to_vec();
     cipher
         .decrypt_inout_detached(
