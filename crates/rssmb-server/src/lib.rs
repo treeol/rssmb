@@ -117,16 +117,11 @@ pub struct ServerState {
     pub sessions: Arc<tokio::sync::RwLock<Vec<Arc<Session>>>>,
     /// Global open table (for share-mode conflict tracking).
     pub open_table: Arc<opens::OpenTable>,
-    /// NTLM identity store — built once at startup from config users.
+    /// NTLM identity store — live-reloadable (swapped on SIGHUP).
     /// Each user's NT hash is pre-computed so plaintext passwords are never
-    /// stored or rebuilt per session_setup. Reloaded on SIGHUP.
-    pub identities: Arc<rssmb_auth::IdentityStore>,
-    /// Live-reloadable identities (swapped on SIGHUP). The `identities`
-    /// field above is the initial boot-time store; this is the current one.
+    /// stored or rebuilt per session_setup.
     /// Use [`identities_snapshot`](Self::identities_snapshot) to get the
-    /// current store. We keep both so `ServerState::new` doesn't change
-    /// its signature and existing code that uses `state.identities`
-    /// directly still works (it gets the boot-time store).
+    /// current store.
     identities_swap: StdRwLock<Arc<rssmb_auth::IdentityStore>>,
     /// Live-reloadable shares (swapped on SIGHUP).
     shares_swap: StdRwLock<Arc<std::collections::HashMap<String, crate::config::ShareConfig>>>,
@@ -206,7 +201,6 @@ impl ServerState {
             config: Arc::new(config),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             open_table: Arc::new(opens::OpenTable::new()),
-            identities: identities.clone(),
             identities_swap: StdRwLock::new(identities),
             shares_swap: StdRwLock::new(initial_shares),
             conn_limiter,
@@ -224,10 +218,6 @@ impl ServerState {
 
     pub async fn shutdown(&self) {
         self.shutdown.trigger();
-    }
-
-    pub async fn add_session(&self, session: Arc<Session>) {
-        self.sessions.write().await.push(session);
     }
 
     pub async fn remove_session(&self, session_id: u64) {
@@ -269,9 +259,10 @@ impl ServerState {
             }),
         ));
 
-        // Swap identities and shares atomically (each behind StdRwLock).
-        // Server-level settings (listen, signing, encryption, dialects,
-        // timeouts, limits) are NOT reloaded — they require a restart.
+        // Swap identities and shares (each behind its own StdRwLock — the
+        // two writes are NOT one atomic step; a reader can briefly see
+        // new identities with old shares. Acceptable: SIGHUP reload is
+        // rare and both tables are advisory config).
         *std::sync::RwLock::write(&self.identities_swap).unwrap() = new_identities;
         *std::sync::RwLock::write(&self.shares_swap).unwrap() = Arc::new(new_config.shares.clone());
 

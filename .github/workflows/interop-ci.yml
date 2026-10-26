@@ -29,7 +29,8 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -Dclippy::all
+        # await_holding_lock gate — see docs/lock-audit.md §3.
+        run: cargo clippy --all-targets -- -Dclippy::all -Dclippy::await_holding_lock
       - name: Build
         run: cargo build
       - name: Test

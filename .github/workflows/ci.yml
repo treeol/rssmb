@@ -25,11 +25,31 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -Dclippy::all
+        # await_holding_lock: no std::sync guard may be alive across an
+        # .await — see docs/lock-audit.md §3 (gate added there, verified 0 fires).
+        run: cargo clippy --all-targets -- -Dclippy::all -Dclippy::await_holding_lock
       - name: Build
         run: cargo build --locked
       - name: Test
         run: cargo test --workspace --locked
+
+  # MSRV check — cargo check on the declared minimum supported toolchain.
+  # The stable job above proves the workspace builds on current stable;
+  # this job proves it still builds on rust-version (1.93, driven by
+  # sspi 0.23). check only (no clippy/test): MSRV gates compilation,
+  # not lints or runtime behavior.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust (MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV
+        run: cargo check --workspace --locked
 
   # Supply-chain checks — cargo-deny (advisories, licenses, bans, sources)
   deny:

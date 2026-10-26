@@ -7,7 +7,7 @@ A pure-Rust SMB2/3 file server for container-native environments.
 [![CI](https://github.com/treeol/rssmb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/treeol/rssmb/actions/workflows/ci.yml)
 [![Interop](https://github.com/treeol/rssmb/actions/workflows/interop-ci.yml/badge.svg?branch=main)](https://github.com/treeol/rssmb/actions/workflows/interop-ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/MSRV-1.85-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/MSRV-1.93-orange.svg)](https://www.rust-lang.org/)
 
 SMB 2.1 – 3.1.1 · AES-128-GCM encryption · NTLMv2 auth · ~8 MB static binary
 

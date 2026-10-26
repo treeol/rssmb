@@ -110,7 +110,7 @@ pub fn message_ranges(data: &[u8]) -> Vec<(usize, usize)> {
             out.push((offset, data.len()));
             break;
         }
-        if next % 8 != 0 || next < HDR || offset + next + HDR > data.len() {
+        if !next.is_multiple_of(8) || next < HDR || offset + next + HDR > data.len() {
             break;
         }
         out.push((offset, offset + next));
@@ -167,7 +167,7 @@ fn parse_plain_payload(data: &[u8]) -> Result<FramedMessage, WireError> {
             data.len()
         } else {
             // Validate: alignment, minimum, and enough room for the next header.
-            if next % 8 != 0 {
+            if !next.is_multiple_of(8) {
                 return Err(WireError::DecodeError(format!(
                     "compound: misaligned next_command {next} at offset {offset}"
                 )));
@@ -458,7 +458,7 @@ mod tests {
         }
         m.extend_from_slice(&body);
         for (i, (ty, data)) in contexts.iter().enumerate() {
-            while m.len() % 8 != 0 {
+            while !m.len().is_multiple_of(8) {
                 m.push(0);
             }
             if i == 0 {

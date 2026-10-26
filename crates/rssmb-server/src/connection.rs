@@ -1597,7 +1597,7 @@ where
                         // Removes `.rssmb-tmp.*` files with no pending map
                         // entry and mtime older than 1 h (crash orphans).
                         ticks = ticks.wrapping_add(1);
-                        if ticks % 120 == 0 {
+                        if ticks.is_multiple_of(120) {
                             for (share_name, share) in state.shares_snapshot().iter() {
                                 if !share.publish_on_close || share.path.is_empty() {
                                     continue;

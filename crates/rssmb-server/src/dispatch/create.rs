@@ -303,7 +303,7 @@ pub(crate) fn parse_create_contexts(
             break;
         }
         // NextOffset must be 8-byte aligned and non-zero.
-        if next_offset % 8 != 0 {
+        if !next_offset.is_multiple_of(8) {
             break;
         }
         pos = match pos.checked_add(next_offset) {
