@@ -25,7 +25,9 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -Dclippy::all
+        # await_holding_lock: no std::sync guard may be alive across an
+        # .await — see docs/lock-audit.md §3 (gate added there, verified 0 fires).
+        run: cargo clippy --all-targets -- -Dclippy::all -Dclippy::await_holding_lock
       - name: Build
         run: cargo build --locked
       - name: Test
