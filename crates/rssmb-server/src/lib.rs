@@ -117,16 +117,11 @@ pub struct ServerState {
     pub sessions: Arc<tokio::sync::RwLock<Vec<Arc<Session>>>>,
     /// Global open table (for share-mode conflict tracking).
     pub open_table: Arc<opens::OpenTable>,
-    /// NTLM identity store — built once at startup from config users.
+    /// NTLM identity store — live-reloadable (swapped on SIGHUP).
     /// Each user's NT hash is pre-computed so plaintext passwords are never
-    /// stored or rebuilt per session_setup. Reloaded on SIGHUP.
-    pub identities: Arc<rssmb_auth::IdentityStore>,
-    /// Live-reloadable identities (swapped on SIGHUP). The `identities`
-    /// field above is the initial boot-time store; this is the current one.
+    /// stored or rebuilt per session_setup.
     /// Use [`identities_snapshot`](Self::identities_snapshot) to get the
-    /// current store. We keep both so `ServerState::new` doesn't change
-    /// its signature and existing code that uses `state.identities`
-    /// directly still works (it gets the boot-time store).
+    /// current store.
     identities_swap: StdRwLock<Arc<rssmb_auth::IdentityStore>>,
     /// Live-reloadable shares (swapped on SIGHUP).
     shares_swap: StdRwLock<Arc<std::collections::HashMap<String, crate::config::ShareConfig>>>,
@@ -206,7 +201,6 @@ impl ServerState {
             config: Arc::new(config),
             sessions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             open_table: Arc::new(opens::OpenTable::new()),
-            identities: identities.clone(),
             identities_swap: StdRwLock::new(identities),
             shares_swap: StdRwLock::new(initial_shares),
             conn_limiter,
