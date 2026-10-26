@@ -19,10 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the canonical session-table order (registry → sessions →
   retired_sessions, never overlapping) documented in
   `docs/lock-audit.md` along with the intentional std/tokio flavor
-  split for signing/encryption vs trees/opens.
-- **CI: `clippy::await_holding_lock` now denied** (`-D`) in both
-  workflows, alongside `-Dclippy::all` — the await-safety audit is
-  now machine-enforced (0 fires across the workspace at introduction).
+  split for signing/encryption vs trees/opens. The audit also records
+  known follow-ups found during it: the global `sessions` Vec is
+  never populated (multichannel bind-by-lookup inert — pre-existing),
+  reload()'s two-lock swap window, session-table teardown
+  non-atomicity, and the unbounded retired_sessions set.
+- **CI: `clippy::await_holding_lock` now passed explicitly** (`-D`) in
+  both workflows, alongside `-Dclippy::all` — the lint was already
+  covered by `clippy::all` (suspicious group); the explicit flag
+  documents the await-safety invariant. 0 fires across the workspace
+  (verified on clippy 0.1.99 / rustc 1.99.1).
 - **docker: builder image bumped `rust:1.90` → `rust:1`** — the
   lockfile's `sspi 0.23` requires rustc ≥ 1.93, so the pinned 1.90
   builder image can no longer compile the workspace.

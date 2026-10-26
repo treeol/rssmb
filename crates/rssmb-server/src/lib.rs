@@ -259,9 +259,10 @@ impl ServerState {
             }),
         ));
 
-        // Swap identities and shares atomically (each behind StdRwLock).
-        // Server-level settings (listen, signing, encryption, dialects,
-        // timeouts, limits) are NOT reloaded — they require a restart.
+        // Swap identities and shares (each behind its own StdRwLock — the
+        // two writes are NOT one atomic step; a reader can briefly see
+        // new identities with old shares. Acceptable: SIGHUP reload is
+        // rare and both tables are advisory config).
         *std::sync::RwLock::write(&self.identities_swap).unwrap() = new_identities;
         *std::sync::RwLock::write(&self.shares_swap).unwrap() = Arc::new(new_config.shares.clone());
 
