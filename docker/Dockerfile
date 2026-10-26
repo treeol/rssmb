@@ -1,10 +1,11 @@
 # Multi-stage Dockerfile for RSSMB
 # Stage 1: Build a fully static musl binary
-# Builder image: current stable (the lockfile's sspi 0.23 requires
-# rustc >= 1.93, above the declared rust-version = "1.85" MSRV — the
-# MSRV field is stale and needs a follow-up bump; the old rust:1.90
-# pin can no longer compile the workspace).
-FROM rust:1-bookworm AS builder
+# Builder image: rust 1.93 — the lockfile's sspi 0.23 requires
+# rustc >= 1.93, which is the workspace rust-version (MSRV). Pinned
+# deliberately (not floating `rust:1`) so release image builds are
+# reproducible and stable regressions can't break them unprompted;
+# bump the pin together with rust-version.
+FROM rust:1.93-bookworm AS builder
 
 # Install musl tools for static linking
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*

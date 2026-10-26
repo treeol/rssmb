@@ -29,9 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covered by `clippy::all` (suspicious group); the explicit flag
   documents the await-safety invariant. 0 fires across the workspace
   (verified on clippy 0.1.99 / rustc 1.99.1).
-- **docker: builder image bumped `rust:1.90` → `rust:1`** — the
-  lockfile's `sspi 0.23` requires rustc ≥ 1.93, so the pinned 1.90
-  builder image can no longer compile the workspace.
+- **docker: builder image pinned `rust:1.90` → `rust:1.93-bookworm`** — the
+  lockfile's `sspi 0.23` requires rustc ≥ 1.93, so the pinned 1.90 builder
+  image can no longer compile the workspace.
+- **MSRV raised to 1.93 and made real.** `rust-version` in Cargo.toml
+  1.85 → 1.93 (the actual floor, driven by sspi 0.23; 1.85 was stale and
+  unbuildable), README badge updated, and a new `msrv` CI job runs
+  `cargo check --workspace --locked` on the 1.93 toolchain so the
+  declared floor can't silently rot again.
 
 ## [0.1.8] — 2026-10-25
 
