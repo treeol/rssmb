@@ -28,3 +28,8 @@ every contribution, without exception.
    in one commit; CI green; human confirms before tag.
 10. Workarounds in tests for server bugs are not allowed; the bug gets a
     roadmap entry and the test stays in its natural form.
+11. A roadmap entry claiming a bug must carry evidence: a committed repro
+    script (tests/live/ or tests/conformance/) or a captured log, plus the
+    exact build it was observed on. "Observed once in a sandbox" with no
+    committed repro is not evidence — close it as cannot-reproduce if it
+    cannot be reconstructed.
