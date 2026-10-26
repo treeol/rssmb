@@ -5,6 +5,28 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Internal
+
+- **Lock audit complete (ROADMAP R-06).** All previously uninspected
+  std-guard sites verified — none holds a std::sync guard across an
+  `.await` (ioctl.rs guards a tokio mutex; quic.rs:650 is a test-only
+  RAII admission; connection.rs:650 has no lock; connection.rs:1880 is
+  a test struct literal). Dual-lock ServerState pairs resolved:
+  dead `identities` boot Arc removed (all auth paths use the
+  live-reload `identities_snapshot()`), dead `add_session` removed,
+  and the canonical session-table order (registry → sessions →
+  retired_sessions, never overlapping) documented in
+  `docs/lock-audit.md` along with the intentional std/tokio flavor
+  split for signing/encryption vs trees/opens.
+- **CI: `clippy::await_holding_lock` now denied** (`-D`) in both
+  workflows, alongside `-Dclippy::all` — the await-safety audit is
+  now machine-enforced (0 fires across the workspace at introduction).
+- **docker: builder image bumped `rust:1.90` → `rust:1`** — the
+  lockfile's `sspi 0.23` requires rustc ≥ 1.93, so the pinned 1.90
+  builder image can no longer compile the workspace.
+
 ## [0.1.8] — 2026-10-25
 
 ### Changed

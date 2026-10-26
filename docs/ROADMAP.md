@@ -25,7 +25,7 @@ advances an item updates its row here in the same PR.
 | R-03 | smb2.getinfo + smb2.setinfo campaign | Clients read file sizes/timestamps/attributes on nearly every operation; wrong answers corrupt Explorer views and backup tools. | results.md: smb2.getinfo 0/8, smb2.setinfo 0/1 | open | — |
 | R-04 | smb2.dir campaign | Directory listing correctness gates every GUI file browser and `ls`-alike. | results.md: smb2.dir 2/7 (1kfiles_rename, fixed, large-files, many, modify, one, sorted) | open | — |
 | R-05 | smb2.credits grant counts | Wrong credit grants stall or kill multi-credit large-MTU transfers (1 MiB reads/writes). | results.md: smb2.credits 0/3 (session_setup_credits_granted, single_req_credits_granted, skipped_mid) | open | — |
-| R-06 | Lock-audit debt: uninspected guard sites + dual-lock ServerState pairs | Uninspected std-guard sites and dual-lock field pairs are unaudited hazards — deadlock risk under load cannot be ruled out until each is checked (the audit found no confirmed guard-across-await instance to date). | [`docs/lock-audit.md`](lock-audit.md) §1 "Uninspected" (ioctl.rs:95-96,185-186; quic.rs:650; connection.rs:650,1880) + §2 dual-lock table (4 pairs) | open | — |
+| R-06 | Lock-audit debt: uninspected guard sites + dual-lock ServerState pairs | Uninspected std-guard sites and dual-lock field pairs are unaudited hazards — deadlock risk under load cannot be ruled out until each is checked (the audit found no confirmed guard-across-await instance to date). | [`docs/lock-audit.md`](lock-audit.md) §1 "Uninspected" (ioctl.rs:95-96,185-186; quic.rs:650; connection.rs:650,1880) + §2 dual-lock table (4 pairs) | done | `fix/lock-audit` |
 
 ## P1 — features and hardening for the 1.0 quality bar
 

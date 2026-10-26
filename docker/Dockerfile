@@ -1,7 +1,7 @@
 # Multi-stage Dockerfile for RSSMB
 # Stage 1: Build a fully static musl binary
 # MSRV is 1.85 (rust-toolchain.toml).
-FROM rust:1.90-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 # Install musl tools for static linking
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
