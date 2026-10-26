@@ -220,10 +220,6 @@ impl ServerState {
         self.shutdown.trigger();
     }
 
-    pub async fn add_session(&self, session: Arc<Session>) {
-        self.sessions.write().await.push(session);
-    }
-
     pub async fn remove_session(&self, session_id: u64) {
         self.sessions.write().await.retain(|s| s.id != session_id);
     }

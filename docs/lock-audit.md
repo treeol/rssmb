@@ -57,19 +57,46 @@ holds a std::sync guard across an `.await`. `clippy::await_holding_lock`
 RwLock guard" worry for ioctl.rs was unfounded — the field is a tokio
 mutex, not std.
 
-## 2. ServerState fields with dual std/tokio lock variants
+## 2. ServerState fields with dual std/tokio lock variants — resolutions (2026-10-26)
 
-| Field pair | std variant | tokio variant | Notes |
+| Field pair | std variant | tokio variant | Resolution |
 |---|---|---|---|
-| **identities** | `identities_swap: StdRwLock<Arc<IdentityStore>>` (lib.rs:130) | `identities: Arc<IdentityStore>` (lib.rs:123) | Identity store accessible both as an unlocked boot Arc and a live-reloadable std-RwLock-swap. High-risk: a reader using the boot Arc won't see a reload. |
-| **shares** | `shares_swap: StdRwLock<Arc<HashMap<String, ShareConfig>>>` (lib.rs:211) | `config.shares` (immutable via `Arc<ServerConfig>`) | Same share data reachable via the immutable config Arc and the std-RwLock swap. Medium-risk: the config path never sees live swaps. |
-| **sessions** | `session_registry: Arc<StdRwLock<HashMap<u64, Arc<SessionShared>>>` (lib.rs:155) | `sessions: Arc<tokio::sync::RwLock<Vec<Arc<Session>>>` (lib.rs:117) | Parallel session tables, one per lock flavor. Removed/inserted in tandem by `teardown_previous_session` (mod.rs:1261-1266). Medium-risk: drift if one is modified without the other. |
-| **SessionShared/SessionArcs** | `signing: Arc<StdRwLock<...>>`, `encryption: Arc<StdRwLock<...>>` (mod.rs:175-176) | `trees: Arc<tokio::sync::RwLock<...>>`, `opens: Arc<tokio::sync::RwLock<...>>` (mod.rs:171-172) | Mixed lock flavors over the same session's state. `SessionArcs` (mod.rs:205) duplicates the same Arcs. Medium-risk: the split is by data type, not by access pattern, so the lock flavors don't match usage. |
+| **identities** | `identities_swap: StdRwLock<Arc<IdentityStore>>` (lib.rs) | ~~`identities: Arc<IdentityStore>`~~ | **Collapsed to one.** The boot Arc had zero readers — every auth path uses `identities_snapshot()` (re-cloned per SESSION_SETUP round, sees SIGHUP reloads). Field removed (fix/lock-audit commit 2). Single source: `identities_snapshot()`. |
+| **shares** | `shares_swap: StdRwLock<Arc<HashMap<String, ShareConfig>>>` (lib.rs) | `config.shares` (immutable via `Arc<ServerConfig>`) | **Documented split, no change.** All production share lookups (TREE_CONNECT tree_connect.rs, ioctl.rs, write.rs, change_notify.rs, publish-on-close orphan sweep connection.rs) go through `shares_snapshot()`; the `config.shares` path is only read at startup/reload time (construction, validation, CLI logging). Not a dual-lock: the config Arc is never locked, and no runtime lookup reads it. |
+| **sessions** | `session_registry: Arc<StdRwLock<HashMap<u64, Arc<SessionShared>>>` + `retired_sessions: StdRwLock<HashSet<u64>>` (lib.rs) | `sessions: Arc<tokio::sync::RwLock<Vec<Arc<Session>>>` (lib.rs) | **Canonical order documented (below); dead `add_session` removed.** |
+| **signing/encryption vs trees/opens** | `signing`, `encryption`: `Arc<StdRwLock<HashMap<...>>>` (SessionShared/SessionArcs, dispatch/mod.rs) | `trees`, `opens`: `Arc<tokio::sync::RwLock<...>>` | **Documented split, no change.** The flavor split follows await semantics: `signing`/`encryption` guards are only ever held over synchronous crypto (sign/verify/transform — scoped blocks at mod.rs:946, session_setup.rs:235, async_helpers.rs closure, logoff.rs:106), so std RwLock is correct and faster; `trees`/`opens` are held across `.await` points, so they must be tokio flavors. Std guards on signing/encryption are never alive across an `.await` (verified by hand + `clippy::await_holding_lock`, §3). |
 
-## Next debt items (not this branch)
+### Canonical session-table order
 
-1. Inspect the uninspected std-guard sites (ioctl.rs, quic.rs, connection.rs).
-2. Unify the dual-lock pairs: pick one lock flavor per field and use it
-   consistently, or document why the split is safe.
-3. The `identities` boot-Arc vs `identities_swap` std-RwLock is the highest
-   risk — a reader using the boot path won't see a live reload.
+When `session_registry`, `sessions`, and `retired_sessions` are touched
+in the same region, the canonical order (as used by
+`teardown_previous_session`, dispatch/mod.rs) is:
+
+1. `session_registry` (read for lookup / write for insert+remove)
+2. `sessions` (tokio write, via `remove_session`)
+3. `retired_sessions` (write insert)
+
+Every existing site takes these guards **sequentially** — no site holds
+two of the three guards simultaneously (`teardown_previous_session` drops
+each before taking the next) — so the order is documentation, not a
+deadlock fix. New code touching multiple session tables must follow this
+order and keep the guards non-overlapping.
+
+`SessionArcs` (dispatch/mod.rs) duplicating the SessionShared Arcs is
+inherent to the per-connection snapshot design (ConnState.active); both
+hold the same Arcs, so it is aliasing, not a dual lock.
+
+## 3. Clippy gate
+
+`clippy::await_holding_lock` (stable clippy 1.99.1) is enabled in CI as
+`-Dclippy::await_holding_lock` alongside `-Dclippy::all`
+(`.github/workflows/ci.yml`, `.github/workflows/interop-ci.yml`).
+Verified clean across the whole workspace on 2026-10-26 (0 fires) —
+machine-confirming §1: no std::sync guard is held across an `.await`
+anywhere in the server crate.
+
+## Status: complete (2026-10-26, `fix/lock-audit`)
+
+All sites inspected (§1), all four dual-lock pairs resolved or
+documented (§2), lint gate added (§3). The former "Next debt items"
+list is closed by this branch; ROADMAP R-06.
