@@ -16,6 +16,8 @@ Usage: client.py <scenario> [<scenario> ...]
   bigwrite_311  same over SMB 3.1.1 (unsealed: impacket has no AES-GCM)
   share_comments  alice -> NetrShareEnum (name, type, remark) triples match config
   share_get_info  alice -> NetrShareGetInfo(public) == (public, Pub, 0); unknown share fails
+  r30_reopen  alice -> re-open an existing file with impacket's default read
+              mask 0x120089 must read the full content (R-30 regression)
 """
 import io
 import os
@@ -335,6 +337,29 @@ def scenario(name):
         c.putFile("public", "enc_upload.txt", io.BytesIO(data).read)
         assert get(c, "public", "enc_upload.txt") == data
         c.deleteFile("public", "enc_upload.txt")
+        c.logoff()
+    elif name == "r30_reopen":
+        # R-30 regression: CREATE a file, write, close, then re-open the
+        # existing file with impacket's default read mask 0x120089 and READ
+        # from a fresh handle — must return the full content, not 0 bytes.
+        # (The R-30 roadmap report could not be reproduced; this pins the
+        # observed-once sequence as a committed scenario per WORKING-METHOD
+        # rule 11.)
+        c = connect()
+        c.login("alice", "TestPass123")
+        tid = c._SMBConnection.connectTree("public")
+        payload = b"hello-r30-" * 100  # 1000 bytes
+        f = c._SMBConnection.create(tid, "r30.txt", 0x12019F, 0x7, 0,
+                                   smb3structs.FILE_OVERWRITE_IF, 0)
+        c._SMBConnection.write(tid, f, payload, 0, len(payload))
+        c._SMBConnection.close(tid, f)
+        f = c._SMBConnection.create(tid, "r30.txt", 0x120089, 0x7, 0,
+                                    smb3structs.FILE_OPEN, 0)
+        data = c._SMBConnection.read(tid, f, 0, 1000) or b""
+        c._SMBConnection.close(tid, f)
+        c.deleteFile("public", "r30.txt")
+        print(f"  re-open read: {len(data)} bytes (expected 1000)")
+        assert data == payload, f"re-open READ mismatch: {len(data)} bytes"
         c.logoff()
     else:
         raise SystemExit(f"unknown scenario {name}")
