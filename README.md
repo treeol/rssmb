@@ -70,7 +70,9 @@ minimal overhead and maximal security**.
   `tests/conformance/results.md`)
 - File leases v1/v2 (R, RH, RW, RWH) and traditional oplocks with break handling
 - Byte-range locks with blocking, CANCEL, LockSequence replay detection —
-  smb2.lock 22/22 (smbtorture 4.19.5, full parity with smbd)
+  smb2.lock 22/22 (smbtorture 4.19.5, full parity with smbd — 25/0/0/0
+  in the 2026-10-28 v0.1.9 baseline;
+  `tests/conformance/results.md`)
 - Multichannel (SMB 3.x): session binding across connections and
   `FSCTL_QUERY_NETWORK_INTERFACE_INFO` interface discovery
 - SMB over QUIC (SMB 3.1.1 over TLS 1.3, ALPN `smb`, UDP/443) — traverse
