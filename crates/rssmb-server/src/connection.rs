@@ -939,7 +939,7 @@ impl Connection {
             None => return Ok(()),
         };
         let _ = from_spawn; // behavior identical; only the caller's error
-                            // handling differs (logged, not fatal)
+        // handling differs (logged, not fatal)
         {
             // Grant credits and write the actual grant into the response
             // header's credit_request field. The client uses this to track

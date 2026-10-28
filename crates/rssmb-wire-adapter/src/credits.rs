@@ -809,7 +809,7 @@ mod tests {
     fn test_credits_session_setup_grants_8192() {
         let mgr = CreditManager::new(8192);
         let mut cur: i64 = 1; // initial credit from negotiate (mid 0)
-        // negotiate: deduct (mid 0), response refunds the charge only.
+                              // negotiate: deduct (mid 0), response refunds the charge only.
         mgr.check_and_deduct(0, 1).unwrap();
         cur -= 1;
         cur += mgr.grant_for_response(1, 1, false, true) as i64;
