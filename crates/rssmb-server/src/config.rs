@@ -236,7 +236,9 @@ fn default_health_port() -> u16 {
     8080
 }
 fn default_max_credits() -> u32 {
-    1024
+    // smbd parity: Samba's "smb2 max credits" default is 8192.
+    // smb2.credits subtests assert >= 8192 grants.
+    8192
 }
 fn default_auth_max_failures() -> u32 {
     5
@@ -671,7 +673,7 @@ impl ServerConfig {
             guest_access: false,
             health_port: 8080,
             health_bind_addr: "127.0.0.1".to_string(),
-            max_credits: 1024,
+            max_credits: 8192,
             auth_max_failures: 5,
             auth_window_secs: 60,
             auth_delay_max_ms: 5000,
@@ -720,7 +722,7 @@ max_connections_per_ip = 100
 max_frame_size = 1048576
 guest_access = false
 health_port = 8080
-max_credits = 1024
+max_credits = 8192
 
 [shares.public]
 name = "public"
@@ -747,7 +749,7 @@ listen_addr = "0.0.0.0"
 port = 445
 guest_access = true
 health_port = 8080
-max_credits = 1024
+max_credits = 8192
 
 [shares.public]
 name = "public"
@@ -804,7 +806,7 @@ disabled = true
         let toml_str = r#"
 guest_access = true
 health_port = 8080
-max_credits = 1024
+max_credits = 8192
 
 [[users]]
 username = "alice"
@@ -1184,7 +1186,7 @@ unknown_field = "should be rejected"
         let toml_str = r#"
 listen_addr = "127.0.0.1"
 port = 445
-max_credits = 1024
+max_credits = 8192
 
 [shares.public]
 name = "public"
@@ -1203,7 +1205,7 @@ bogus_field = true
         let toml_str = r#"
 listen_addr = "127.0.0.1"
 port = 445
-max_credits = 1024
+max_credits = 8192
 
 [[users]]
 username = "alice"

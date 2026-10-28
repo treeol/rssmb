@@ -21,6 +21,10 @@ Usage: client.py <scenario> [<scenario> ...]
   r11_eof     alice -> READ at/past EOF returns STATUS_END_OF_FILE (not
               OK+0); partial window and len-0 semantics match the Samba
               4.19.5 golden (R-11 pin; golden: tests/live/golden-r11-eof.json)
+  credits     alice 3.1.1 -> login with CreditRequest 65535 on every request:
+              server must grant the full window (>= 8192) on the
+              auth-complete SESSION_SETUP response (R-05 pin, smbd 4.19.5
+              parity: charge-refund + window-budget grants)
 """
 import io
 import os
@@ -431,6 +435,49 @@ def scenario(name):
             smb.close(tid, fid)
             c.deleteFile("public", "r11eof.bin")
             c.logoff()
+    elif name == "credits":
+        # R-05 pin: credit grants must match smbd 4.19.5
+        # (smb2_set_operation_credit): every request's own charge is
+        # refunded with its response, and the auth-complete SESSION_SETUP
+        # response grants the full window (capped by `max_credits`, now
+        # 8192 = smbd's "smb2 max credits" default). The smb2.credits
+        # torture asserts client cur_credits >= 8192 after login.
+        # Client model (smbXcli): cur -= charge per request; cur +=
+        # CreditResponse per response. The single-request (subtest 2)
+        # grant arithmetic is unit-tested in rssmb-wire-adapter
+        # (test_credits_*); here we pin the wire behavior of the login
+        # sequence: interim SETUP grants the charge only, the
+        # auth-complete SETUP grants the full window.
+        c = connect_311()
+        smb = c._SMBConnection
+        orig_send = smb.sendSMB
+        orig_recv = smb.recvSMB
+        grants = []
+        state = {"req": 65535}
+
+        def p_send(packet):
+            packet["CreditRequestResponse"] = state["req"]
+            return orig_send(packet)
+
+        def p_recv(packet_id=None):
+            p = orig_recv(packet_id)
+            grants.append(int(p["CreditRequestResponse"]))
+            return p
+
+        smb.sendSMB = p_send
+        smb.recvSMB = p_recv
+        c.login("alice", "TestPass123")
+        # interim SETUP: MORE_PROCESSING (status != 0) -> charge only (1);
+        # auth-complete SETUP -> full window (>= 8192).
+        print(f"  login grants: {grants}")
+        assert grants == [1, 8192], f"expected [1, 8192], got {grants}"
+        cur = 1
+        for g in grants:
+            cur -= 1
+            cur += g
+        print(f"  cur_credits={cur}")
+        assert cur >= 8192, f"server granted only {cur} credits (< 8192)"
+        c.logoff()
     else:
         raise SystemExit(f"unknown scenario {name}")
 

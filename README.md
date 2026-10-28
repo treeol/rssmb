@@ -212,7 +212,7 @@ See `config/rssmb.example.toml` for production-safe defaults. Key settings:
 | `guest_access` | `false` | Allow anonymous guest logons (only `guest_ok` shares) |
 | `max_connections_per_ip` | `0` (`100` in example config) | Per-IP connection limit (`0` = unlimited) |
 | `max_frame_size` | `1048576` | Maximum SMB2 payload size = advertised MaxRead/MaxWrite/MaxTransactSize (capped at 1 MiB, min 65536); the wire frame limit adds a fixed 64 KiB header allowance |
-| `max_credits` | `1024` | Maximum outstanding credits |
+| `max_credits` | `8192` | Maximum SMB2 credit window per connection (smbd `smb2 max credits` parity) |
 | `health_bind_addr` / `health_port` | `0.0.0.0` / `8080` | HTTP health/metrics endpoint |
 | `shutdown_grace_secs` | `10` | Graceful drain timeout on SIGTERM/SIGINT |
 | `leases` | `true` | SMB 2.1+ file leases and traditional oplocks |
