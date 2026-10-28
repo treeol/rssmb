@@ -1,0 +1,58 @@
+[
+  {
+    "label": "samba-419",
+    "capture_date": "2026-10-27",
+    "samba_version": "4.19.5-Ubuntu",
+    "seq": "eof_eq_len_pos",
+    "offset": 1000,
+    "length": 1000,
+    "status": "0xc0000011",
+    "status_name": "STATUS_END_OF_FILE",
+    "data_len": 0
+  },
+  {
+    "label": "samba-419",
+    "seq": "eof_gt_len_pos",
+    "offset": 2000,
+    "length": 1000,
+    "status": "0xc0000011",
+    "status_name": "STATUS_END_OF_FILE",
+    "data_len": 0
+  },
+  {
+    "label": "samba-419",
+    "seq": "partial_window",
+    "offset": 500,
+    "length": 1000,
+    "status": "0x00000000",
+    "status_name": "STATUS_SUCCESS",
+    "data_len": 500
+  },
+  {
+    "label": "samba-419",
+    "seq": "zero_at_start",
+    "offset": 0,
+    "length": 0,
+    "status": "0x00000000",
+    "status_name": "STATUS_SUCCESS",
+    "data_len": 0
+  },
+  {
+    "label": "samba-419",
+    "seq": "zero_at_eof",
+    "offset": 1000,
+    "length": 0,
+    "status": "0x00000000",
+    "status_name": "STATUS_SUCCESS",
+    "data_len": 0
+  },
+  {
+    "label": "samba-419",
+    "seq": "zero_past_eof",
+    "offset": 2000,
+    "length": 0,
+    "status": "0x00000000",
+    "status_name": "STATUS_SUCCESS",
+    "data_len": 0
+  }
+]
