@@ -32,4 +32,7 @@ every contribution, without exception.
     script (tests/live/ or tests/conformance/) or a captured log, plus the
     exact build it was observed on. "Observed once in a sandbox" with no
     committed repro is not evidence — close it as cannot-reproduce if it
-    cannot be reconstructed.
+    cannot be reconstructed. The same rule applies to agent reports: every
+    result row in a report must come from a command actually run in that
+    session; anything reasoned, remembered, or otherwise not directly
+    observed must be marked [inferred].

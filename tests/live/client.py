@@ -18,6 +18,9 @@ Usage: client.py <scenario> [<scenario> ...]
   share_get_info  alice -> NetrShareGetInfo(public) == (public, Pub, 0); unknown share fails
   r30_reopen  alice -> re-open an existing file with impacket's default read
               mask 0x120089 must read the full content (R-30 regression)
+  r11_eof     alice -> READ at/past EOF returns STATUS_END_OF_FILE (not
+              OK+0); partial window and len-0 semantics match the Samba
+              4.19.5 golden (R-11 pin; golden: tests/live/golden-r11-eof.json)
 """
 import io
 import os
@@ -361,6 +364,73 @@ def scenario(name):
         print(f"  re-open read: {len(data)} bytes (expected 1000)")
         assert data == payload, f"re-open READ mismatch: {len(data)} bytes"
         c.logoff()
+    elif name == "r11_eof":
+        # R-11 pin: READ semantics at/past EOF must match the Samba 4.19.5
+        # golden (tests/live/golden-r11-eof.json), per MS-SMB2 3.3.5.12:
+        #   READ offset >= EOF, Length > 0  -> STATUS_END_OF_FILE
+        #   READ window crossing EOF       -> STATUS_OK + available bytes
+        #   READ Length == 0 (any offset)   -> STATUS_OK + 0 bytes
+        # Raw SMB2 READ requests, not SMBConnection.readFile()/read():
+        # impacket's helpers swallow STATUS_END_OF_FILE and return b''
+        # (smbconnection.py readFile), which would hide a regression of
+        # END_OF_FILE -> OK+0.
+        from impacket.smb3structs import SMB2Read, SMB2Read_Response
+        from impacket.smb3 import SessionError
+        from impacket.nt_errors import STATUS_END_OF_FILE, STATUS_SUCCESS
+        STATUS_END_OF_FILE = int(STATUS_END_OF_FILE)
+        STATUS_SUCCESS = int(STATUS_SUCCESS)
+
+        def raw_read(smb, tid, fid, off, length):
+            packet = smb.SMB_PACKET()
+            packet["Command"] = smb3structs.SMB2_READ
+            packet["TreeID"] = tid
+            rr = SMB2Read()
+            rr["Padding"] = 0x50
+            rr["FileID"] = fid
+            rr["Length"] = length
+            rr["Offset"] = off
+            packet["Data"] = rr
+            mid = smb.sendSMB(packet)
+            ans = smb.recvSMB(mid)
+            return int(ans["Status"]), ans
+
+        SIZE = 1000
+        payload = bytes(range(256)) * (SIZE // 256) + bytes(SIZE % 256)
+        c = connect()
+        c.login("alice", "TestPass123")
+        smb = c._SMBConnection
+        tid = smb.connectTree("public")
+        fid = smb.create(tid, "r11eof.bin", 0x12019F, 0x7, 0,
+                         smb3structs.FILE_OVERWRITE_IF, 0)
+        smb.write(tid, fid, payload, 0, len(payload))
+        smb.close(tid, fid)
+        fid = smb.create(tid, "r11eof.bin", 0x120089, 0x7, 0,
+                         smb3structs.FILE_OPEN, 0)
+        try:
+            # offset == EOF, Length > 0 -> END_OF_FILE (golden row 1)
+            status, _ = raw_read(smb, tid, fid, SIZE, 1000)
+            assert status == STATUS_END_OF_FILE, hex(status)
+            print(f"  off={SIZE} len=1000 -> END_OF_FILE (expected)")
+            # offset > EOF, Length > 0 -> END_OF_FILE (golden row 2)
+            status, _ = raw_read(smb, tid, fid, 2 * SIZE, 1000)
+            assert status == STATUS_END_OF_FILE, hex(status)
+            print(f"  off={2 * SIZE} len=1000 -> END_OF_FILE (expected)")
+            # window crossing EOF -> OK + available bytes (golden row 3)
+            status, ans = raw_read(smb, tid, fid, SIZE // 2, 1000)
+            body = SMB2Read_Response(ans["Data"])["Buffer"]
+            assert status == STATUS_SUCCESS, hex(status)
+            assert body == payload[SIZE // 2:], (len(body), hex(status))
+            print(f"  off={SIZE // 2} len=1000 -> OK + {len(body)} bytes (expected)")
+            # Length == 0 at start / EOF / past EOF -> OK + 0 (golden rows 4-6)
+            for off in (0, SIZE, 2 * SIZE):
+                status, ans = raw_read(smb, tid, fid, off, 0)
+                body = SMB2Read_Response(ans["Data"])["Buffer"]
+                assert status == STATUS_SUCCESS and body == b"", (off, hex(status))
+                print(f"  off={off} len=0 -> OK + 0 bytes (expected)")
+        finally:
+            smb.close(tid, fid)
+            c.deleteFile("public", "r11eof.bin")
+            c.logoff()
     else:
         raise SystemExit(f"unknown scenario {name}")
 
