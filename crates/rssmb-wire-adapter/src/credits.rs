@@ -118,9 +118,14 @@ impl CreditManager {
         let balance_charge = charge.max(1) as u64;
         // smbd parity (smb2_validate_message_id): the MessageId window
         // also charges max(charge, 1). The previous behavior
-        // (window_charge = charge, zero-charge reuses the MessageId)
-        // pinned `low` behind phantom holes and ate grant budget
-        // (smb2.credits off-by-N failures).
+        // (window_charge = charge, a zero-charge request consumed no
+        // MessageId — PR #31's model of impacket mid reuse) was based on
+        // a wrong root-cause story: impacket never reuses a MessageId
+        // (its WRITE charge is always >= 1 and its SequenceWindow
+        // advances every send). Instead the 0-consumption left every
+        // negotiate's MessageId unconsumed, pinning `low` behind a
+        // phantom hole and eating grant budget (smb2.credits
+        // off-by-N failures).
         let window_charge = balance_charge;
         let mut w = self.window.lock().unwrap();
 
@@ -514,18 +519,32 @@ mod tests {
     #[test]
     fn test_zero_charge_reuses_message_id() {
         // smbd parity: a charge of 0 is treated as 1 for BOTH the balance
-        // and the MessageId window (MS-SMB2 3.3.1.2), so the MessageId is
-        // consumed and CANNOT be reused by the next request.
+        // and the MessageId window (MS-SMB2 3.3.1.2,
+        // smb2_validate_message_id), so the MessageId is consumed and
+        // CANNOT be reused by the next request.
+        //
+        // Wire-observed impacket 0.13.1 sequence (the PR #31 repro path,
+        // tmp/stress/repro_charge0.py): NEGPROT is the only charge-0
+        // request (mid 0); every WRITE/CLOSE carries charge >= 1
+        // (impacket computes 1 + (len-1)//65536) and mids are strictly
+        // sequential — a client never reuses a MessageId. The old
+        // 0-consumes-nothing behavior left mid 0 unconsumed, pinning
+        // `low` at 0 forever (phantom hole) and eating window budget.
         let mgr = CreditManager::new(1024);
-        mgr.grant(99); // 100 total, window [0..100)
-                       // WRITE: charge 0 → balance -= 1, MessageId 5 consumed.
-        mgr.check_and_deduct(5, 0).unwrap();
-        assert_eq!(mgr.available_credits(), 99);
-        // CLOSE: reusing MessageId 5 must now FAIL (already used).
-        let r = mgr.check_and_deduct(5, 1);
+        // NEGPROT: charge 0, mid 0 — consumed like a charge of 1.
+        mgr.check_and_deduct(0, 0).unwrap();
+        assert_eq!(mgr.available_credits(), 0);
+        // Reusing mid 0 must fail (already used / below low).
+        let r = mgr.check_and_deduct(0, 1);
         assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
-        // The next valid MessageId is 6.
-        mgr.check_and_deduct(6, 1).unwrap();
+        // The next request (SESSION_SETUP, charge 1, mid 1) succeeds.
+        mgr.grant(99);
+        mgr.check_and_deduct(1, 1).unwrap();
+        // A small WRITE: charge >= 1, next sequential mid — succeeds.
+        mgr.check_and_deduct(2, 1).unwrap();
+        // CLOSE: charge 1, NEXT sequential mid (impacket never reuses) —
+        // succeeds under the smbd-parity window.
+        mgr.check_and_deduct(3, 1).unwrap();
     }
 
     #[test]

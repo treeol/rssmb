@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      permanently eating window budget — the off-by-4/8188 seen in the
      torture. A charge of 0 now consumes its MessageId and advances
      `low` like a charge of 1.
+     **This supersedes the 0.1.4 credit-window entry** (PR #31), whose
+     root-cause story — "impacket sends WRITE with credit_charge=0 and
+     then CLOSE with the same MessageId" — is not what impacket does on
+     the wire: impacket computes WRITE charges as
+     `1 + (len-1)//65536` (always ≥ 1, smb3.py) and advances its
+     SequenceWindow on every send, so its MessageIds are strictly
+     sequential and never reused. The client-side step-back that PR #31
+     observed is driven by the *response* echo
+     (`SequenceWindow += CreditCharge - 1`, smb3.py recvSMB) and only
+     fires before the dialect is negotiated, where it is exempt; #31's
+     real fix value was the balance-availability check, which is kept
+     (in `check_and_deduct`, `available < max(charge,1)` still rejects).
+     The PR #31 repro (`tests/conformance/poc-impacket-test.py`, incl.
+     `smb.write()` → `smb.close()` → `logoff()` on one connection) passes
+     against this change (3/3), as do all 20 live scenarios.
   Golden vs rssmb, full login sequence (CreditRequest 65535):
   smbd grants [NEGPROT 1, SETUP-interim 1, SETUP-auth 8192] → client
   `cur_credits` 8192; rssmb now byte-identical. All 19 live interop
