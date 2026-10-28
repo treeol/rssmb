@@ -169,7 +169,7 @@ static musl binaries for `x86_64` and `aarch64` Linux (with `SHA256SUMS`),
 and a multi-arch image:
 
 ```sh
-docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.8
+docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.9
 docker run -d --name rssmb -p 445:445 \
   -v ./config/rssmb.toml:/etc/rssmb/rssmb.toml:ro \
   -v ./data:/data ghcr.io/treeol/rssmb:latest
@@ -177,7 +177,7 @@ docker run -d --name rssmb -p 445:445 \
 
 ## Building from source
 
-Requires Rust 1.85+ (stable).
+Requires Rust 1.93+ (stable).
 
 ```sh
 cargo build --release
@@ -264,7 +264,7 @@ semantics, and config validation.
 ## Testing & conformance
 
 ```sh
-cargo test --workspace          # 616 unit + integration tests
+cargo test --workspace          # 646 unit + integration tests
 tests/live/run.sh               # impacket-based interop (needs Python)
 tests/live/mount.sh <server-ip> # real kernel CIFS mount (needs Docker --privileged)
 tests/conformance/run-smbtorture.sh   # smbtorture baseline (needs samba-testsuite)

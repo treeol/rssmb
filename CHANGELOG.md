@@ -5,7 +5,28 @@ All notable changes to RSSMB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+### Changed
+
+- **R-30 closed as cannot-reproduce; repro pinned as the `r30_reopen` live
+  scenario (#49).** The reported symptom (READ answering an empty body with
+  `STATUS_OK` after CREATE/WRITE/CLOSE + re-open) does not reproduce on the
+  claimed-failing commit `d791d4d` nor on `main` (dialects 2.1/3.0/3.1.1,
+  impacket 0.13.1); the exact sequence is committed as `tests/live` scenario
+  `r30_reopen` so it can't silently regress. Past-EOF READ semantics
+  tracked under R-11.
+- **EOF READ semantics pinned as the `r11_eof` live scenario with the Samba
+  4.19.5 golden (#50).** rssmb already matches smbd byte-for-byte on all six
+  probed sequences (READ at/past EOF with length > 0 →
+  `STATUS_END_OF_FILE` + 0 B; a window crossing EOF → `STATUS_OK` +
+  partial; length 0 at any offset → `STATUS_OK` + 0 B), and on the
+  shrink-while-open probe; the golden capture (`tests/live/golden-r11-eof.json`)
+  and the scenario keep it that way.
+- **WORKING-METHOD rule 11: evidence discipline.** A roadmap entry claiming
+  a bug must carry a committed repro script or a captured log ("observed
+  once in a sandbox" is not evidence); every result row in a report must
+  come from a command run in that session, anything else marked `[inferred]`.
+
+## [0.1.9] — 2026-10-28
 
 ### Fixed
 
@@ -52,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      The PR #31 repro (`tests/conformance/poc-impacket-test.py`, incl.
      `smb.write()` → `smb.close()` → `logoff()` on one connection) passes
      against this change (3/3), as do all 20 live scenarios.
+  This entry corrects the root-cause description given in 0.1.4.
   Golden vs rssmb, full login sequence (CreditRequest 65535):
   smbd grants [NEGPROT 1, SETUP-interim 1, SETUP-auth 8192] → client
   `cur_credits` 8192; rssmb now byte-identical. All 19 live interop
