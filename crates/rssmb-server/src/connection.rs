@@ -939,16 +939,14 @@ impl Connection {
             None => return Ok(()),
         };
         let _ = from_spawn; // behavior identical; only the caller's error
-        // handling differs (logged, not fatal)
+                            // handling differs (logged, not fatal)
         {
             // Grant credits and write the actual grant into the response
             // header's credit_request field. The client uses this to track
             // its available credits; if we don't write it, the client and
             // server disagree on the credit balance.
             let (charge, requested) = match &resp {
-                FramedResponse::Plain(p) => {
-                    (p.header.credit_charge, p.header.credit_request)
-                }
+                FramedResponse::Plain(p) => (p.header.credit_charge, p.header.credit_request),
                 FramedResponse::Compound(ps) => {
                     let last = ps.last();
                     (
