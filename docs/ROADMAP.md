@@ -1,7 +1,7 @@
 # RSSMB Roadmap
 
-- **Date:** 2026-10-25
-- **Current version:** 0.1.8
+- **Date:** 2026-10-28
+- **Current version:** 0.1.9
 - **Current baseline:** smbtorture 4.19.5, uncapped run of 2026-10-24
   ([`tests/conformance/results.md`](../tests/conformance/results.md)),
   captured against rssmb 0.1.6 (481de59) with the 0.1.7 credit-accounting fix
@@ -36,7 +36,7 @@ advances an item updates its row here in the same PR.
 | R-08 | FSCTL_SRV_COPYCHUNK | Server-side copy lets clients offload large copies instead of moving the data over the wire twice. | results.md: smb2.ioctl — all copy_chunk_* subtests failing (~20) | open | — |
 | R-09 | rpc.srvsvc remaining | Complete share enumeration is what network-browse dialogs (Windows Explorer, macOS Finder) display. | results.md: rpc.srvsvc 2/15 | open | — |
 | R-10 | Multichannel binding hardening (per-channel signing keys) | Binding is not hardened against a malicious second channel (per-channel signing key derivation); mitigated by shipping multichannel default-off. | CHANGELOG 0.1.7: `multichannel` default flipped to `false` until binding hardening lands. Lock-audit follow-up (2026-10-26, `fix/lock-audit`): the bind-by-lookup path reads `ServerState.sessions` (session_setup.rs:207) — a table that is **never populated** (only per-connection `ConnState.sessions` receives inserts), so cross-connection session lookup is already inert; see `docs/lock-audit.md` §2 follow-ups | open | — |
-| R-11 | smb2.read campaign | Correct READ semantics (positions, EOF, directory access checks) gate every file-transfer tool. | results.md: smb2.read 1/4 (access, dir, eof, position) | open | — |
+| R-11 | smb2.read campaign | Correct READ semantics (positions, EOF, directory access checks) gate every file-transfer tool. | results.md: smb2.read 1/4 (access, dir, eof, position). EOF/past-EOF semantics verified byte-identical to smbd 4.19.5 and pinned as the `r11_eof` live scenario with committed golden (`tests/live/golden-r11-eof.json`) — remaining failures are access/dir/position. | open (EOF half done) | — |
 | R-12 | smb2.notify basedir fidelity + CI budget | Correct change-notify keeps GUI folders live-updating instead of appearing frozen. | results.md: smb2.notify INCOMPLETE — stalls at basedir (attribute-filter fidelity debt) | open | — |
 | R-13 | Threat-model / SECURITY.md refresh | Security disclosures and reviewers need a current threat map — the threat model covers neither QUIC, publish_on_close, nor the lease/durable/lock surface, and the external review is still pending. | [`docs/threat-model.md`](threat-model.md) (no QUIC / publish_on_close / lease sections; §External Security Review "pending") | open | — |
 | R-14 | 1.0 release checklist (semver policy, config stability, upgrade notes) | Operators need config-format stability and documented upgrade paths before depending on rssmb in production. | none yet | open | — |
