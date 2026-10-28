@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SMB2 credit grants now match smbd 4.19.5 (`smb2.credits` 0/3 → 3/3,
+  ROADMAP R-05).** Three defects, found by capturing Samba 4.19.5's
+  per-response grants with `smb2_credits:5` debug logging and diffing
+  against rssmb's (extracted from `source3/smbd/smb2_server.c`
+  `smb2_set_operation_credit`):
+  1. **`max_credits` default 1024 → 8192** — smbd's `smb2 max credits`
+     default; the torture subtests assert ≥ 8192 grants after session
+     setup. All `tests/live/*.toml` configs follow.
+  2. **Per-response grant policy was "drain the window" instead of
+     "refund the charge, grant up to the window budget."** New
+     `CreditManager::grant_for_response(charge, requested, interim,
+     charge_only)`: granted = `charge + min(max(requested,1)−1,
+     max_grant − charge)`, clamped by the remaining window budget
+     (`max_grant − (high − low)`) — exactly smbd's algorithm. Interim
+     (async) responses grant 0; NEGPROT and non-auth-complete
+     SESSION_SETUP responses refund the charge only (`additional_max =
+     0`, smbd's `SMB2_OP_NEGPROT`/failed-`SMB2_OP_SESSSETUP` cases).
+     The old `grant()` capped by outstanding balance only, so the client
+     balance could never converge to the window while requests were
+     in flight.
+  3. **Zero-charge requests no longer reuse their MessageId.** smbd
+     charges `MAX(CreditCharge, 1)` to the MessageId window too
+     (`smb2_validate_message_id`); the old zero-charge workaround
+     (window consumed 0, MessageId reusable) pinned `low` behind
+     phantom holes on every negotiate (the first request is charge 0),
+     permanently eating window budget — the off-by-4/8188 seen in the
+     torture. A charge of 0 now consumes its MessageId and advances
+     `low` like a charge of 1.
+  Golden vs rssmb, full login sequence (CreditRequest 65535):
+  smbd grants [NEGPROT 1, SETUP-interim 1, SETUP-auth 8192] → client
+  `cur_credits` 8192; rssmb now byte-identical. All 19 live interop
+  scenarios (impacket/smbclient-style, incl. `bigwrite`, `rename`,
+  `r30_reopen`, `r11_eof`) still pass; `smb2.read` delta unchanged.
+
 ### Internal
 
 - **Lock audit complete (ROADMAP R-06).** All previously uninspected

@@ -109,16 +109,19 @@ impl CreditManager {
     ///   consumed the MessageIds. State **is** mutated; the error is a policy
     ///   rejection, not a protocol violation.
     pub fn check_and_deduct(&self, message_id: u64, charge: u32) -> Result<(), CreditError> {
-        // The credit balance charge is max(charge, 1) per MS-SMB2 3.3.1.2:
-        // "If the CreditCharge field is 0, it MUST be treated as 1."
-        // The MessageId window, however, uses the actual charge: a request
-        // with credit_charge=0 consumes 0 MessageIds (the MessageId is not
-        // advanced). This prevents a spurious "already used" rejection when
-        // a subsequent request reuses the same MessageId — a pattern seen
-        // with impacket, which sends WRITE with credit_charge=0 and then
-        // CLOSE with the same MessageId.
+        // The credit charge is max(charge, 1) per MS-SMB2 3.3.1.2: "If the
+        // CreditCharge field is 0, it MUST be treated as 1." This applies
+        // to BOTH the balance and the MessageId window — smbd parity
+        // (smb2_validate_message_id: credit_charge = MAX(charge, 1)):
+        // every request consumes at least one MessageId, so `low` advances
+        // with the contiguous prefix.
         let balance_charge = charge.max(1) as u64;
-        let window_charge = charge as u64;
+        // smbd parity (smb2_validate_message_id): the MessageId window
+        // also charges max(charge, 1). The previous behavior
+        // (window_charge = charge, zero-charge reuses the MessageId)
+        // pinned `low` behind phantom holes and ate grant budget
+        // (smb2.credits off-by-N failures).
+        let window_charge = balance_charge;
         let mut w = self.window.lock().unwrap();
 
         let low = w.low;
@@ -227,6 +230,77 @@ impl CreditManager {
             }
         }
         to_grant
+    }
+
+    /// Grant credits for a regular response, matching smbd 4.19's
+    /// `smb2_set_operation_credit` (source3/smbd/smb2_server.c):
+    ///
+    /// ```text
+    /// additional_possible = max_grant - charge          // room after refund
+    /// additional          = min(max(requested, 1) - 1, additional_possible)
+    /// granted             = charge + additional        // refund + extra
+    /// ```
+    ///
+    /// The request's own charge is refunded with every response (the
+    /// client `available` balance is restored as the request completes),
+    /// and additional credits are granted up to the window width budget
+    /// (`max_grant`). The window (`high`) extends by `granted`, so the
+    /// sequence window widens in lockstep with the credit balance —
+    /// Samba's exact model.
+    ///
+    /// On an interim (async) response no credits are granted at all
+    /// (smbd returns 0 when SMB2_HDR_FLAG_ASYNC is set); callers pass
+    /// `interim = true` for that case. On NEGOTIATE responses and on
+    /// SESSION_SETUP responses that did not complete authentication
+    /// (`charge_only = true`), only the request's charge is refunded —
+    /// no additional credits (smbd: `additional_max = 0` for
+    /// SMB2_OP_NEGPROT and non-OK SMB2_OP_SESSSETUP).
+    ///
+    /// Returns the number granted (written into the response header's
+    /// CreditRequest/Response field by the connection layer).
+    pub fn grant_for_response(
+        &self,
+        charge: u32,
+        requested: u32,
+        interim: bool,
+        charge_only: bool,
+    ) -> u32 {
+        if interim {
+            return 0;
+        }
+        let mut w = self.window.lock().unwrap();
+        let charge = charge.max(1) as u64;
+        let requested = requested.max(1) as u64;
+        // Room for additional credits after the charge refund, bounded by
+        // the total window budget (max_grant). Samba: additional_possible =
+        // credits.max - credit_charge.
+        let additional_possible = (self.max_grant as u64).saturating_sub(charge);
+        // The outstanding window width (high - low) also consumes budget:
+        // the sequence range smbd tracks as seq_range. Budget for the
+        // refund + additional must fit within max_grant - width.
+        let width = w.high - w.low;
+        let width_budget = (self.max_grant as u64).saturating_sub(width);
+        // smbd: additional_credits = min(requested - 1, additional_possible);
+        // credits_granted = charge + additional; then the final window
+        // clamp: credits_granted = min(credits_granted, max - seq_range).
+        let additional = if charge_only {
+            0
+        } else {
+            (requested - 1).min(additional_possible)
+        };
+        let granted = (charge + additional).min(width_budget) as u32;
+        if granted > 0 {
+            w.available = w.available.saturating_add(granted);
+            match w.high.checked_add(granted as u64) {
+                Some(new_high) => w.high = new_high,
+                None => {
+                    // Sequence space exhausted: roll back.
+                    w.available = w.available.saturating_sub(granted);
+                    return 0;
+                }
+            }
+        }
+        granted
     }
 
     /// Get current available credits (for diagnostics).
@@ -439,25 +513,25 @@ mod tests {
 
     #[test]
     fn test_zero_charge_reuses_message_id() {
-        // Impacket sends WRITE with credit_charge=0 and then CLOSE with the
-        // same MessageId. The balance is charged 1 (max(0,1) per MS-SMB2
-        // 3.3.1.2), but the MessageId window consumes 0 — so the same
-        // MessageId can be reused by the next request.
+        // smbd parity: a charge of 0 is treated as 1 for BOTH the balance
+        // and the MessageId window (MS-SMB2 3.3.1.2), so the MessageId is
+        // consumed and CANNOT be reused by the next request.
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
-                       // WRITE: charge 0 → balance -= 1, but MessageId 5 not consumed.
+                       // WRITE: charge 0 → balance -= 1, MessageId 5 consumed.
         mgr.check_and_deduct(5, 0).unwrap();
         assert_eq!(mgr.available_credits(), 99);
-        // CLOSE: same MessageId 5, charge 1 → should succeed because
-        // MessageId 5 was not consumed by the zero-charge WRITE.
-        mgr.check_and_deduct(5, 1).unwrap();
-        assert_eq!(mgr.available_credits(), 98);
-        // MessageId 6 is the next valid one (5 was consumed by the CLOSE).
+        // CLOSE: reusing MessageId 5 must now FAIL (already used).
+        let r = mgr.check_and_deduct(5, 1);
+        assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
+        // The next valid MessageId is 6.
         mgr.check_and_deduct(6, 1).unwrap();
     }
 
     #[test]
-    fn test_zero_charge_does_not_advance_low() {
+    fn test_zero_charge_advances_low() {
+        // smbd parity: a zero-charge request still consumes its MessageId,
+        // so `low` advances past it on the contiguous prefix.
         let mgr = CreditManager::new(1024);
         mgr.grant(99); // 100 total, window [0..100)
                        // Consume 0..5 with charge 1 each — low advances to 5.
@@ -465,13 +539,15 @@ mod tests {
             mgr.check_and_deduct(m, 1).unwrap();
         }
         assert_eq!(mgr.available_credits(), 95);
-        // Zero-charge request at 5: balance -= 1, low stays at 5 (no
-        // MessageId consumed).
+        // Zero-charge request at 5: balance -= 1 AND MessageId 5 consumed,
+        // low advances to 6.
         mgr.check_and_deduct(5, 0).unwrap();
         assert_eq!(mgr.available_credits(), 94);
-        // MessageId 5 is still available for a charge-1 request.
-        mgr.check_and_deduct(5, 1).unwrap();
-        assert_eq!(mgr.available_credits(), 93);
+        // MessageId 5 is now below low — rejected.
+        let r = mgr.check_and_deduct(5, 1);
+        assert!(matches!(r, Err(CreditError::InsufficientCredits { .. })));
+        // MessageId 6 is the next valid one.
+        mgr.check_and_deduct(6, 1).unwrap();
     }
 
     #[test]
@@ -699,6 +775,122 @@ mod tests {
                     "available {} exceeds max_grant {}",
                     mgr.available_credits(), max_grant);
             }
+        }
+    }
+
+    // ---- smb2.credits parity tests (smbd smb2_set_operation_credit) ----
+
+    /// Torture subtest 1: request 65535 on every SESSION_SETUP; the
+    /// client's cur_credits after login must be >= 8192.
+    /// Client model (smbXcli): cur -= charge per request; cur += grant
+    /// per response. smbd parity: NEGOTIATE and non-OK SESSION_SETUP
+    /// responses refund the charge only; the auth-complete SESSION_SETUP
+    /// response grants the full window.
+    #[test]
+    fn test_credits_session_setup_grants_8192() {
+        let mgr = CreditManager::new(8192);
+        let mut cur: i64 = 1; // initial credit from negotiate (mid 0)
+        // negotiate: deduct (mid 0), response refunds the charge only.
+        mgr.check_and_deduct(0, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 1, false, true) as i64;
+        // SESSION_SETUP #1 (NTLM negotiate, MORE_PROCESSING): charge only.
+        mgr.check_and_deduct(1, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 65535, false, true) as i64;
+        // SESSION_SETUP #2 (auth complete): full window.
+        mgr.check_and_deduct(2, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 65535, false, false) as i64;
+        assert!(cur >= 8192, "cur_credits {} < 8192", cur);
+    }
+
+    /// Torture subtest 2: connect with request 1 (cur must land at 1),
+    /// then a single CREATE requesting 65535 — cur must be >= 8192.
+    #[test]
+    fn test_credits_single_req_grants_8192() {
+        let mgr = CreditManager::new(8192);
+        let mut cur: i64 = 1;
+        mgr.check_and_deduct(0, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 1, false, true) as i64;
+        for mid in 1..=2 {
+            // session setups requesting exactly 1 (charge-only responses)
+            mgr.check_and_deduct(mid, 1).unwrap();
+            cur -= 1;
+            cur += mgr.grant_for_response(1, 1, false, mid == 1) as i64;
+        }
+        assert_eq!(cur, 1, "cur after minimal-credit login");
+        // tree connect + CREATE with CreditRequest 65535
+        mgr.check_and_deduct(3, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 1, false, false) as i64; // tree connect
+        mgr.check_and_deduct(4, 1).unwrap();
+        cur -= 1;
+        let g = mgr.grant_for_response(1, 65535, false, false);
+        assert_eq!(g, 8192, "single big request must grant the full window");
+        cur += g as i64;
+        assert!(cur >= 8192, "cur_credits {} < 8192", cur);
+    }
+
+    /// Torture subtest 3 (skipped_mid): with an outstanding hole at `low`
+    /// (a skipped MessageId), grants stay bounded by the window budget —
+    /// 8191 sequential single-credit writes each request-and-receive one
+    /// credit must keep working, and reusing the skipped mid then grants
+    /// the full 8192 window.
+    #[test]
+    fn test_credits_skipped_mid_window() {
+        let mgr = CreditManager::new(8192);
+        let mut cur: i64 = 1;
+        mgr.check_and_deduct(0, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 1, false, true) as i64;
+        // two session setups; final one completes auth -> full window
+        mgr.check_and_deduct(1, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 8192, false, true) as i64;
+        mgr.check_and_deduct(2, 1).unwrap();
+        cur -= 1;
+        cur += mgr.grant_for_response(1, 8192, false, false) as i64;
+        assert!(cur >= 8192, "cur {} < 8192 after setup", cur);
+        // skip mid 3 (hole at low). Sequential single-credit writes must
+        // keep being ADMITTED: the server-side balance (granted) covers
+        // the charges even though the full window means per-response
+        // grants are 0 (smbd: credits_possible = max - seq_range = 0).
+        // The client lives off its 8192-credit balance for all 8191 writes.
+        let hole = 3u64;
+        for i in 0..200u64 {
+            let mid = 4 + i;
+            // Server-side admission: each write consumes one credit from
+            // the balance granted during setup.
+            mgr.check_and_deduct(mid, 1)
+                .expect("write must stay inside the credit window");
+            let _g = mgr.grant_for_response(1, 2, false, false);
+        }
+        // fill the hole: the window reclaims (low advances past 3+4..),
+        // and a big ask grants the full 8192 again (budget restored).
+        mgr.check_and_deduct(hole, 1).unwrap();
+        let g = mgr.grant_for_response(1, 65535, false, false);
+        assert!(g > 0, "no budget after hole filled: got {}", g);
+    }
+
+    /// Interim (async) responses grant nothing (smbd: ASYNC => 0).
+    #[test]
+    fn test_grant_for_response_interim_grants_zero() {
+        let mgr = CreditManager::new(8192);
+        assert_eq!(mgr.grant_for_response(1, 65535, true, false), 0);
+        assert_eq!(mgr.available_credits(), 1);
+    }
+
+    /// grant_for_response never exceeds max_grant nor unbounds the window.
+    #[test]
+    fn test_grant_for_response_bounded() {
+        let mgr = CreditManager::new(16);
+        for _ in 0..100 {
+            let _ = mgr.check_and_deduct(0, 0); // zero-charge admission
+            let g = mgr.grant_for_response(1, 65535, false, false);
+            assert!(g <= 16, "grant {} > max 16", g);
+            assert!(mgr.available_credits() <= 16);
         }
     }
 }

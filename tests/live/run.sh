@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 PY=${PY:-/tmp/smbvenv/bin/python}
-SCEN=${*:-"guest guestpriv alice badpass signed rename bigwrite dirclasses encrypted enum_guest enum_user share_comments share_get_info r30_reopen r11_eof"}
+SCEN=${*:-"guest guestpriv alice badpass signed rename bigwrite dirclasses encrypted enum_guest enum_user share_comments share_get_info r30_reopen r11_eof credits"}
 LOG=/tmp/rssmb-live-server.log
 
 rm -rf /tmp/rssmb-live && mkdir -p /tmp/rssmb-live/public /tmp/rssmb-live/private

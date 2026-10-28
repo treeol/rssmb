@@ -9,7 +9,7 @@ signing = "required"
 encryption = "disabled"
 guest_access = true
 health_port = 18080
-max_credits = 1024
+max_credits = 8192
 
 [shares.public]
 name = "public"

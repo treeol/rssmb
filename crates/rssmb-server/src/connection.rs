@@ -945,15 +945,46 @@ impl Connection {
             // header's credit_request field. The client uses this to track
             // its available credits; if we don't write it, the client and
             // server disagree on the credit balance.
-            let requested = match &resp {
-                FramedResponse::Plain(p) => p.header.credit_request,
-                FramedResponse::Compound(ps) => {
-                    ps.last().map(|p| p.header.credit_request).unwrap_or(1)
+            let (charge, requested) = match &resp {
+                FramedResponse::Plain(p) => {
+                    (p.header.credit_charge, p.header.credit_request)
                 }
-                _ => 1,
+                FramedResponse::Compound(ps) => {
+                    let last = ps.last();
+                    (
+                        last.map(|p| p.header.credit_charge).unwrap_or(1),
+                        last.map(|p| p.header.credit_request).unwrap_or(1),
+                    )
+                }
+                _ => (1, 1),
             };
+            // smbd parity (smb2_set_operation_credit): the request's own
+            // charge is refunded with every response, plus additional
+            // credits up to the window budget. Interim (async) responses
+            // grant nothing. Negotiate and non-auth-complete SESSION_SETUP
+            // responses refund only the charge (no additional credits).
+            let interim = matches!(
+                &resp,
+                FramedResponse::Plain(p)
+                    if p.header.status == NtStatus::Pending.to_u32()
+                        && p.header.flags.async_command()
+            );
+            let charge_only = matches!(
+                &resp,
+                FramedResponse::Plain(p) if p.header.command == Command::Negotiate
+            ) || matches!(
+                &resp,
+                FramedResponse::Plain(p)
+                    if p.header.command == Command::SessionSetup
+                        && p.header.status != 0
+            );
             let granted = if ledgered {
-                conn_state.credits.grant(requested.max(1) as u32)
+                conn_state.credits.grant_for_response(
+                    charge as u32,
+                    requested.max(1) as u32,
+                    interim,
+                    charge_only,
+                )
             } else {
                 0
             };
