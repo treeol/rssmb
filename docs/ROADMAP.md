@@ -2,13 +2,15 @@
 
 - **Date:** 2026-10-28
 - **Current version:** 0.1.9
-- **Current baseline:** smbtorture 4.19.5, uncapped run of 2026-10-24
+- **Current baseline:** smbtorture 4.19.5, uncapped run of 2026-10-28
   ([`tests/conformance/results.md`](../tests/conformance/results.md)),
-  captured against rssmb 0.1.6 (481de59) with the 0.1.7 credit-accounting fix
-  reflected in smb2.session. Counts are pass/fail unless stated otherwise:
-  smb2.lock 22 pass + 3 cluster-only skips (suite exit 0, golden parity),
-  smb2.connect PASS, smb2.durable-v2-open 14/1, smb2.lease 31/8
-  (timing-flaky, 28–31 observed across runs), smb2.session 49/17,
+  captured against the rssmb 0.1.9 release binary (90a70086e). Counts are
+  pass/fail unless stated otherwise:
+  smb2.lock 25/0 (0 fail, suite rc 0, golden parity),
+  smb2.connect PASS, smb2.credits 3/0 PASS (R-05),
+  smb2.durable-v2-open 14/1, smb2.lease 31/8
+  (timing-flaky, 28–31 observed across runs; `multibreak` observed failing
+  only in the poc-on run of the same day), smb2.session 49/17,
   smb2.read 1/4, smb2.dir 2/7, smb2.getinfo 0/8, smb2.rename 3/9,
   smb2.sharemode 1/2, rpc.srvsvc 2/15.
 
@@ -21,9 +23,9 @@ advances an item updates its row here in the same PR.
 | ID | Item | Why it matters (one line, client-visible effect) | Evidence | Status | PR/branch |
 |---|---|---|---|---|---|
 | R-01 | Windows-redirector interop run (Explorer, robocopy, Office save; needs port 445 reachable) | The primary real-world client is the Windows redirector; nothing currently proves it works end-to-end. | none yet | blocked on infra (Valon's task) | — |
-| R-02 | smb2.rename + smb2.sharemode campaign | Renames and share-mode conflicts are everyday Explorer/Office operations; failures surface as "file in use" and lost saves. | results.md: smb2.rename 3/9, smb2.sharemode 1/2 | open | — |
-| R-03 | smb2.getinfo + smb2.setinfo campaign | Clients read file sizes/timestamps/attributes on nearly every operation; wrong answers corrupt Explorer views and backup tools. | results.md: smb2.getinfo 0/8, smb2.setinfo 0/1 | open | — |
-| R-04 | smb2.dir campaign | Directory listing correctness gates every GUI file browser and `ls`-alike. | results.md: smb2.dir 2/7 (1kfiles_rename, fixed, large-files, many, modify, one, sorted) | open | — |
+| R-02 | smb2.rename + smb2.sharemode campaign | Renames and share-mode conflicts are everyday Explorer/Office operations; failures surface as "file in use" and lost saves. | results.md 2026-10-28 (v0.1.9): smb2.rename 3/9, smb2.sharemode 1/2 (poc-on run: rename 6/6, delta noted) | open | — |
+| R-03 | smb2.getinfo + smb2.setinfo campaign | Clients read file sizes/timestamps/attributes on nearly every operation; wrong answers corrupt Explorer views and backup tools. | results.md 2026-10-28 (v0.1.9): smb2.getinfo 0/8, smb2.setinfo 0/1 | open | — |
+| R-04 | smb2.dir campaign | Directory listing correctness gates every GUI file browser and `ls`-alike. | results.md 2026-10-28 (v0.1.9): smb2.dir 2/7 (1kfiles_rename, fixed, large-files, many, modify, one, sorted) | open | — |
 | R-05 | smb2.credits grant counts | Wrong credit grants stall or kill multi-credit large-MTU transfers (1 MiB reads/writes). | results.md: smb2.credits 3/0/0/0 — smbd 4.19.5 grant parity: `smb2 max credits` ceiling 1024 → 8192; per-response grant = charge refund + `min(requested−1, …)` capped by window budget (`grant_for_response`, mirroring `smb2_set_operation_credit`), interim SETups NEGPROT charge-only; zero-charge requests consume their MessageId (`window_charge = max(charge,1)`). | done | `fix/R-05-credits` |
 | R-06 | Lock-audit debt: uninspected guard sites + dual-lock ServerState pairs | Uninspected std-guard sites and dual-lock field pairs are unaudited hazards — deadlock risk under load cannot be ruled out until each is checked (the audit found no confirmed guard-across-await instance to date). | [`docs/lock-audit.md`](lock-audit.md) §1 "Uninspected" (ioctl.rs:95-96,185-186; quic.rs:650; connection.rs:650,1880) + §2 dual-lock table (4 pairs) | done | `fix/lock-audit` |
 | R-30 | CREATE re-open of an existing file reads 0 bytes under impacket's default read access mask | — | Cannot reproduce. Committed repro (identical CREATE/WRITE/CLOSE + CREATE FILE_OPEN mask 0x120089 + READ 1000 B, impacket 0.13.1, dialects 2.1/3.0/3.1.1) passes on both d791d4d (the claimed-failing commit) and e379c730: full 1000 bytes, correct content; now pinned as the `r30_reopen` live scenario. Original observation (empty READ with STATUS_OK, `resp_len=76`) not reconstructible — most consistent with a past-EOF or offset-confused repro; past-EOF EOF semantics tracked under R-11. | closed (cannot reproduce) | `fix/R-30` |
@@ -33,11 +35,11 @@ advances an item updates its row here in the same PR.
 | ID | Item | Why it matters (one line, client-visible effect) | Evidence | Status | PR/branch |
 |---|---|---|---|---|---|
 | R-07 | Perf part 2: concurrent dispatch | Higher throughput for multi-client workloads without per-request serialization. | branch `perf/concurrent-dispatch`; profile on `perf/read-path-profile`; part 1 measured in CHANGELOG 0.1.3 (391 → ~550 MiB/s sealed iodepth 16) | open | perf/concurrent-dispatch |
-| R-08 | FSCTL_SRV_COPYCHUNK | Server-side copy lets clients offload large copies instead of moving the data over the wire twice. | results.md: smb2.ioctl — all copy_chunk_* subtests failing (~20) | open | — |
-| R-09 | rpc.srvsvc remaining | Complete share enumeration is what network-browse dialogs (Windows Explorer, macOS Finder) display. | results.md: rpc.srvsvc 2/15 | open | — |
+| R-08 | FSCTL_SRV_COPYCHUNK | Server-side copy lets clients offload large copies instead of moving the data over the wire twice. | results.md 2026-10-28 (v0.1.9): smb2.ioctl 44/29 — all copy_chunk_* subtests failing (~20) | open | — |
+| R-09 | rpc.srvsvc remaining | Complete share enumeration is what network-browse dialogs (Windows Explorer, macOS Finder) display. | results.md 2026-10-28 (v0.1.9): rpc.srvsvc 2/15 | open | — |
 | R-10 | Multichannel binding hardening (per-channel signing keys) | Binding is not hardened against a malicious second channel (per-channel signing key derivation); mitigated by shipping multichannel default-off. | CHANGELOG 0.1.7: `multichannel` default flipped to `false` until binding hardening lands. Lock-audit follow-up (2026-10-26, `fix/lock-audit`): the bind-by-lookup path reads `ServerState.sessions` (session_setup.rs:207) — a table that is **never populated** (only per-connection `ConnState.sessions` receives inserts), so cross-connection session lookup is already inert; see `docs/lock-audit.md` §2 follow-ups | open | — |
-| R-11 | smb2.read campaign | Correct READ semantics (positions, EOF, directory access checks) gate every file-transfer tool. | results.md: smb2.read 1/4 (access, dir, eof, position). EOF/past-EOF semantics verified byte-identical to smbd 4.19.5 and pinned as the `r11_eof` live scenario with committed golden (`tests/live/golden-r11-eof.json`) — remaining failures are access/dir/position. | open (EOF half done) | — |
-| R-12 | smb2.notify basedir fidelity + CI budget | Correct change-notify keeps GUI folders live-updating instead of appearing frozen. | results.md: smb2.notify INCOMPLETE — stalls at basedir (attribute-filter fidelity debt) | open | — |
+| R-11 | smb2.read campaign | Correct READ semantics (positions, EOF, directory access checks) gate every file-transfer tool. | results.md 2026-10-28 (v0.1.9): smb2.read 1/4 (access, dir, eof, position). EOF/past-EOF semantics verified byte-identical to smbd 4.19.5 and pinned as the `r11_eof` live scenario with committed golden (`tests/live/golden-r11-eof.json`) — remaining failures are access/dir/position. | open (EOF half done) | — |
+| R-12 | smb2.notify basedir fidelity + CI budget | Correct change-notify keeps GUI folders live-updating instead of appearing frozen. | results.md 2026-10-28 (v0.1.9): smb2.notify INCOMPLETE — stalls at basedir (attribute-filter fidelity debt) | open | — |
 | R-13 | Threat-model / SECURITY.md refresh | Security disclosures and reviewers need a current threat map — the threat model covers neither QUIC, publish_on_close, nor the lease/durable/lock surface, and the external review is still pending. | [`docs/threat-model.md`](threat-model.md) (no QUIC / publish_on_close / lease sections; §External Security Review "pending") | open | — |
 | R-14 | 1.0 release checklist (semver policy, config stability, upgrade notes) | Operators need config-format stability and documented upgrade paths before depending on rssmb in production. | none yet | open | — |
 
@@ -63,7 +65,7 @@ advances an item updates its row here in the same PR.
 | R-25 | Persistent handles (TLER resilient) | Files survive server restarts so clients resume instead of erroring; the supported recovery model is part of this item. | none yet (durable handles v1/v2 done; persistent not) | open | — |
 | R-26 | AppInstanceId | App-instance-scoped opens let Office-style clients coordinate exclusive access. | results.md: smb2.durable-v2-open 14 pass / 1 fail (`app-instance`) | open (subtest excluded from parity gates — see Accepted-never) | — |
 | R-27 | SMB over QUIC real-client test + cert rotation | QUIC is implemented but unproven against a real client, and TLS certs expire in production. | SMB over QUIC shipped (CHANGELOG 0.1.0, README); no real-client test | open | — |
-| R-28 | CREATE ACL/quota — document as not-applicable on POSIX | CREATE ACL/quota queries have no direct POSIX equivalent; document the supported mapping (POSIX-mode-synthesized SDs) and honest not-supported answers instead of protocol failures. | results.md: smb2.create failures include aclfile, acldir, quota-fake-file | open | — |
+| R-28 | CREATE ACL/quota — document as not-applicable on POSIX | CREATE ACL/quota queries have no direct POSIX equivalent; document the supported mapping (POSIX-mode-synthesized SDs) and honest not-supported answers instead of protocol failures. | results.md 2026-10-28 (v0.1.9): smb2.create failures include aclfile, acldir, quota-fake-file | open | — |
 | R-29 | macOS Finder interop | Finder exercises unusual compounds and metadata; second real-client ecosystem. | none yet | open | — |
 
 ## Accepted-never
