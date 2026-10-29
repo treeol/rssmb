@@ -14,10 +14,11 @@ git worktree add -f /tmp/ab-src-main 90a70086e 2>/dev/null || true
 cp /tmp/ab-src-main/target/release/rssmb "$OUT/ab-main-glibc"
 
 echo "== main (musl, container) =="
-docker run --rm -e RUSTUP_TOOLCHAIN=stable -v /home/valon/coding/rssmb:/src -v "$OUT:/out" -w /src/rssmb \
+git worktree add --detach tmp/ab-main-src 90a70086e 2>/dev/null || true
+docker run --rm -e RUSTUP_TOOLCHAIN=stable -v /home/valon/coding/rssmb:/src -v "$OUT:/out" -w /src/rssmb/tmp/ab-main-src \
   clux/muslrust:stable cargo build --release --locked -p rssmb-cli --target x86_64-unknown-linux-musl \
   --config 'target.x86_64-unknown-linux-musl.linker="x86_64-linux-musl-gcc"'
-cp target/x86_64-unknown-linux-musl/release/rssmb "$OUT/ab-main-musl" 2>/dev/null || true
+cp tmp/ab-main-src/target/x86_64-unknown-linux-musl/release/rssmb "$OUT/ab-main-musl"
 
 echo "== mimalloc (musl, container) =="
 docker run --rm -e RUSTUP_TOOLCHAIN=stable -v /home/valon/coding/rssmb:/src -v "$OUT:/out" -w /src/rssmb \
