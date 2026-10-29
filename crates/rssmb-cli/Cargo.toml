@@ -11,6 +11,13 @@ authors.workspace = true
 name = "rssmb"
 path = "src/main.rs"
 
+[features]
+# Global allocator override: on by default for the release/shipped binary.
+# musl's system malloc is markedly slower than glibc's for the server's
+# per-read allocation pattern (R-07a A/B: main musl 424 vs main glibc
+# 1501 MiB/s unsealed fio r16); mimalloc closes most of that gap.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 rssmb-server = { workspace = true }
 rssmb-auth = { workspace = true }
@@ -23,3 +30,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
+mimalloc = { version = "0.1", optional = true, default-features = false, features = ["local_dynamic_tls"] }

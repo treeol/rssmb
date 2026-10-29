@@ -1,5 +1,13 @@
 //! RSSMB server binary — config loading, CLI args, signal handling, health endpoint.
 
+// Global allocator override (R-07a): on by default; musl's system malloc is
+// markedly slower than glibc's for the server's per-read allocation pattern
+// (identical-build A/B: musl 424 vs glibc 1501 MiB/s unsealed fio r16).
+// `--no-default-features` on rssmb-cli restores the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, Subcommand};
 use rssmb_server::{ServerConfig, ServerState};
 use std::path::PathBuf;
