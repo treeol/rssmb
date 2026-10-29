@@ -101,10 +101,23 @@ for suite in $SUITES; do
     rc=1
     continue
   fi
+  # A client panic must never record a pass: smbtorture can die mid-suite
+  # (rc=139 SIGSEGV etc.) having printed zero "failure:" lines, and the
+  # tally below would otherwise count every started subtest as passed
+  # (the smb2.compound rc=139 artifact — see R-33). Any panic marker in
+  # the log fails the suite regardless of rc, and any nonzero rc (beyond
+  # the timeout cases handled above) fails it too.
+  if grep -qE 'smb_panic|PANIC|Segmentation fault' "/tmp/torture-$suite.log"; then
+    result="❌ FAIL (client panic)"
+    rc=1
+    echo "$result (subtest tally unreliable)"
+    echo "| $suite | $result | — (panic in client, tally unreliable) | — |" >> "$RESULTS"
+    continue
+  fi
   if [ "$st" -eq 0 ]; then
     result="✅ PASS"
   else
-    result="❌ FAIL"
+    result="❌ FAIL (rc=$st)"
     rc=1
   fi
   # Per-subtest tallies. smbtorture 4.19.5 emits, per subtest:

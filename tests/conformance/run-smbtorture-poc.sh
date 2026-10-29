@@ -74,10 +74,17 @@ for suite in $SUITES; do
     rc=1
     continue
   fi
+  if grep -qE 'smb_panic|PANIC|Segmentation fault' "/tmp/torture-poc-$suite.log"; then
+    result="❌ FAIL (client panic)"
+    rc=1
+    echo "$result (subtest tally unreliable)"
+    echo "| $suite | $result | — (panic in client, tally unreliable) | — |" >> "$RESULTS"
+    continue
+  fi
   if [ "$st" -eq 0 ]; then
     result="✅ PASS"
   else
-    result="❌ FAIL"
+    result="❌ FAIL (rc=$st)"
     rc=1
   fi
   total=$(grep -cE '^test: ' "/tmp/torture-poc-$suite.log" || true)
