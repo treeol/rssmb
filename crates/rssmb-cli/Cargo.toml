@@ -16,6 +16,7 @@ path = "src/main.rs"
 # musl's system malloc is markedly slower than glibc's for the server's
 # per-read allocation pattern (R-07a A/B: main musl 424 vs main glibc
 # 1501 MiB/s unsealed fio r16); mimalloc closes most of that gap.
+default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
