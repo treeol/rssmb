@@ -14,13 +14,13 @@ git worktree add -f /tmp/ab-src-main 90a70086e 2>/dev/null || true
 cp /tmp/ab-src-main/target/release/rssmb "$OUT/ab-main-glibc"
 
 echo "== main (musl, container) =="
-docker run --rm -e RUSTUP_TOOLCHAIN=stable -v "$PWD/..:/src:ro" -v "$OUT:/out" -w /src \
+docker run --rm -e RUSTUP_TOOLCHAIN=stable -v /home/valon/coding/rssmb:/src -v "$OUT:/out" -w /src/rssmb \
   clux/muslrust:stable cargo build --release --locked -p rssmb-cli --target x86_64-unknown-linux-musl \
   --config 'target.x86_64-unknown-linux-musl.linker="x86_64-linux-musl-gcc"'
 cp target/x86_64-unknown-linux-musl/release/rssmb "$OUT/ab-main-musl" 2>/dev/null || true
 
 echo "== mimalloc (musl, container) =="
-docker run --rm -e RUSTUP_TOOLCHAIN=stable -v "$PWD/..:/src:ro" -v "$OUT:/out" -w /src \
+docker run --rm -e RUSTUP_TOOLCHAIN=stable -v /home/valon/coding/rssmb:/src -v "$OUT:/out" -w /src/rssmb \
   clux/muslrust:stable cargo build --release --locked -p rssmb-cli --target x86_64-unknown-linux-musl \
   --features mimalloc --config 'target.x86_64-unknown-linux-musl.linker="x86_64-linux-musl-gcc"'
 cp target/x86_64-unknown-linux-musl/release/rssmb "$OUT/ab-mimalloc-musl"
