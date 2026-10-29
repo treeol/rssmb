@@ -186,6 +186,14 @@ cargo build --release
 cargo test --workspace
 ```
 
+Release/Docker builds (musl target) use [mimalloc](https://github.com/microsoft/mimalloc)
+as the global allocator — feature-gated (`mimalloc`, **on by default**). In a
+kernel-mount A/B (fio r16, 1 MiB direct reads) it is ~6.6× faster than the musl
+system allocator on unsealed reads and ~2.9× sealed; it costs ~+8 MB idle RSS
+and ~+6% binary size. Disable with `--no-default-features` if you need the
+smallest binary. The A/B protocol and build recipe:
+`tests/perf/build-ab.sh`, `tmp/stress/ab-bench*.sh`.
+
 Run the server:
 
 ```sh

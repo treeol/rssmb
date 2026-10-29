@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **R-07a: mimalloc is the global allocator for release/Docker builds
+  (musl), feature-gated and on by default.** Identical-build A/B
+  (kernel CIFS mount 3.1.1, fio r16 bs=1M direct, 30 s ×3 per cell,
+  1000-file create/list/delete loop ×3 in a fresh tree; medians,
+  `tests/perf/build-ab.sh` reproduces all three binaries with identical
+  flags): unsealed read bandwidth 378 → 2480 MiB/s (6.6×, ≈1.9× the
+  glibc baseline of 1262), sealed 327 → 942 MiB/s (2.9×, ≈1.7× glibc's
+  523); small-file loop: list 31 → 16 ms, create 560 → 455 ms,
+  delete ≈2.1 s both. Idle RSS +8 MB (43 → 51 MB), binary size +6%.
+  Attribution of the remaining musl/glibc gap: not profiled in-sandbox.
+  Data integrity verified (fio `verify=crc32c` 2 GiB write+read-back
+  sealed and unsealed, 2 GiB random file sha256 round-trip through the
+  mount); full uncapped smbtorture baseline on the mimalloc binary is
+  identical to `tests/conformance/results.md` (0 main→mimalloc delta,
+  same harness invocation, same day). An earlier session's
+  AES-128-GMAC signing-negotiation and lock-21 claims are retracted as
+  counting artifacts of the old harness formula.
 - **R-30 closed as cannot-reproduce; repro pinned as the `r30_reopen` live
   scenario (#49).** The reported symptom (READ answering an empty body with
   `STATUS_OK` after CREATE/WRITE/CLOSE + re-open) does not reproduce on the
