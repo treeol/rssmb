@@ -15,6 +15,7 @@ pub(crate) async fn handle_ioctl(
     const FSCTL_LMR_REQ_RESILIENCY: u32 = 0x0014_01F4;
     const FSCTL_QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
     const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
+    const FSCTL_CREATE_OR_GET_OBJECT_ID: u32 = 0x0009_00C0;
     const STATUS_NOT_FOUND: u32 = 0xC000_0225;
     const STATUS_INVALID_DEVICE_REQUEST: u32 = 0xC000_0010;
     debug!(
@@ -255,7 +256,59 @@ pub(crate) async fn handle_ioctl(
             }
             NtStatus::Success
         }
-        _ => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
+        FSCTL_CREATE_OR_GET_OBJECT_ID => {
+            // Samba source3/modules/vfs_default.c:1466 — return the file's
+            // object ID (dev+ino). Layout: file_id (16) + volume objectid
+            // (16) + file_id (16) + zero (16) = 64 bytes. smb2.compound
+            // related3 chains CREATE + this ioctl + CLOSE and expects OK.
+            let file_id_volatile = io.file_id.volatile;
+            let session_id = req.header.session_id;
+            let tree_id = req.header.tree_id.unwrap_or(0);
+            let Ok(entry) =
+                lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await
+            else {
+                // Unknown handle → FILE_CLOSED (Samba smb2_ioctl.c default:
+                // file_fsp_smb2() == NULL → FILE_CLOSED, not
+                // INVALID_DEVICE_REQUEST).
+                return error_response_for(Command::Ioctl, NtStatus::FileClosed, &req.header);
+            };
+            let fid = entry
+                .file_id
+                .unwrap_or(rssmb_vfs::FileId { dev: 0, ino: 0 });
+            let mut out = Vec::with_capacity(64);
+            out.extend_from_slice(&fid.dev.to_le_bytes());
+            out.extend_from_slice(&fid.ino.to_le_bytes());
+            // Volume objectid: zero (Samba uses create_volume_objectid —
+            // opaque per share; zero is a valid stable value).
+            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(&fid.dev.to_le_bytes());
+            out.extend_from_slice(&fid.ino.to_le_bytes());
+            out.extend_from_slice(&[0u8; 16]);
+            out.resize(64.min(io.max_output_response as usize), 0);
+            let resp = rssmb_proto::ioctl::IoctlResponse {
+                ctl_code: io.ctl_code,
+                file_id: io.file_id,
+                in_buffer: vec![],
+                out_buffer: out,
+            };
+            return FramedResponse::Plain(build_response(
+                &req.header,
+                ResponseContent::Ioctl(resp),
+            ));
+        }
+        _ => {
+            // Unknown FSCTL on a live handle: FILE_CLOSED when the handle
+            // does not exist (Samba smb2_ioctl.c: file_fsp_smb2() == NULL →
+            // FILE_CLOSED; smb2.compound related5), else
+            // INVALID_DEVICE_REQUEST (the unimplemented-FSCTL default).
+            let file_id_volatile = io.file_id.volatile;
+            let session_id = req.header.session_id;
+            let tree_id = req.header.tree_id.unwrap_or(0);
+            match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
+                Ok(_) => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
+                Err(_) => NtStatus::FileClosed,
+            }
+        }
     };
     error_response_for(Command::Ioctl, status, &req.header)
 }
