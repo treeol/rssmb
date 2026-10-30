@@ -171,7 +171,7 @@ static musl binaries for `x86_64` and `aarch64` Linux (with `SHA256SUMS`),
 and a multi-arch image:
 
 ```sh
-docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.9
+docker pull ghcr.io/treeol/rssmb:latest   # or :0.1.10
 docker run -d --name rssmb -p 445:445 \
   -v ./config/rssmb.toml:/etc/rssmb/rssmb.toml:ro \
   -v ./data:/data ghcr.io/treeol/rssmb:latest
@@ -187,11 +187,18 @@ cargo test --workspace
 ```
 
 Release/Docker builds (musl target) use [mimalloc](https://github.com/microsoft/mimalloc)
-as the global allocator — feature-gated (`mimalloc`, **on by default**). In a
-kernel-mount A/B (fio r16, 1 MiB direct reads) it is ~6.6× faster than the musl
-system allocator on unsealed reads and ~2.9× sealed; it costs ~+8 MB idle RSS
-and ~+6% binary size. Disable with `--no-default-features` if you need the
-smallest binary. The A/B protocol and build recipe:
+as the global allocator — feature-gated (`mimalloc`, **on by default**). Same-rig
+A/B medians (kernel CIFS mount, fio r16, 1 MiB direct reads, 3 runs per cell;
+test env, tmpfs — absolute numbers are rig-dependent):
+
+| | musl system (0.1.9) | musl + mimalloc (0.1.10) | glibc system |
+|---|---|---|---|
+| unsealed read | 378 MiB/s | **2480 MiB/s** | 1262 MiB/s |
+| sealed read | 327 MiB/s | **942 MiB/s** | 523 MiB/s |
+
+That is ~6.6× the musl system allocator unsealed and ~2.9× sealed, at a cost of
+~+8 MB idle RSS and ~+6% binary size. Disable with `--no-default-features` if
+you need the smallest binary. The A/B protocol and build recipe:
 `tests/perf/build-ab.sh`, `tmp/stress/ab-bench*.sh`.
 
 Run the server:
