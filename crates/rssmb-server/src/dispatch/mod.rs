@@ -794,8 +794,16 @@ pub(crate) fn error_plain_response(req_header: &Header, status: u32) -> PlainRes
             },
             next_command: 0,
             message_id: req_header.message_id,
-            tree_id: if is_async { None } else { req_header.tree_id.or(Some(0)) },
-            async_id: if is_async { req_header.async_id.or(Some(0)) } else { None },
+            tree_id: if is_async {
+                None
+            } else {
+                req_header.tree_id.or(Some(0))
+            },
+            async_id: if is_async {
+                req_header.async_id.or(Some(0))
+            } else {
+                None
+            },
             session_id: req_header.session_id,
             signature: 0,
         },
@@ -834,8 +842,16 @@ pub(crate) fn error_plain_response_with_ids(
             },
             next_command: 0,
             message_id: req_header.message_id,
-            tree_id: if is_async { None } else { tree_id.or(Some(0)) },
-            async_id: if is_async { req_header.async_id.or(Some(0)) } else { None },
+            tree_id: if is_async {
+                None
+            } else {
+                tree_id.or(Some(0))
+            },
+            async_id: if is_async {
+                req_header.async_id.or(Some(0))
+            } else {
+                None
+            },
             session_id,
             signature: 0,
         },

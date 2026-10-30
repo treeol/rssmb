@@ -272,7 +272,9 @@ pub(crate) async fn handle_ioctl(
                 // INVALID_DEVICE_REQUEST).
                 return error_response_for(Command::Ioctl, NtStatus::FileClosed, &req.header);
             };
-            let fid = entry.file_id.unwrap_or(rssmb_vfs::FileId { dev: 0, ino: 0 });
+            let fid = entry
+                .file_id
+                .unwrap_or(rssmb_vfs::FileId { dev: 0, ino: 0 });
             let mut out = Vec::with_capacity(64);
             out.extend_from_slice(&fid.dev.to_le_bytes());
             out.extend_from_slice(&fid.ino.to_le_bytes());
@@ -302,8 +304,7 @@ pub(crate) async fn handle_ioctl(
             let file_id_volatile = io.file_id.volatile;
             let session_id = req.header.session_id;
             let tree_id = req.header.tree_id.unwrap_or(0);
-            match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await
-            {
+            match lookup_open_for_session(conn_state, session_id, tree_id, file_id_volatile).await {
                 Ok(_) => NtStatus::Other(STATUS_INVALID_DEVICE_REQUEST),
                 Err(_) => NtStatus::FileClosed,
             }
