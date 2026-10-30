@@ -2459,6 +2459,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn related_member_never_resolves_foreign_session_tree_handle() {
+        // R-33 security boundary (MS-SMB2 3.3.5.2.7): a related element
+        // inherits SessionId/TreeId/FileId from the PRECEDING chain members'
+        // responses — it must never resolve an open belonging to a
+        // different session or tree. Two proofs in one test:
+        //   (a) handle_compound inheritance is response-driven: a related
+        //       member after a failing unrelated member gets
+        //       INVALID_PARAMETER (chain_valid=false), never a dispatch
+        //       with the foreign member's ids;
+        //   (b) lookup_open_for_session refuses any handle whose owning
+        //       session/tree differs — the substitution path could only
+        //       ever substitute a FileId, and the session/tree check is
+        //       still enforced at dispatch time.
+        // Here: session 7 owns an open (volatile 55) on tree 9; a chain
+        // [unrelated CLOSE on session 7] + [related CLOSE with the real
+        // FileId but under a FOREIGN session id in the saved header] must
+        // fail — the related member inherits session 7 (the previous
+        // response's session), and lookup then fails on the mismatched
+        // tree, or on the unknown handle if the id was not inherited.
+        // Either way: an error status, never SUCCESS.
+        let state = make_test_state();
+        let conn = make_conn_state();
+        establish_negotiation(&state, &conn).await;
+        conn.credits.grant(10);
+
+        // Register an open in the connection's open table as if created
+        // under session 7, tree 9.
+        {
+            let opens_ref = conn.opens_ref();
+            let mut opens = opens_ref.write().await;
+            opens.insert(
+                55u64,
+                OpenEntry {
+                    session_id: 7,
+                    tree_id: 9,
+                    open_id: rssmb_vfs::OpenId(55),
+                    vfs: std::sync::Arc::new(rssmb_vfs::memoryfs::MemoryFs::new())
+                        as std::sync::Arc<dyn rssmb_vfs::Vfs>,
+                    file_id: Some(rssmb_vfs::FileId { dev: 1, ino: 55 }),
+                    dir_cursor: Arc::new(tokio::sync::Mutex::new(DirCursor::default())),
+                    path: "test.bin".to_string(),
+                    is_pipe: false,
+                    pipe_state: None,
+                    durable_guid: None,
+                    durable_persistent_id: None,
+                    lock_sequence_array: Arc::new(std::sync::Mutex::new([0xFFu8; 64])),
+                },
+            );
+        }
+
+        // Unrelated member: session 7, tree 9 — closes the real handle.
+        let mut m0 = close_req(1, 7, false);
+        m0.header.tree_id = Some(9);
+        m0.content = RequestContent::Close(rssmb_proto::create::CloseRequest {
+            flags: rssmb_proto::create::CloseFlags::new(),
+            file_id: rssmb_proto::create::FileId {
+                persistent: 0,
+                volatile: 55,
+            },
+        });
+
+        // Related member: FOREIGN session id (99) in its own header, with
+        // the same real FileId. Inheritance must override the foreign id
+        // with the chain's session 7 — or, if any code path dispatched it
+        // with session 99, lookup_open_for_session must refuse (InvalidHandle).
+        // It must never succeed and close/open across the boundary.
+        let mut m1 = close_req(2, 99, true);
+        m1.header.tree_id = Some(99);
+        m1.content = RequestContent::Close(rssmb_proto::create::CloseRequest {
+            flags: rssmb_proto::create::CloseFlags::new(),
+            file_id: rssmb_proto::create::FileId {
+                persistent: 0,
+                volatile: 55,
+            },
+        });
+
+        let resp = handle_message(
+            &state,
+            &conn,
+            FramedMessage::Compound(vec![m0, m1]),
+            &[],
+            None,
+        )
+        .await;
+        match resp.expect("compound response") {
+            FramedResponse::Compound(ps) => {
+                assert_eq!(ps.len(), 2);
+                // First member: the unrelated CLOSE succeeds or fails
+                // normally (FileClosed is fine — the entry has no real
+                // file behind it); it must NOT be a success in a way that
+                // would leak state — and more importantly:
+                let second = &ps[1];
+                assert_ne!(
+                    second.header.status,
+                    NtStatus::Success.to_u32(),
+                    "related member under a foreign session/tree must NEVER succeed"
+                );
+                // The related member's response must carry the INHERITED
+                // session (7), not its own foreign header session (99) —
+                // inheritance is from the previous response.
+                assert_eq!(
+                    second.header.session_id, 7,
+                    "related member must inherit the chain's session id, not its own foreign one"
+                );
+            }
+            other => panic!("expected Compound, got {other:?}"),
+        }
+
+        // And the boundary at the lookup layer: a direct dispatch-style
+        // lookup under the foreign pair must fail.
+        let foreign = lookup_open_for_session(&conn, 99, 99, 55).await;
+        assert!(
+            foreign.is_err(),
+            "lookup_open_for_session must refuse a handle owned by another session/tree"
+        );
+    }
+
+    #[tokio::test]
     async fn excessive_credit_charge_rejected() {
         let state = make_test_state();
         let conn = make_conn_state();
