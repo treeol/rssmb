@@ -519,6 +519,13 @@ async fn handle_compound(
     let mut inherited_session_id: u64 = 0;
     let mut inherited_tree_id: Option<u32> = Some(0);
     let mut propagated_status: Option<u32> = None;
+    // Whether the current chain context is usable for related inheritance.
+    // A related member may only inherit from a preceding *successful* (or
+    // warning-severity) chain element. Samba (smb2_server.c chain walk +
+    // smb2_create.c error propagation): an unrelated member that fails
+    // leaves no session/tcon/handle context; a related member following it
+    // gets INVALID_PARAMETER (smb2.compound invalid2 req[4]).
+    let mut chain_valid = true;
     // Byte range of each member — handlers see only their own message bytes
     // (WRITE data offsets and signatures are relative to the member's header).
     let ranges = rssmb_wire_adapter::framing::message_ranges(raw_frame);
@@ -598,6 +605,24 @@ async fn handle_compound(
             saved_header.tree_id
         };
 
+        if is_related && !chain_valid {
+            // A related member after a failed unrelated member: the chain
+            // context is gone (Samba returns INVALID_PARAMETER — smb2.compound
+            // invalid2 req[4]). Do not inherit; do not substitute FileId.
+            // (No credit charge here — the skips_handler block above has
+            // already charged propagated related members.)
+            responses.push((
+                true,
+                error_plain_response_with_ids(
+                    &saved_header,
+                    NtStatus::InvalidParameter.to_u32(),
+                    effective_session_id,
+                    effective_tree_id,
+                ),
+            ));
+            continue;
+        }
+
         if is_related {
             // Inherit SessionId and TreeId from the previous request's response.
             req.header.session_id = effective_session_id;
@@ -623,9 +648,13 @@ async fn handle_compound(
                 continue;
             }
         } else {
-            // Unrelated: reset all inherited state (including last_file_id).
+            // Unrelated member: starts a fresh chain context. Reset all
+            // inherited state. chain_valid will be re-evaluated from this
+            // member's own outcome below (a failing unrelated member breaks
+            // inheritance for a following related member).
             propagated_status = None;
             last_file_id = None;
+            chain_valid = true;
         }
 
         // Dispatch this sub-request.
@@ -658,6 +687,16 @@ async fn handle_compound(
                 let status = plain.header.status;
                 if (status & 0xC000_0000) == 0xC000_0000 {
                     propagated_status = Some(status);
+                    if !is_related && status == NtStatus::UserSessionDeleted.to_u32() {
+                        // A session-level failure on an unrelated member leaves
+                        // no session context to inherit: the chain is broken
+                        // and following related members get INVALID_PARAMETER
+                        // (smb2.compound invalid2 req[4]). Command-level
+                        // failures (FILE_CLOSED, OBJECT_NAME_NOT_FOUND...)
+                        // keep the chain — the status propagates (invalid3,
+                        // related8).
+                        chain_valid = false;
+                    }
                 }
 
                 responses.push((is_related, plain));
@@ -670,6 +709,11 @@ async fn handle_compound(
                 inherited_tree_id = effective_tree_id;
                 // Error responses always have error severity.
                 propagated_status = Some(status.to_u32());
+                if !is_related && status == NtStatus::UserSessionDeleted {
+                    // Session-level failure on an unrelated member breaks the
+                    // chain (see the Plain arm above for the rationale).
+                    chain_valid = false;
+                }
                 responses.push((
                     is_related,
                     error_plain_response_with_ids(
@@ -1023,6 +1067,38 @@ async fn handle_plain(
 
     if let Err(resp) = charge_credits(conn_state, &req.header) {
         return Some(*resp);
+    }
+
+    // Unknown-session gate (Samba smbd_smb2_request_check_session,
+    // smb2_server.c: a session_id not in the connection's session table
+    // fails every command except SESSION_SETUP with USER_SESSION_DELETED —
+    // smb2.compound invalid2: an unrelated CLOSE naming session UINT64_MAX
+    // must return USER_SESSION_DELETED, not FILE_CLOSED). Exempt NEGOTIATE
+    // (no session), SESSION_SETUP (establishing), ECHO (sessionless
+    // keepalive semantics), LOGOFF (its own session handling) and
+    // session_id 0. Runs after credit charging so the client is still
+    // charged for the rejected member.
+    if command != Command::Negotiate
+        && command != Command::SessionSetup
+        && command != Command::Echo
+        && command != Command::Logoff
+    {
+        let sid = req.header.session_id;
+        if sid != 0 {
+            let known = {
+                let sessions = conn_state.sessions.read().await;
+                sessions.iter().any(|s| s.id == sid)
+            };
+            if !known {
+                debug!(conn_id = conn_state.conn_id, session_id = sid,
+                    command = %command, "request on unknown session — USER_SESSION_DELETED");
+                return Some(error_response_for(
+                    command,
+                    NtStatus::UserSessionDeleted,
+                    &req.header,
+                ));
+            }
+        }
     }
 
     match command {
@@ -2231,6 +2307,11 @@ mod tests {
         let conn = make_conn_state();
         establish_negotiation(&state, &conn).await;
         conn.credits.grant(10);
+        // Unrelated CLOSE on unknown session 42 → USER_SESSION_DELETED (the
+        // unknown-session gate, Samba smb2_server.c check_session); the
+        // following RELATED member must NOT inherit that context — the
+        // chain was broken by the failing unrelated member, so it gets
+        // INVALID_PARAMETER (Samba invalid2 req[4] semantics).
         let reqs = vec![close_req(1, 42, false), close_req(2, u64::MAX, true)];
         let resp = handle_message(&state, &conn, FramedMessage::Compound(reqs), &[], None).await;
         match resp.expect("compound response") {
@@ -2238,11 +2319,18 @@ mod tests {
                 assert_eq!(ps.len(), 2);
                 assert_eq!(ps[0].header.session_id, 42);
                 assert_eq!(
-                    ps[1].header.session_id, 42,
-                    "propagated error lost the effective session"
+                    ps[0].header.status,
+                    NtStatus::UserSessionDeleted.to_u32(),
+                    "unrelated member on unknown session must be USER_SESSION_DELETED"
                 );
-                assert_eq!(ps[1].header.tree_id, Some(7));
-                assert_eq!(ps[1].header.status, NtStatus::FileClosed.to_u32());
+                assert_eq!(
+                    ps[1].header.status,
+                    NtStatus::InvalidParameter.to_u32(),
+                    "related member after broken chain must be INVALID_PARAMETER"
+                );
+                // The broken-chain reply still carries the saved header's
+                // session (placeholder u64::MAX) — signed contexts resolve
+                // elsewhere; the important part is the status pair above.
             }
             other => panic!("expected Compound, got {:?}", other),
         }
