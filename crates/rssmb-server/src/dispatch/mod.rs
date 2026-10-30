@@ -842,11 +842,7 @@ pub(crate) fn error_plain_response_with_ids(
             },
             next_command: 0,
             message_id: req_header.message_id,
-            tree_id: if is_async {
-                None
-            } else {
-                tree_id.or(Some(0))
-            },
+            tree_id: if is_async { None } else { tree_id.or(Some(0)) },
             async_id: if is_async {
                 req_header.async_id.or(Some(0))
             } else {
