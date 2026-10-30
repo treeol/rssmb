@@ -732,17 +732,26 @@ async fn handle_compound(
 /// Uses the saved request header to preserve message_id, session_id, tree_id,
 /// credit_charge, and async_id.
 pub(crate) fn error_plain_response(req_header: &Header, status: u32) -> PlainResponse {
+    // Preserve the member's sync/async shape: an async member's error
+    // response must keep async_command + async_id (and tree_id=None) or the
+    // encoder's tree_id/async assertion (header.rs) fails and the whole
+    // connection is dropped — the smb2.compound invalid1 IO_TIMEOUT.
+    let is_async = req_header.flags.async_command();
     PlainResponse {
         header: Header {
             credit_charge: req_header.credit_charge,
             status,
             command: req_header.command,
             credit_request: req_header.credit_request,
-            flags: HeaderFlags::new().with_server_to_redir(true),
+            flags: {
+                let mut f = HeaderFlags::new().with_server_to_redir(true);
+                f.set_async_command(is_async);
+                f
+            },
             next_command: 0,
             message_id: req_header.message_id,
-            tree_id: req_header.tree_id,
-            async_id: req_header.async_id,
+            tree_id: if is_async { None } else { req_header.tree_id.or(Some(0)) },
+            async_id: if is_async { req_header.async_id.or(Some(0)) } else { None },
             session_id: req_header.session_id,
             signature: 0,
         },
@@ -762,17 +771,27 @@ pub(crate) fn error_plain_response_with_ids(
     session_id: u64,
     tree_id: Option<u32>,
 ) -> PlainResponse {
+    // Same sync/async shape preservation as error_plain_response: an async
+    // member's propagated error must keep async_command + async_id or the
+    // encoder assertion kills the connection (see error_plain_response).
+    // For async members the inherited tree_id is ignored (async headers
+    // carry no TreeId on the wire).
+    let is_async = req_header.flags.async_command();
     PlainResponse {
         header: Header {
             credit_charge: req_header.credit_charge,
             status,
             command: req_header.command,
             credit_request: req_header.credit_request,
-            flags: HeaderFlags::new().with_server_to_redir(true),
+            flags: {
+                let mut f = HeaderFlags::new().with_server_to_redir(true);
+                f.set_async_command(is_async);
+                f
+            },
             next_command: 0,
             message_id: req_header.message_id,
-            tree_id,
-            async_id: req_header.async_id,
+            tree_id: if is_async { None } else { tree_id.or(Some(0)) },
+            async_id: if is_async { req_header.async_id.or(Some(0)) } else { None },
             session_id,
             signature: 0,
         },
