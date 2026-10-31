@@ -160,7 +160,7 @@ jobs:
           cp /tmp/poc-server.log poc-artifacts/ 2>/dev/null || true
       - name: Upload transcripts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: publish-on-close-transcripts
           path: poc-artifacts/
@@ -224,7 +224,7 @@ jobs:
           cp /tmp/torture-*.log smbtorture-artifacts/ 2>/dev/null || true
       - name: Upload baseline artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smbtorture-baseline
           path: smbtorture-artifacts/

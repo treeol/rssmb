@@ -58,7 +58,7 @@ jobs:
         run: |
           file "target/${{ matrix.target }}/release/rssmb"
           "target/${{ matrix.target }}/release/rssmb" --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rssmb-${{ matrix.arch }}
           path: |
