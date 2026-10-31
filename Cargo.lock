@@ -1639,11 +1639,11 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "picky"
-version = "7.0.0-rc.26"
+version = "7.0.0-rc.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07ad9686b270be4eb3f3c23027d202ad488a25c2bec6d6be20c2164b28d2c86c"
+checksum = "3bcf32b73bfc151bc07c3fbf35e729ad3078d48c581f8656c0f62a529fbf681c"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "crypto-bigint",
  "crypto-common 0.2.2",
  "digest 0.11.3",
@@ -1712,9 +1712,9 @@ dependencies = [
 
 [[package]]
 name = "picky-krb"
-version = "0.12.4"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d188f3192356068dbdba54bddbca6fd0f7a09565d3861eeb8efe1ab77ae8e97"
+checksum = "9306c2a07e8bfd1faa0985b76bc7b86ab98f2b9a1433fdfa4c9a116b6e4c8a3d"
 dependencies = [
  "aes",
  "block-padding",
@@ -2519,9 +2519,9 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sspi"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "256b74a75c961d4eb11e0e302a4451cdc51d713d5f26b2ede8156ba61cca5d7e"
+checksum = "3d3fa5e1405884e88be309bd801760caa84c654be746fe4261ab407496263692"
 dependencies = [
  "async-dnssd",
  "async-recursion",
@@ -3089,7 +3089,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
